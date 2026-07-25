@@ -1,0 +1,27 @@
+# Secrets — NE JAMAIS committer
+.env
+
+# Données de trading (privées)
+*.xlsx
+*.xlsx.tmp
+*.json
+bot_state.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
