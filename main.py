@@ -2,7 +2,7 @@
 BotShortTrade – Hyperliquid DEX
 Stratégie : M15 biais → M5 confirm → M1 entrée | SL=1.5×ATR | TP=2.5×ATR | 5× levier
 """
-import math, os, time, traceback
+import json, math, os, time, traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -86,6 +86,7 @@ def init_exchange_info():
 
 # ── Excel ──────────────────────────────────────────────────────────────────────
 EXCEL_FILE = "trades.xlsx"
+STATE_FILE = "bot_state.json"
 COL_HEADERS = [
     "ID Ordre", "Date/Heure", "Symbole", "Côté", "Qté", "Prix entrée",
     "SL", "TP", "ATR M5", "Notionnel $", "P&L TP $", "P&L SL $",
@@ -313,6 +314,37 @@ def get_equity() -> float:
         return perp_bal
     spot = info.spot_user_state(WALLET_ADDRESS)
     return sum(float(b["total"]) for b in spot.get("balances", []) if b["coin"] == "USDC")
+
+def get_unrealized_pnl() -> float:
+    try:
+        positions = info.user_state(WALLET_ADDRESS).get("assetPositions", [])
+        return sum(float(p["position"]["unrealizedPnl"]) for p in positions)
+    except Exception:
+        return 0.0
+
+def load_initial_balance(current_balance: float) -> float:
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE) as f:
+                state = json.load(f)
+            if "initial_balance" in state:
+                return float(state["initial_balance"])
+        except Exception:
+            pass
+    _save_initial_balance(current_balance)
+    return current_balance
+
+def _save_initial_balance(balance: float):
+    state = {}
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE) as f:
+                state = json.load(f)
+        except Exception:
+            pass
+    state["initial_balance"] = round(balance, 4)
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
 
 # ── Scan parallèle ────────────────────────────────────────────────────────────
 def scan_all(open_coins: set[str]) -> list[dict]:
@@ -617,6 +649,9 @@ def run():
         log_error(f"Balance: {e}")
         balance = MAX_LIQUIDITY
 
+    initial_balance = load_initial_balance(balance)
+    print(f"  Solde initial : ${initial_balance:.2f} USDC")
+
     open_positions, capital_in_use = recover_open_positions()
     if open_positions:
         reconcile_zombie_orders(wb, open_positions)
@@ -655,8 +690,12 @@ def run():
         slots_left    = max_slots - len(open_positions)
 
         pnl_total, pnl_week = calc_portfolio_pnl(wb)
+        unrealized = get_unrealized_pnl()
+        net_pnl = pnl_total + unrealized
+        net_pct = (net_pnl / initial_balance * 100) if initial_balance > 0 else 0.0
         print(f"  Positions: {len(open_positions)}  Dispo: ${avail_capital:.2f}  Équité: ${balance:.2f}")
-        print(f"  P&L total: ${pnl_total:+.2f}  |  P&L 7j: ${pnl_week:+.2f}")
+        print(f"  P&L réalisé: ${pnl_total:+.2f}  |  Non réalisé: ${unrealized:+.2f}  |  Net: ${net_pnl:+.2f} ({net_pct:+.1f}%)")
+        print(f"  P&L 7j: ${pnl_week:+.2f}")
 
         # Filtre horaire (heures UTC)
         hour_utc = datetime.now(timezone.utc).hour
