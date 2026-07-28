@@ -251,16 +251,16 @@ def _avg_vol(candles: list[dict], n: int = 20) -> float:
 # ── Signal multi-timeframe ────────────────────────────────────────────────────
 def get_signal(coin: str) -> dict | None:
     try:
-        c15 = fetch_candles(coin, INTERVAL_M15, 30)
+        c15 = fetch_candles(coin, INTERVAL_M15, 50)
         c5  = fetch_candles(coin, INTERVAL_M5,  50)
-        c1  = fetch_candles(coin, INTERVAL_M1,  20)
-        if len(c15) < 10 or len(c5) < 20 or len(c1) < 10:
+        c1  = fetch_candles(coin, INTERVAL_M1,  30)
+        if len(c15) < 25 or len(c5) < 20 or len(c1) < 16:
             return None
 
-        # M15 biais (EMA8)
-        ema8_15 = _ema([c["c"] for c in c15], 8)
-        bias_up = c15[-1]["c"] > ema8_15[-1]
-        bias_dn = c15[-1]["c"] < ema8_15[-1]
+        # M15 biais (EMA20 — plus stable que EMA8 pour filtrer la tendance)
+        ema20_15 = _ema([c["c"] for c in c15], 20)
+        bias_up = c15[-1]["c"] > ema20_15[-1]
+        bias_dn = c15[-1]["c"] < ema20_15[-1]
 
         # M5 confirmation (VWAP + EMA8 + ATR)
         closes5 = [c["c"] for c in c5]
@@ -285,13 +285,20 @@ def get_signal(coin: str) -> dict | None:
 
         signal = None
         score  = 0.0
+        vol_ratio = c5[-1]["v"] / avg_vol5 if avg_vol5 else 1.0
 
-        if bias_up and confirm_long and vol_ok and move_ok and rsi1 < 70 and vol1_ok:
+        # RSI 40-65 pour buy : momentum confirmé mais pas overbought
+        # RSI 35-60 pour sell : momentum baissier mais pas oversold
+        if bias_up and confirm_long and vol_ok and move_ok and 40 <= rsi1 <= 65 and vol1_ok:
             signal = "buy"
-            score  = round((rsi1 / 100) * 0.3 + (c5[-1]["v"] / avg_vol5) * 0.4 + 0.3, 3)
-        elif bias_dn and confirm_short and vol_ok and move_ok and rsi1 > 30 and vol1_ok:
+            # Récompense RSI bas dans la zone valide (achat sur repli, pas sur pic)
+            rsi_score = (65 - rsi1) / 25
+            score  = round(rsi_score * 0.3 + vol_ratio * 0.4 + 0.3, 3)
+        elif bias_dn and confirm_short and vol_ok and move_ok and 35 <= rsi1 <= 60 and vol1_ok:
             signal = "sell"
-            score  = round(((100 - rsi1) / 100) * 0.3 + (c5[-1]["v"] / avg_vol5) * 0.4 + 0.3, 3)
+            # Récompense RSI haut dans la zone valide (vente sur rebond, pas sur creux)
+            rsi_score = (rsi1 - 35) / 25
+            score  = round(rsi_score * 0.3 + vol_ratio * 0.4 + 0.3, 3)
 
         details = (f"M15={'↑' if bias_up else '↓'} M5={'↑' if confirm_long else '↓'} "
                    f"RSI={rsi1:.1f} vol={c5[-1]['v']:.2f}/{avg_vol5:.2f}")
@@ -452,8 +459,8 @@ def place_order(sig: dict, wb: Workbook) -> dict:
             print(f"  [{label}] ERREUR : {e}")
 
     notional = round(qty * entry_px, 2)
-    pnl_tp   = round(abs(tp - entry_px) * qty * LEVERAGE, 2)
-    pnl_sl   = round(-abs(sl - entry_px) * qty * LEVERAGE, 2)
+    pnl_tp   = round(abs(tp - entry_px) * qty, 2)
+    pnl_sl   = round(-abs(sl - entry_px) * qty, 2)
 
     log_order(wb, order_id, coin, side, qty, entry_px, sl, tp, atr, notional, pnl_tp, pnl_sl)
 
