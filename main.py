@@ -17,6 +17,28 @@ from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.utils import get_column_letter
 
+# ── Couleurs console (ANSI) ────────────────────────────────────────────────────
+os.system("")  # active les codes ANSI sur Windows
+
+class C:
+    RST  = "\033[0m"
+    BOLD = "\033[1m"
+    DIM  = "\033[2m"
+    RED  = "\033[91m"
+    GRN  = "\033[92m"
+    YLW  = "\033[93m"
+    BLU  = "\033[94m"
+    CYN  = "\033[96m"
+    WHT  = "\033[97m"
+    BRED = "\033[1;91m"
+    BGRN = "\033[1;92m"
+    BYLW = "\033[1;93m"
+    BCYN = "\033[1;96m"
+
+def _cp(val: float) -> str:
+    """Couleur selon signe d'une valeur P&L."""
+    return C.BGRN if val > 0 else (C.BRED if val < 0 else C.WHT)
+
 # ── Env ────────────────────────────────────────────────────────────────────────
 load_dotenv()
 
@@ -46,8 +68,9 @@ API_URL        = constants.TESTNET_API_URL if HL_TESTNET else constants.MAINNET_
 info           = Info(API_URL, skip_ws=True)
 exchange       = Exchange(_account, API_URL)
 
-print(f"  Wallet : {WALLET_ADDRESS}")
-print(f"  Réseau : {'TESTNET' if HL_TESTNET else 'MAINNET'}")
+print(f"  {C.DIM}Wallet : {WALLET_ADDRESS}{C.RST}")
+_net_color = C.BYLW if HL_TESTNET else C.BRED
+print(f"  Réseau : {_net_color}{'TESTNET' if HL_TESTNET else 'MAINNET'}{C.RST}")
 
 # ── Symboles ───────────────────────────────────────────────────────────────────
 WATCHLIST = ["BTC", "ETH", "AVAX", "LINK", "LTC", "DOGE", "XRP"]
@@ -171,7 +194,7 @@ _scan_log: list[dict] = []
 
 def log_error(msg: str):
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    print(f"  [ERR {ts}] {msg}")
+    print(f"  {C.BRED}[ERR {ts}]{C.RST} {msg}")
 
 def log_scan(coin: str, tf: str, signal: str | None, score: float, details: str):
     _scan_log.append({"ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
@@ -389,9 +412,9 @@ def set_leverage(coin: str):
     try:
         res = exchange.update_leverage(LEVERAGE, coin, is_cross=True)
         if res.get("status") != "ok":
-            print(f"  [WARN] Levier {coin}: {res}")
+            print(f"  {C.BYLW}[WARN]{C.RST} Levier {coin}: {res}")
     except Exception as e:
-        print(f"  [WARN] Levier {coin}: {e}")
+        print(f"  {C.BYLW}[WARN]{C.RST} Levier {coin}: {e}")
 
 # ── Passer un ordre ───────────────────────────────────────────────────────────
 def place_order(sig: dict, wb: Workbook) -> dict:
@@ -416,7 +439,8 @@ def place_order(sig: dict, wb: Workbook) -> dict:
         sl = round_px(price + ATR_SL_MULT * atr)
         tp = round_px(price - ATR_TP_MULT * atr)
 
-    print(f"  [{side}] {coin} {qty} @ ${price:.6g}  SL=${sl:.6g}  TP=${tp:.6g}  {LEVERAGE}x")
+    _sc = C.BGRN if is_buy else C.BRED
+    print(f"  {_sc}[{side}]{C.RST} {C.BOLD}{coin}{C.RST} {qty} @ ${price:.6g}  {C.RED}SL=${sl:.6g}{C.RST}  {C.GRN}TP=${tp:.6g}{C.RST}  {LEVERAGE}x")
 
     # Ouverture de la position au marché
     result = exchange.market_open(coin, is_buy, qty, px=None, slippage=0.02)
@@ -429,7 +453,7 @@ def place_order(sig: dict, wb: Workbook) -> dict:
     entry_px  = float(fill.get("avgPx") or price)
     open_fee  = round(float(fill.get("fee", 0)), 4)
 
-    print(f"  [OK] oid={order_id}  entrée=${entry_px:.6g}  frais=${open_fee}")
+    print(f"  {C.BGRN}[OK]{C.RST} oid={order_id}  entrée=${entry_px:.6g}  frais=${open_fee}")
 
     # Ordres SL / TP (trigger reduce-only)
     close_buy = not is_buy
@@ -449,14 +473,15 @@ def place_order(sig: dict, wb: Workbook) -> dict:
                 reduce_only=True,
             )
             if r.get("status") == "ok":
-                print(f"  [{label}] ${trig_px:.6g} → OK")
+                _lc = C.RED if label == "SL" else C.GRN
+                print(f"  {_lc}[{label}]{C.RST} ${trig_px:.6g} → OK")
                 if label == "SL":
                     st = r["response"]["data"]["statuses"]
                     sl_oid = (st[0].get("resting") or st[0].get("filled") or {}).get("oid")
             else:
-                print(f"  [{label}] REJETÉ : {r}")
+                print(f"  {C.BRED}[{label}] REJETÉ{C.RST} : {r}")
         except Exception as e:
-            print(f"  [{label}] ERREUR : {e}")
+            print(f"  {C.BRED}[{label}] ERREUR{C.RST} : {e}")
 
     notional = round(qty * entry_px, 2)
     pnl_tp   = round(abs(tp - entry_px) * qty, 2)
@@ -493,7 +518,7 @@ def trail_sl(position: dict, current_price: float):
         try:
             exchange.cancel(coin, int(sl_oid))
         except Exception as e:
-            print(f"  [TRAIL] annulation SL : {e}")
+            print(f"  {C.BYLW}[TRAIL]{C.RST} annulation SL : {e}")
 
     # Placer le nouveau SL
     close_buy = not is_buy
@@ -510,11 +535,11 @@ def trail_sl(position: dict, current_price: float):
             position["sl_oid"] = (st[0].get("resting") or {}).get("oid")
             position["sl"] = new_sl
             arrow = "↑" if is_buy else "↓"
-            print(f"  [TRAIL {arrow}] {coin} SL={new_sl:.6g} (profit={profit_atr:.1f}×ATR)")
+            print(f"  {C.BCYN}[TRAIL {arrow}]{C.RST} {coin} SL={new_sl:.6g} (profit={profit_atr:.1f}×ATR)")
         else:
-            print(f"  [TRAIL] rejeté : {r}")
+            print(f"  {C.BYLW}[TRAIL]{C.RST} rejeté : {r}")
     except Exception as e:
-        print(f"  [TRAIL] erreur : {e}")
+        print(f"  {C.BYLW}[TRAIL]{C.RST} erreur : {e}")
 
 # ── Suivi de position ─────────────────────────────────────────────────────────
 def check_position(wb: Workbook, position: dict) -> str | None:
@@ -535,7 +560,8 @@ def check_position(wb: Workbook, position: dict) -> str | None:
             pct   = (price - position["entry"]) / position["entry"] * 100
             if position["side"] == "SELL":
                 pct = -pct
-            print(f"  [SUIVI] {coin} ${price:.6g} ({pct:+.2f}%)  P&L=${pnl:.2f}")
+            _pc = _cp(pnl)
+            print(f"  {C.DIM}[SUIVI]{C.RST} {C.BOLD}{coin}{C.RST} ${price:.6g} ({pct:+.2f}%)  P&L={_pc}${pnl:.2f}{C.RST}")
             update_order_live(wb, position["id"], price)
             trail_sl(position, price)
             return None
@@ -553,11 +579,12 @@ def check_position(wb: Workbook, position: dict) -> str | None:
                 gross     = float(recent.get("closedPnl", 0))
                 pnl       = round(gross - open_fee - close_fee, 2)
                 result    = "TP touché" if pnl >= 0 else "SL touché"
-                print(f"  [FRAIS] ouv=${open_fee:.4f}  ferm=${close_fee:.4f}  net=${pnl:.2f}")
+                print(f"  {C.DIM}[FRAIS] ouv=${open_fee:.4f}  ferm=${close_fee:.4f}  net=${pnl:.2f}{C.RST}")
         except Exception:
             pass
 
-        print(f"  [{result}] {coin}  P&L=${pnl:.2f}")
+        _rc = C.BGRN if "TP" in result else C.BRED
+        print(f"  {_rc}[{result}]{C.RST} {C.BOLD}{coin}{C.RST}  P&L={_cp(pnl)}${pnl:.2f}{C.RST}")
         update_order_status(wb, position["id"], result, pnl)
         return result
 
@@ -593,7 +620,8 @@ def recover_open_positions() -> tuple[list, float]:
         recovered.append({"id": f"recovered-{coin}", "symbol": coin, "side": side,
                            "entry": entry, "qty": qty, "sl": sl, "tp": tp})
         capital_used += CAPITAL_PER_TRADE
-        print(f"  [REPRISE] {coin} {side} @ ${entry:.6g}")
+        _sc = C.BGRN if side == "BUY" else C.BRED
+        print(f"  {C.BCYN}[REPRISE]{C.RST} {coin} {_sc}{side}{C.RST} @ ${entry:.6g}")
 
     return recovered, capital_used
 
@@ -634,45 +662,46 @@ def calc_portfolio_pnl(wb: Workbook) -> tuple[float, float]:
 def _print_scan_summary():
     if not _scan_log:
         return
-    print(f"\n  ── Scan ({len(_scan_log)} symboles) ──")
+    print(f"\n  {C.DIM}── Scan ({len(_scan_log)} symboles) ──{C.RST}")
     for e in _scan_log:
         sig = e["signal"] or "–"
-        print(f"    {e['coin']:5s} {sig:4s}  score={e['score']:.3f}  {e['details']}")
+        _sc = C.BGRN if sig == "buy" else (C.BRED if sig == "sell" else C.DIM)
+        print(f"    {C.BOLD}{e['coin']:5s}{C.RST} {_sc}{sig:4s}{C.RST}  score={e['score']:.3f}  {C.DIM}{e['details']}{C.RST}")
     _scan_log.clear()
 
 # ── Boucle principale ─────────────────────────────────────────────────────────
 def run():
-    print("\n" + "═" * 60)
-    print("  BotShortTrade  –  Hyperliquid DEX")
-    print("═" * 60)
+    print(f"\n{C.BCYN}{'═' * 60}{C.RST}")
+    print(f"  {C.BOLD}BotShortTrade  –  Hyperliquid DEX{C.RST}")
+    print(f"{C.BCYN}{'═' * 60}{C.RST}")
 
     wb = init_excel()
     init_exchange_info()
 
     try:
         balance = get_equity()
-        print(f"  Balance : ${balance:.2f} USDC")
+        print(f"  Balance : {C.BOLD}${balance:.2f} USDC{C.RST}")
     except Exception as e:
         log_error(f"Balance: {e}")
         balance = MAX_LIQUIDITY
 
     initial_balance = load_initial_balance(balance)
-    print(f"  Solde initial : ${initial_balance:.2f} USDC")
+    print(f"  {C.DIM}Solde initial : ${initial_balance:.2f} USDC{C.RST}")
 
     open_positions, capital_in_use = recover_open_positions()
     if open_positions:
         reconcile_zombie_orders(wb, open_positions)
-        print(f"  Positions reprises : {len(open_positions)}")
+        print(f"  {C.BCYN}Positions reprises : {len(open_positions)}{C.RST}")
     else:
-        print("  Aucune position ouverte à la reprise")
+        print(f"  {C.DIM}Aucune position ouverte à la reprise{C.RST}")
 
     LOOP_SECONDS = 60
-    print(f"\n  Démarrage — scan toutes les {LOOP_SECONDS}s\n")
+    print(f"\n  {C.DIM}Démarrage — scan toutes les {LOOP_SECONDS}s{C.RST}\n")
 
     while True:
         loop_start = time.time()
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        print(f"\n[{ts}] ──────────────────────────────────────────────────")
+        print(f"\n{C.DIM}[{ts}] ──────────────────────────────────────────────────{C.RST}")
 
         # Suivi des positions ouvertes
         closed_this_loop = []
@@ -700,9 +729,10 @@ def run():
         unrealized = get_unrealized_pnl()
         net_pnl = pnl_total + unrealized
         net_pct = (net_pnl / initial_balance * 100) if initial_balance > 0 else 0.0
-        print(f"  Positions: {len(open_positions)}  Dispo: ${avail_capital:.2f}  Équité: ${balance:.2f}")
-        print(f"  P&L réalisé: ${pnl_total:+.2f}  |  Non réalisé: ${unrealized:+.2f}  |  Net: ${net_pnl:+.2f} ({net_pct:+.1f}%)")
-        print(f"  P&L 7j: ${pnl_week:+.2f}")
+        _dispo_c = C.BYLW if avail_capital < CAPITAL_PER_TRADE * 2 else C.WHT
+        print(f"  Positions: {C.BOLD}{len(open_positions)}{C.RST}  Dispo: {_dispo_c}${avail_capital:.2f}{C.RST}  Équité: {C.BOLD}${balance:.2f}{C.RST}")
+        print(f"  P&L réalisé: {_cp(pnl_total)}${pnl_total:+.2f}{C.RST}  |  Non réalisé: {_cp(unrealized)}${unrealized:+.2f}{C.RST}  |  Net: {_cp(net_pnl)}{C.BOLD}${net_pnl:+.2f} ({net_pct:+.1f}%){C.RST}")
+        print(f"  P&L 7j: {_cp(pnl_week)}${pnl_week:+.2f}{C.RST}")
 
         # Filtre horaire (heures UTC)
         hour_utc = datetime.now(timezone.utc).hour
@@ -713,9 +743,9 @@ def run():
         daily_loss_limit = -MAX_LIQUIDITY * MAX_DAILY_LOSS_PCT / 100
         daily_loss_hit = pnl_today <= daily_loss_limit
         if daily_loss_hit:
-            print(f"  [STOP] Perte journalière atteinte (${pnl_today:.2f} ≤ ${daily_loss_limit:.2f})")
+            print(f"  {C.BRED}[STOP]{C.RST} Perte journalière atteinte (${pnl_today:.2f} ≤ ${daily_loss_limit:.2f})")
         if not in_session:
-            print(f"  [PAUSE] Hors session ({hour_utc}h UTC, actif {SESSION_START_UTC}h-{SESSION_END_UTC}h)")
+            print(f"  {C.BYLW}[PAUSE]{C.RST} Hors session ({hour_utc}h UTC, actif {SESSION_START_UTC}h-{SESSION_END_UTC}h)")
 
         # Chercher un nouveau signal
         if slots_left > 0 and avail_capital >= CAPITAL_PER_TRADE and in_session and not daily_loss_hit:
@@ -725,7 +755,8 @@ def run():
 
             sig = best_signal(signals)
             if sig:
-                print(f"\n  [SIGNAL] {sig['symbol']} {sig['signal'].upper()}  score={sig['score']:.3f}")
+                _ss = C.BGRN if sig["signal"] == "buy" else C.BRED
+                print(f"\n  {_ss}[SIGNAL] {sig['symbol']} {sig['signal'].upper()}{C.RST}  score={sig['score']:.3f}")
                 try:
                     pos = place_order(sig, wb)
                     open_positions.append(pos)
@@ -734,9 +765,9 @@ def run():
                     log_error(f"place_order: {e}")
                     traceback.print_exc()
             else:
-                print("  Pas de signal retenu ce cycle")
+                print(f"  {C.DIM}Pas de signal retenu ce cycle{C.RST}")
         else:
-            print("  Slots/capital épuisés — scan ignoré")
+            print(f"  {C.DIM}Slots/capital épuisés — scan ignoré{C.RST}")
             _scan_log.clear()
 
         elapsed = time.time() - loop_start
@@ -749,7 +780,7 @@ if __name__ == "__main__":
     try:
         run()
     except KeyboardInterrupt:
-        print("\n  [STOP] Arrêt demandé")
+        print(f"\n  {C.BRED}[STOP]{C.RST} Arrêt demandé")
     except Exception as e:
         log_error(f"Crash fatal: {e}")
         traceback.print_exc()
