@@ -48,7 +48,7 @@ MAX_LIQUIDITY     = float(os.getenv("MAX_LIQUIDITY", 100))
 CAPITAL_PCT       = float(os.getenv("CAPITAL_PCT", 0.10))
 LEVERAGE          = int(os.getenv("LEVERAGE", 5))
 MIN_MOVE_PCT      = float(os.getenv("MIN_MOVE_PCT", 0.0002))
-VOL_MULTIPLIER    = float(os.getenv("VOL_MULTIPLIER", 0.60))
+VOL_MULTIPLIER    = float(os.getenv("VOL_MULTIPLIER", 1.2))
 MAX_TRADES        = int(os.getenv("MAX_TRADES", 0))
 MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", 3.0))   # % du capital
 SESSION_START_UTC  = int(os.getenv("SESSION_START_UTC", 7))         # heure UTC
@@ -57,7 +57,7 @@ SESSION_END_UTC    = int(os.getenv("SESSION_END_UTC", 22))          # heure UTC
 CAPITAL_PER_TRADE = MAX_LIQUIDITY * CAPITAL_PCT   # 10 $
 
 ATR_SL_MULT   = 1.5
-ATR_TP_MULT   = 2.5
+ATR_TP_MULT   = 3.0   # R:R 2:1 (TP = 3×ATR, SL = 1.5×ATR)
 TRAIL_TRIGGER = 1.5   # activer trailing quand profit ≥ 1.5×ATR
 TRAIL_DIST    = 1.0   # trailing SL à 1×ATR du prix courant
 
@@ -80,7 +80,8 @@ SYM_BYBIT   = {c: f"{c}USDT" for c in WATCHLIST}   # format Bybit
 INTERVAL_M1  = "1m"
 INTERVAL_M5  = "5m"
 INTERVAL_M15 = "15m"
-_BYBIT_IV    = {"1m": "1", "5m": "5", "15m": "15"}  # Bybit interval codes
+INTERVAL_D1  = "1D"
+_BYBIT_IV    = {"1m": "1", "5m": "5", "15m": "15", "1D": "D"}  # Bybit interval codes
 
 BYBIT_KLINE  = "https://api.bybit.com/v5/market/kline"
 
@@ -351,6 +352,28 @@ def get_unrealized_pnl() -> float:
         return sum(float(p["position"]["unrealizedPnl"]) for p in positions)
     except Exception:
         return 0.0
+
+def get_market_regime() -> tuple[str, str]:
+    """
+    Analyse BTC et ETH sur 7 jours pour déterminer le régime de marché.
+    Retourne (regime, bias) :
+      regime : 'TRENDING_UP' | 'TRENDING_DOWN' | 'RANGING'
+      bias   : 'up' | 'down' | 'neutral'
+    """
+    try:
+        btc = fetch_candles("BTC", INTERVAL_D1, 8)
+        eth = fetch_candles("ETH", INTERVAL_D1, 8)
+        btc_chg = (btc[-1]["c"] - btc[0]["c"]) / btc[0]["c"] * 100
+        eth_chg = (eth[-1]["c"] - eth[0]["c"]) / eth[0]["c"] * 100
+        avg_chg = (btc_chg + eth_chg) / 2
+
+        if avg_chg > 5:
+            return "TRENDING_UP",   "up"
+        if avg_chg < -5:
+            return "TRENDING_DOWN", "down"
+        return "RANGING", "neutral"
+    except Exception:
+        return "RANGING", "neutral"   # safe default
 
 def load_initial_balance(current_balance: float) -> float:
     if os.path.exists(STATE_FILE):
@@ -738,6 +761,11 @@ def run():
         hour_utc = datetime.now(timezone.utc).hour
         in_session = SESSION_START_UTC <= hour_utc < SESSION_END_UTC
 
+        # Régime de marché (BTC+ETH sur 7 jours)
+        regime, bias = get_market_regime()
+        _rc = C.BGRN if regime == "TRENDING_UP" else (C.BRED if regime == "TRENDING_DOWN" else C.BYLW)
+        print(f"  Régime: {_rc}{regime}{C.RST}  (biais: {bias})")
+
         # Limite de perte journalière
         _, pnl_today = calc_portfolio_pnl(wb)
         daily_loss_limit = -MAX_LIQUIDITY * MAX_DAILY_LOSS_PCT / 100
@@ -753,10 +781,21 @@ def run():
             signals    = scan_all(open_coins)
             _print_scan_summary()
 
+            # Filtrage par régime :
+            # RANGING → exiger score > 0.75 (marché sans direction claire)
+            # TRENDING_UP → n'accepter que les BUY
+            # TRENDING_DOWN → n'accepter que les SELL
+            min_score = 0.75 if regime == "RANGING" else 0.0
+            if regime == "TRENDING_UP":
+                signals = [s for s in signals if s["signal"] == "buy"]
+            elif regime == "TRENDING_DOWN":
+                signals = [s for s in signals if s["signal"] == "sell"]
+            signals = [s for s in signals if s["score"] >= min_score]
+
             sig = best_signal(signals)
             if sig:
                 _ss = C.BGRN if sig["signal"] == "buy" else C.BRED
-                print(f"\n  {_ss}[SIGNAL] {sig['symbol']} {sig['signal'].upper()}{C.RST}  score={sig['score']:.3f}")
+                print(f"\n  {_ss}[SIGNAL] {sig['symbol']} {sig['signal'].upper()}{C.RST}  score={sig['score']:.3f}  régime={regime}")
                 try:
                     pos = place_order(sig, wb)
                     open_positions.append(pos)
