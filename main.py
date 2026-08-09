@@ -817,8 +817,11 @@ def run():
         hour_utc = datetime.now(timezone.utc).hour
         in_session = SESSION_START_UTC <= hour_utc < SESSION_END_UTC
 
-        # Régime de marché (BTC+ETH sur 7 jours)
-        regime, bias, btc_chg, eth_chg = get_market_regime()
+        # Régime de marché — mis à jour toutes les 30 min (candles journalières, pas besoin de plus)
+        now_min = datetime.now(timezone.utc).minute
+        if "_regime_cache" not in run.__dict__ or now_min % 30 == 0:
+            run._regime_cache = get_market_regime()
+        regime, bias, btc_chg, eth_chg = run._regime_cache
         _rc = (C.BGRN if regime == "BULL" else
                C.BRED if regime in ("BEAR", "DIVERGING") else C.BYLW)
         print(f"  Régime: {_rc}{regime}{C.RST}  BTC={btc_chg:+.1f}%  ETH={eth_chg:+.1f}%")
@@ -829,13 +832,15 @@ def run():
         daily_loss_hit = pnl_today <= daily_loss_limit
         if daily_loss_hit:
             print(f"  {C.BRED}[STOP]{C.RST} Perte journalière atteinte (${pnl_today:.2f} ≤ ${daily_loss_limit:.2f})")
-        if not in_session:
-            print(f"  {C.BYLW}[PAUSE]{C.RST} Hors session ({hour_utc}h UTC, actif {SESSION_START_UTC}h-{SESSION_END_UTC}h)")
 
         # Bloquer les nouveaux trades en régime dangereux
         regime_blocked = regime in ("BEAR", "DIVERGING")
         if regime_blocked:
             print(f"  {C.BRED}[RÉGIME]{C.RST} {regime} — aucun nouveau trade")
+
+        # Raison de non-scan (lisible)
+        if not in_session:
+            print(f"  {C.BYLW}[PAUSE]{C.RST} Hors session ({hour_utc}h UTC, actif {SESSION_START_UTC}h-{SESSION_END_UTC}h)")
 
         # Chercher un nouveau signal
         if slots_left > 0 and avail_capital >= CAPITAL_PER_TRADE and in_session and not daily_loss_hit and not regime_blocked:
@@ -844,12 +849,11 @@ def run():
             _print_scan_summary()
 
             # Filtrage par régime :
-            # BULL     → favorise BUY, accepte SELL si le signal est fort
+            # BULL     → BUY uniquement (dans la tendance)
             # RANGING  → exige score > 0.75 (marché sans direction claire)
             min_score = 0.75 if regime == "RANGING" else 0.0
             if regime == "BULL":
                 signals = [s for s in signals if s["signal"] == "buy"]
-
             signals = [s for s in signals if s["score"] >= min_score]
 
             sig = best_signal(signals)
@@ -865,8 +869,13 @@ def run():
                     traceback.print_exc()
             else:
                 print(f"  {C.DIM}Pas de signal retenu ce cycle{C.RST}")
+        elif slots_left <= 0:
+            print(f"  {C.DIM}Toutes les positions sont ouvertes — scan ignoré{C.RST}")
+            _scan_log.clear()
+        elif avail_capital < CAPITAL_PER_TRADE:
+            print(f"  {C.DIM}Capital insuffisant (${avail_capital:.2f} < ${CAPITAL_PER_TRADE:.2f}) — scan ignoré{C.RST}")
+            _scan_log.clear()
         else:
-            print(f"  {C.DIM}Slots/capital épuisés — scan ignoré{C.RST}")
             _scan_log.clear()
 
         elapsed = time.time() - loop_start
