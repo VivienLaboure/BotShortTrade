@@ -307,25 +307,30 @@ def get_signal(coin: str) -> dict | None:
         avg_vol1 = _avg_vol(c1)
         vol1_ok  = c1[-1]["v"] >= avg_vol1 * VOL_MULTIPLIER
 
+        # 3 bougies M5 consécutives dans le même sens (confirmation momentum)
+        bars3_bull = all(c5[-i]["c"] > c5[-i]["o"] for i in range(1, 4))  # 3 bougies vertes
+        bars3_bear = all(c5[-i]["c"] < c5[-i]["o"] for i in range(1, 4))  # 3 bougies rouges
+
         signal = None
         score  = 0.0
         vol_ratio = c5[-1]["v"] / avg_vol5 if avg_vol5 else 1.0
 
         # RSI 40-65 pour buy : momentum confirmé mais pas overbought
         # RSI 35-60 pour sell : momentum baissier mais pas oversold
-        if bias_up and confirm_long and vol_ok and move_ok and 40 <= rsi1 <= 65 and vol1_ok:
+        if bias_up and confirm_long and vol_ok and move_ok and 40 <= rsi1 <= 65 and vol1_ok and bars3_bull:
             signal = "buy"
             # Récompense RSI bas dans la zone valide (achat sur repli, pas sur pic)
             rsi_score = (65 - rsi1) / 25
             score  = round(rsi_score * 0.3 + vol_ratio * 0.4 + 0.3, 3)
-        elif bias_dn and confirm_short and vol_ok and move_ok and 35 <= rsi1 <= 60 and vol1_ok:
+        elif bias_dn and confirm_short and vol_ok and move_ok and 35 <= rsi1 <= 60 and vol1_ok and bars3_bear:
             signal = "sell"
             # Récompense RSI haut dans la zone valide (vente sur rebond, pas sur creux)
             rsi_score = (rsi1 - 35) / 25
             score  = round(rsi_score * 0.3 + vol_ratio * 0.4 + 0.3, 3)
 
+        bars3_str = ("3×↑" if bars3_bull else ("3×↓" if bars3_bear else "3×✗"))
         details = (f"M15={'↑' if bias_up else '↓'} M5={'↑' if confirm_long else '↓'} "
-                   f"RSI={rsi1:.1f} vol={c5[-1]['v']:.2f}/{avg_vol5:.2f}")
+                   f"RSI={rsi1:.1f} vol={c5[-1]['v']:.2f}/{avg_vol5:.2f} {bars3_str}")
         log_scan(coin, "M15/M5/M1", signal, score, details)
 
         if signal:
