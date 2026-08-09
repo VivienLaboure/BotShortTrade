@@ -51,8 +51,8 @@ MIN_MOVE_PCT      = float(os.getenv("MIN_MOVE_PCT", 0.0002))
 VOL_MULTIPLIER    = float(os.getenv("VOL_MULTIPLIER", 1.2))
 MAX_TRADES        = int(os.getenv("MAX_TRADES", 0))
 MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", 3.0))   # % du capital
-SESSION_START_UTC  = int(os.getenv("SESSION_START_UTC", 7))         # heure UTC
-SESSION_END_UTC    = int(os.getenv("SESSION_END_UTC", 22))          # heure UTC
+SESSION_START_UTC  = int(os.getenv("SESSION_START_UTC", 0))         # heure UTC (0 = minuit)
+SESSION_END_UTC    = int(os.getenv("SESSION_END_UTC", 24))          # heure UTC (24 = H24)
 
 # Initialisées au démarrage dans run() depuis le solde réel
 MAX_LIQUIDITY     = _MAX_LIQ_CFG if _MAX_LIQ_CFG > 0 else 100.0  # placeholder
