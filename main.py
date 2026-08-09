@@ -44,7 +44,7 @@ load_dotenv()
 
 HL_PRIVATE_KEY    = os.environ["HL_PRIVATE_KEY"]
 HL_TESTNET        = os.getenv("HL_TESTNET", "1") == "1"
-MAX_LIQUIDITY     = float(os.getenv("MAX_LIQUIDITY", 100))
+_MAX_LIQ_CFG  = float(os.getenv("MAX_LIQUIDITY", 0))  # 0 = auto (solde réel)
 CAPITAL_PCT       = float(os.getenv("CAPITAL_PCT", 0.10))
 LEVERAGE          = int(os.getenv("LEVERAGE", 5))
 MIN_MOVE_PCT      = float(os.getenv("MIN_MOVE_PCT", 0.0002))
@@ -54,7 +54,9 @@ MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", 3.0))   # % du capita
 SESSION_START_UTC  = int(os.getenv("SESSION_START_UTC", 7))         # heure UTC
 SESSION_END_UTC    = int(os.getenv("SESSION_END_UTC", 22))          # heure UTC
 
-CAPITAL_PER_TRADE = MAX_LIQUIDITY * CAPITAL_PCT   # 10 $
+# Initialisées au démarrage dans run() depuis le solde réel
+MAX_LIQUIDITY     = _MAX_LIQ_CFG if _MAX_LIQ_CFG > 0 else 100.0  # placeholder
+CAPITAL_PER_TRADE = MAX_LIQUIDITY * CAPITAL_PCT
 
 ATR_SL_MULT   = 1.5
 ATR_TP_MULT   = 3.0   # R:R 2:1 (TP = 3×ATR, SL = 1.5×ATR)
@@ -741,15 +743,29 @@ def run():
     wb = init_excel()
     init_exchange_info()
 
+    # ── Calibrage du capital sur le solde réel ────────────────────────────────
+    global MAX_LIQUIDITY, CAPITAL_PER_TRADE
     try:
         balance = get_equity()
         print(f"  Balance : {C.BOLD}${balance:.2f} USDC{C.RST}")
     except Exception as e:
         log_error(f"Balance: {e}")
-        balance = MAX_LIQUIDITY
+        balance = _MAX_LIQ_CFG if _MAX_LIQ_CFG > 0 else 100.0
+
+    if _MAX_LIQ_CFG > 0:
+        # Plafond manuel — utile pour limiter l'exposition si le portefeuille est grand
+        MAX_LIQUIDITY = min(_MAX_LIQ_CFG, balance)
+        print(f"  {C.BYLW}Capital plafonné à ${MAX_LIQUIDITY:.2f} (config) sur ${balance:.2f} disponibles{C.RST}")
+    else:
+        # Mode auto : gère tout le portefeuille
+        MAX_LIQUIDITY = balance
+        print(f"  {C.BGRN}Capital auto : ${MAX_LIQUIDITY:.2f} USDC (solde complet){C.RST}")
+
+    CAPITAL_PER_TRADE = MAX_LIQUIDITY * CAPITAL_PCT
+    print(f"  {C.DIM}Par trade : {CAPITAL_PCT*100:.0f}% × ${MAX_LIQUIDITY:.2f} = {C.RST}{C.BOLD}${CAPITAL_PER_TRADE:.2f}{C.RST}")
 
     initial_balance = load_initial_balance(balance)
-    print(f"  {C.DIM}Solde initial : ${initial_balance:.2f} USDC{C.RST}")
+    print(f"  {C.DIM}Solde initial (référence % P&L) : ${initial_balance:.2f} USDC{C.RST}")
 
     open_positions, capital_in_use = recover_open_positions()
     if open_positions:
