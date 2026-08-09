@@ -358,27 +358,37 @@ def get_unrealized_pnl() -> float:
     except Exception:
         return 0.0
 
-def get_market_regime() -> tuple[str, str]:
+def get_market_regime() -> tuple[str, str, float, float]:
     """
-    Analyse BTC et ETH sur 7 jours pour déterminer le régime de marché.
-    Retourne (regime, bias) :
-      regime : 'TRENDING_UP' | 'TRENDING_DOWN' | 'RANGING'
-      bias   : 'up' | 'down' | 'neutral'
+    Analyse BTC et ETH sur 7 jours — 4 régimes (inspiré de tbot) :
+      BULL      : BTC et ETH tous les deux > +5%  → trade normal, favorise BUY
+      BEAR      : BTC et ETH tous les deux < -5%  → aucun nouveau trade
+      RANGING   : les deux dans ±5%               → exige score élevé
+      DIVERGING : l'un monte, l'autre descend      → aucun nouveau trade (marché incohérent)
+
+    Retourne (regime, bias, btc_chg_pct, eth_chg_pct)
     """
     try:
         btc = fetch_candles("BTC", INTERVAL_D1, 8)
         eth = fetch_candles("ETH", INTERVAL_D1, 8)
         btc_chg = (btc[-1]["c"] - btc[0]["c"]) / btc[0]["c"] * 100
         eth_chg = (eth[-1]["c"] - eth[0]["c"]) / eth[0]["c"] * 100
+
+        # DIVERGING : BTC et ETH se contredisent (>3% d'écart et dans des sens opposés)
+        if btc_chg > 3 and eth_chg < -3:
+            return "DIVERGING", "neutral", btc_chg, eth_chg
+        if btc_chg < -3 and eth_chg > 3:
+            return "DIVERGING", "neutral", btc_chg, eth_chg
+
         avg_chg = (btc_chg + eth_chg) / 2
 
         if avg_chg > 5:
-            return "TRENDING_UP",   "up"
+            return "BULL",    "up",      btc_chg, eth_chg
         if avg_chg < -5:
-            return "TRENDING_DOWN", "down"
-        return "RANGING", "neutral"
+            return "BEAR",    "down",    btc_chg, eth_chg
+        return "RANGING",     "neutral", btc_chg, eth_chg
     except Exception:
-        return "RANGING", "neutral"   # safe default
+        return "RANGING", "neutral", 0.0, 0.0   # safe default
 
 def load_initial_balance(current_balance: float) -> float:
     if os.path.exists(STATE_FILE):
@@ -767,9 +777,10 @@ def run():
         in_session = SESSION_START_UTC <= hour_utc < SESSION_END_UTC
 
         # Régime de marché (BTC+ETH sur 7 jours)
-        regime, bias = get_market_regime()
-        _rc = C.BGRN if regime == "TRENDING_UP" else (C.BRED if regime == "TRENDING_DOWN" else C.BYLW)
-        print(f"  Régime: {_rc}{regime}{C.RST}  (biais: {bias})")
+        regime, bias, btc_chg, eth_chg = get_market_regime()
+        _rc = (C.BGRN if regime == "BULL" else
+               C.BRED if regime in ("BEAR", "DIVERGING") else C.BYLW)
+        print(f"  Régime: {_rc}{regime}{C.RST}  BTC={btc_chg:+.1f}%  ETH={eth_chg:+.1f}%")
 
         # Limite de perte journalière
         _, pnl_today = calc_portfolio_pnl(wb)
@@ -780,21 +791,24 @@ def run():
         if not in_session:
             print(f"  {C.BYLW}[PAUSE]{C.RST} Hors session ({hour_utc}h UTC, actif {SESSION_START_UTC}h-{SESSION_END_UTC}h)")
 
+        # Bloquer les nouveaux trades en régime dangereux
+        regime_blocked = regime in ("BEAR", "DIVERGING")
+        if regime_blocked:
+            print(f"  {C.BRED}[RÉGIME]{C.RST} {regime} — aucun nouveau trade")
+
         # Chercher un nouveau signal
-        if slots_left > 0 and avail_capital >= CAPITAL_PER_TRADE and in_session and not daily_loss_hit:
+        if slots_left > 0 and avail_capital >= CAPITAL_PER_TRADE and in_session and not daily_loss_hit and not regime_blocked:
             open_coins = {p["symbol"] for p in open_positions}
             signals    = scan_all(open_coins)
             _print_scan_summary()
 
             # Filtrage par régime :
-            # RANGING → exiger score > 0.75 (marché sans direction claire)
-            # TRENDING_UP → n'accepter que les BUY
-            # TRENDING_DOWN → n'accepter que les SELL
+            # BULL     → favorise BUY, accepte SELL si le signal est fort
+            # RANGING  → exige score > 0.75 (marché sans direction claire)
             min_score = 0.75 if regime == "RANGING" else 0.0
-            if regime == "TRENDING_UP":
+            if regime == "BULL":
                 signals = [s for s in signals if s["signal"] == "buy"]
-            elif regime == "TRENDING_DOWN":
-                signals = [s for s in signals if s["signal"] == "sell"]
+
             signals = [s for s in signals if s["score"] >= min_score]
 
             sig = best_signal(signals)
