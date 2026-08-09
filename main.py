@@ -439,7 +439,33 @@ def _save_initial_balance(balance: float):
             pass
     state["initial_balance"] = round(balance, 4)
     with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
+        json.dump(state, f, indent=2)
+
+def save_positions_state(positions: list):
+    """Persiste les positions ouvertes dans bot_state.json après chaque changement."""
+    state = {}
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE) as f:
+                state = json.load(f)
+        except Exception:
+            pass
+    state["open_positions"] = positions
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+def load_positions_state() -> dict[str, dict]:
+    """Charge l'état enrichi des positions depuis bot_state.json.
+    Retourne {coin: position_dict} pour enrichir la reprise depuis l'API."""
+    if not os.path.exists(STATE_FILE):
+        return {}
+    try:
+        with open(STATE_FILE) as f:
+            state = json.load(f)
+        saved = state.get("open_positions", [])
+        return {p["symbol"]: p for p in saved if "symbol" in p}
+    except Exception:
+        return {}
 
 # ── Scan parallèle ────────────────────────────────────────────────────────────
 def scan_all(open_coins: set[str]) -> list[dict]:
@@ -659,6 +685,9 @@ def check_position(wb: Workbook, position: dict) -> str | None:
 
 # ── Récupération positions à la reprise ──────────────────────────────────────
 def recover_open_positions() -> tuple[list, float]:
+    # Charger l'état enrichi du dernier run (sl_oid, atr, sl, tp, open_fee)
+    saved_state = load_positions_state()
+
     try:
         user_state = info.user_state(WALLET_ADDRESS)
         asset_pos  = user_state.get("assetPositions", [])
@@ -679,14 +708,35 @@ def recover_open_positions() -> tuple[list, float]:
         side  = "BUY" if size > 0 else "SELL"
         entry = float(p.get("entryPx") or 0)
         qty   = abs(size)
-        atr_fb = entry * 0.002
-        sl = (entry - ATR_SL_MULT * atr_fb) if side == "BUY" else (entry + ATR_SL_MULT * atr_fb)
-        tp = (entry + ATR_TP_MULT * atr_fb) if side == "BUY" else (entry - ATR_TP_MULT * atr_fb)
-        recovered.append({"id": f"recovered-{coin}", "symbol": coin, "side": side,
-                           "entry": entry, "qty": qty, "sl": sl, "tp": tp})
+
+        # Tenter d'enrichir avec l'état sauvegardé (sl_oid, atr réel, sl/tp précis)
+        saved = saved_state.get(coin, {})
+        enriched = saved and saved.get("side") == side
+        if enriched:
+            sl       = saved.get("sl",       (entry - ATR_SL_MULT * entry * 0.002) if side == "BUY" else (entry + ATR_SL_MULT * entry * 0.002))
+            tp       = saved.get("tp",       (entry + ATR_TP_MULT * entry * 0.002) if side == "BUY" else (entry - ATR_TP_MULT * entry * 0.002))
+            atr      = saved.get("atr",      entry * 0.002)
+            sl_oid   = saved.get("sl_oid")
+            open_fee = saved.get("open_fee", 0.0)
+            oid      = saved.get("id",       f"recovered-{coin}")
+        else:
+            atr_fb   = entry * 0.002
+            sl       = (entry - ATR_SL_MULT * atr_fb) if side == "BUY" else (entry + ATR_SL_MULT * atr_fb)
+            tp       = (entry + ATR_TP_MULT * atr_fb) if side == "BUY" else (entry - ATR_TP_MULT * atr_fb)
+            atr      = atr_fb
+            sl_oid   = None
+            open_fee = 0.0
+            oid      = f"recovered-{coin}"
+
+        position = {"id": oid, "symbol": coin, "side": side,
+                    "entry": entry, "qty": qty, "sl": sl, "tp": tp,
+                    "sl_oid": sl_oid, "atr": atr, "open_fee": open_fee}
+        recovered.append(position)
         capital_used += CAPITAL_PER_TRADE
-        _sc = C.BGRN if side == "BUY" else C.BRED
-        print(f"  {C.BCYN}[REPRISE]{C.RST} {coin} {_sc}{side}{C.RST} @ ${entry:.6g}")
+
+        _sc  = C.BGRN if side == "BUY" else C.BRED
+        _enr = (C.BGRN + "état complet" + C.RST) if enriched else (C.BYLW + "état partiel" + C.RST)
+        print(f"  {C.BCYN}[REPRISE]{C.RST} {coin} {_sc}{side}{C.RST} @ ${entry:.6g}  ({_enr})")
 
     return recovered, capital_used
 
@@ -793,6 +843,10 @@ def run():
             open_positions.remove(pos)
             capital_in_use = max(0.0, capital_in_use - CAPITAL_PER_TRADE)
 
+        # Persister l'état si des positions ont changé ce cycle
+        if closed_this_loop:
+            save_positions_state(open_positions)
+
         # Balance à jour
         try:
             balance = get_equity()
@@ -864,6 +918,7 @@ def run():
                     pos = place_order(sig, wb)
                     open_positions.append(pos)
                     capital_in_use += CAPITAL_PER_TRADE
+                    save_positions_state(open_positions)  # persister immédiatement
                 except Exception as e:
                     log_error(f"place_order: {e}")
                     traceback.print_exc()
