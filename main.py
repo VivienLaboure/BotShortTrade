@@ -268,6 +268,25 @@ def _vwap(candles: list[dict]) -> float:
     den = sum(c["v"] for c in candles)
     return num / den if den else 0.0
 
+def _bb(closes: list[float], n: int = 20, k: float = 2.0) -> tuple[float, float, float, float]:
+    """
+    Bollinger Bands sur les n dernières closes.
+    Retourne (upper, middle, lower, bbp) où :
+      bbp = (close - lower) / (upper - lower)
+      bbp < 0  → prix sous la bande basse  (extrême oversold)
+      0..0.5   → moitié basse de la range
+      0.5..1   → moitié haute de la range
+      bbp > 1  → prix au-dessus de la bande haute (extrême overbought)
+    """
+    window = closes[-n:]
+    mid    = sum(window) / len(window)
+    var    = sum((p - mid) ** 2 for p in window) / len(window)
+    std    = var ** 0.5
+    upper  = mid + k * std
+    lower  = mid - k * std
+    bbp    = (closes[-1] - lower) / (upper - lower) if upper != lower else 0.5
+    return upper, mid, lower, round(bbp, 3)
+
 def _avg_vol(candles: list[dict], n: int = 20) -> float:
     vols = [c["v"] for c in candles[-n:]]
     return sum(vols) / len(vols) if vols else 0.0
@@ -286,13 +305,14 @@ def get_signal(coin: str) -> dict | None:
         bias_up = c15[-1]["c"] > ema20_15[-1]
         bias_dn = c15[-1]["c"] < ema20_15[-1]
 
-        # M5 confirmation (VWAP + EMA8 + ATR)
+        # M5 confirmation (VWAP + EMA8 + ATR + Bollinger Bands)
         closes5 = [c["c"] for c in c5]
         ema8_5  = _ema(closes5, 8)
         vwap5   = _vwap(c5)
         atr5    = _atr(c5, 14)
         last5   = closes5[-1]
         move_pct = abs(last5 - closes5[-2]) / closes5[-2] if closes5[-2] else 0
+        _, _, _, bbp5 = _bb(closes5, n=20, k=2.0)
 
         confirm_long  = last5 > ema8_5[-1] and last5 > vwap5
         confirm_short = last5 < ema8_5[-1] and last5 < vwap5
@@ -301,6 +321,11 @@ def get_signal(coin: str) -> dict | None:
         vol_ok   = c5[-1]["v"] >= avg_vol5 * VOL_MULTIPLIER
         move_ok  = move_pct >= MIN_MOVE_PCT
 
+        # BBP : prix dans la zone basse pour BUY, haute pour SELL
+        # 0.35 = tiers bas de la bande  |  0.65 = tiers haut
+        bb_long_ok  = bbp5 <= 0.35
+        bb_short_ok = bbp5 >= 0.65
+
         # M1 entrée (RSI14 + volume)
         closes1  = [c["c"] for c in c1]
         rsi1     = _rsi(closes1, 14)
@@ -308,8 +333,8 @@ def get_signal(coin: str) -> dict | None:
         vol1_ok  = c1[-1]["v"] >= avg_vol1 * VOL_MULTIPLIER
 
         # 3 bougies M5 consécutives dans le même sens (confirmation momentum)
-        bars3_bull = all(c5[-i]["c"] > c5[-i]["o"] for i in range(1, 4))  # 3 bougies vertes
-        bars3_bear = all(c5[-i]["c"] < c5[-i]["o"] for i in range(1, 4))  # 3 bougies rouges
+        bars3_bull = all(c5[-i]["c"] > c5[-i]["o"] for i in range(1, 4))
+        bars3_bear = all(c5[-i]["c"] < c5[-i]["o"] for i in range(1, 4))
 
         signal = None
         score  = 0.0
@@ -317,20 +342,20 @@ def get_signal(coin: str) -> dict | None:
 
         # RSI 40-65 pour buy : momentum confirmé mais pas overbought
         # RSI 35-60 pour sell : momentum baissier mais pas oversold
-        if bias_up and confirm_long and vol_ok and move_ok and 40 <= rsi1 <= 65 and vol1_ok and bars3_bull:
+        if bias_up and confirm_long and vol_ok and move_ok and 40 <= rsi1 <= 65 and vol1_ok and bars3_bull and bb_long_ok:
             signal = "buy"
-            # Récompense RSI bas dans la zone valide (achat sur repli, pas sur pic)
             rsi_score = (65 - rsi1) / 25
-            score  = round(rsi_score * 0.3 + vol_ratio * 0.4 + 0.3, 3)
-        elif bias_dn and confirm_short and vol_ok and move_ok and 35 <= rsi1 <= 60 and vol1_ok and bars3_bear:
+            bb_score  = (0.35 - bbp5) / 0.35   # plus bbp est bas, mieux c'est
+            score  = round(rsi_score * 0.25 + vol_ratio * 0.4 + bb_score * 0.15 + 0.2, 3)
+        elif bias_dn and confirm_short and vol_ok and move_ok and 35 <= rsi1 <= 60 and vol1_ok and bars3_bear and bb_short_ok:
             signal = "sell"
-            # Récompense RSI haut dans la zone valide (vente sur rebond, pas sur creux)
             rsi_score = (rsi1 - 35) / 25
-            score  = round(rsi_score * 0.3 + vol_ratio * 0.4 + 0.3, 3)
+            bb_score  = (bbp5 - 0.65) / 0.35   # plus bbp est haut, mieux c'est
+            score  = round(rsi_score * 0.25 + vol_ratio * 0.4 + bb_score * 0.15 + 0.2, 3)
 
         bars3_str = ("3×↑" if bars3_bull else ("3×↓" if bars3_bear else "3×✗"))
         details = (f"M15={'↑' if bias_up else '↓'} M5={'↑' if confirm_long else '↓'} "
-                   f"RSI={rsi1:.1f} vol={c5[-1]['v']:.2f}/{avg_vol5:.2f} {bars3_str}")
+                   f"RSI={rsi1:.1f} BBP={bbp5:.2f} vol={c5[-1]['v']:.2f}/{avg_vol5:.2f} {bars3_str}")
         log_scan(coin, "M15/M5/M1", signal, score, details)
 
         if signal:
