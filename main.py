@@ -338,26 +338,43 @@ def get_signal(coin: str) -> dict | None:
         bars3_bull = all(c5[-i]["c"] > c5[-i]["o"] for i in range(1, 4))
         bars3_bear = all(c5[-i]["c"] < c5[-i]["o"] for i in range(1, 4))
 
-        signal = None
-        score  = 0.0
+        signal    = None
+        score     = 0.0
+        mode      = ""
         vol_ratio = c5[-1]["v"] / avg_vol5 if avg_vol5 else 1.0
 
-        # RSI 40-65 pour buy : momentum confirmé mais pas overbought
-        # RSI 35-60 pour sell : momentum baissier mais pas oversold
-        if bias_up and confirm_long and vol_ok and move_ok and 40 <= rsi1 <= 65 and vol1_ok and bars3_bull and bb_long_ok:
-            signal = "buy"
-            rsi_score = (65 - rsi1) / 25
-            bb_score  = (0.35 - bbp5) / 0.35   # plus bbp est bas, mieux c'est
-            score  = round(rsi_score * 0.25 + vol_ratio * 0.4 + bb_score * 0.15 + 0.2, 3)
-        elif bias_dn and confirm_short and vol_ok and move_ok and 35 <= rsi1 <= 60 and vol1_ok and bars3_bear and bb_short_ok:
-            signal = "sell"
-            rsi_score = (rsi1 - 35) / 25
-            bb_score  = (bbp5 - 0.65) / 0.35   # plus bbp est haut, mieux c'est
-            score  = round(rsi_score * 0.25 + vol_ratio * 0.4 + bb_score * 0.15 + 0.2, 3)
+        base_cond = vol_ok and move_ok and vol1_ok and bars3_bear  # partagé short
+        base_long = vol_ok and move_ok and vol1_ok and bars3_bull   # partagé long
+
+        # ── BUY mean-reversion : RSI en zone neutre, prix bas de la bande ──────
+        if bias_up and confirm_long and base_long and 30 <= rsi1 <= 70 and bbp5 <= 0.40:
+            signal    = "buy"
+            mode      = "MR"
+            rsi_score = (70 - rsi1) / 40
+            bb_score  = (0.40 - bbp5) / 0.40
+            score     = round(rsi_score * 0.25 + vol_ratio * 0.4 + bb_score * 0.15 + 0.2, 3)
+
+        # ── SELL mean-reversion : RSI neutre, prix haut de la bande ─────────────
+        elif bias_dn and confirm_short and base_cond and 35 <= rsi1 <= 65 and bb_short_ok:
+            signal    = "sell"
+            mode      = "MR"
+            rsi_score = (rsi1 - 35) / 30
+            bb_score  = (bbp5 - 0.65) / 0.35
+            score     = round(rsi_score * 0.25 + vol_ratio * 0.4 + bb_score * 0.15 + 0.2, 3)
+
+        # ── SELL momentum : crash/tendance forte — prix sous la bande basse ─────
+        # RSI extrême (<= 35) + prix cassant sous la BB + toute la structure baissière
+        elif bias_dn and confirm_short and base_cond and rsi1 <= 35 and bbp5 <= 0.35:
+            signal    = "sell"
+            mode      = "MOM"
+            rsi_score = max(0.0, (35 - rsi1) / 35)   # plus RSI bas = momentum fort
+            bb_score  = max(0.0, (0.35 - bbp5) / 0.35)
+            score     = round(vol_ratio * 0.5 + rsi_score * 0.25 + bb_score * 0.25, 3)
 
         bars3_str = ("3×↑" if bars3_bull else ("3×↓" if bars3_bear else "3×✗"))
         details = (f"M15={'↑' if bias_up else '↓'} M5={'↑' if confirm_long else '↓'} "
-                   f"RSI={rsi1:.1f} BBP={bbp5:.2f} vol={c5[-1]['v']:.2f}/{avg_vol5:.2f} {bars3_str}")
+                   f"RSI={rsi1:.1f} BBP={bbp5:.2f} vol={c5[-1]['v']:.2f}/{avg_vol5:.2f} {bars3_str}"
+                   + (f" [{mode}]" if mode else ""))
         log_scan(coin, "M15/M5/M1", signal, score, details)
 
         if signal:
