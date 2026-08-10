@@ -870,8 +870,17 @@ def run():
         except Exception:
             pass
 
-        # Disponible = ce qu'il reste du capital alloué (tracking interne, pas l'API)
-        avail_capital = MAX_LIQUIDITY - capital_in_use
+        # Disponible = min(tracking interne, cash libre réel)
+        # Le solde Hyperliquid (balance) inclut déjà la marge des positions ouvertes.
+        # Si balance < capital_in_use, le compte est en sous-marge → bloquer tout nouveau trade.
+        internal_avail = MAX_LIQUIDITY - capital_in_use
+        real_free      = max(0.0, balance - capital_in_use)   # cash libre estimé côté exchange
+        avail_capital  = min(internal_avail, real_free)
+
+        # Alerte si divergence > 20% entre tracking interne et solde réel
+        if internal_avail > 0 and real_free < internal_avail * 0.8:
+            print(f"  {C.BRED}[ALERTE]{C.RST} Dispo interne ${internal_avail:.2f} vs cash libre estimé ${real_free:.2f} — solde réel à vérifier")
+
         max_slots     = MAX_TRADES if MAX_TRADES > 0 else 999
         slots_left    = max_slots - len(open_positions)
 
@@ -879,7 +888,7 @@ def run():
         unrealized = get_unrealized_pnl()
         net_pnl = pnl_total + unrealized
         net_pct = (net_pnl / initial_balance * 100) if initial_balance > 0 else 0.0
-        _dispo_c = C.BYLW if avail_capital < CAPITAL_PER_TRADE * 2 else C.WHT
+        _dispo_c = C.BRED if avail_capital <= 0 else (C.BYLW if avail_capital < CAPITAL_PER_TRADE * 2 else C.WHT)
         print(f"  Positions: {C.BOLD}{len(open_positions)}{C.RST}  Dispo: {_dispo_c}${avail_capital:.2f}{C.RST}  Équité: {C.BOLD}${balance:.2f}{C.RST}")
         print(f"  P&L réalisé: {_cp(pnl_total)}${pnl_total:+.2f}{C.RST}  |  Non réalisé: {_cp(unrealized)}${unrealized:+.2f}{C.RST}  |  Net: {_cp(net_pnl)}{C.BOLD}${net_pnl:+.2f} ({net_pct:+.1f}%){C.RST}")
         print(f"  P&L 7j: {_cp(pnl_week)}${pnl_week:+.2f}{C.RST}")
