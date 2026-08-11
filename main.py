@@ -193,7 +193,8 @@ def update_order_status(wb: Workbook, order_id, status: str, pnl: float | None =
     _safe_save(wb)
 
 # ── Journalisation ────────────────────────────────────────────────────────────
-_scan_log: list[dict] = []
+_scan_log:  list[dict] = []
+_last_scan: list[dict] = []   # snapshot du dernier scan complet (pour le dashboard)
 
 def log_error(msg: str):
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
@@ -792,6 +793,7 @@ def calc_portfolio_pnl(wb: Workbook) -> tuple[float, float]:
     return round(total, 2), round(weekly, 2)
 
 def _print_scan_summary():
+    global _last_scan
     if not _scan_log:
         return
     print(f"\n  {C.DIM}── Scan ({len(_scan_log)} symboles) ──{C.RST}")
@@ -799,7 +801,241 @@ def _print_scan_summary():
         sig = e["signal"] or "–"
         _sc = C.BGRN if sig == "buy" else (C.BRED if sig == "sell" else C.DIM)
         print(f"    {C.BOLD}{e['coin']:5s}{C.RST} {_sc}{sig:4s}{C.RST}  score={e['score']:.3f}  {C.DIM}{e['details']}{C.RST}")
+    _last_scan = list(_scan_log)   # snapshot pour le dashboard
     _scan_log.clear()
+
+# ── Génération du dashboard HTML ──────────────────────────────────────────────
+def write_dashboard(wb: Workbook, open_positions: list, balance: float,
+                    initial_balance: float, pnl_total: float, pnl_week: float,
+                    unrealized: float, avail_capital: float,
+                    regime: str, btc_chg: float, eth_chg: float):
+    try:
+        ws = wb["Trades"]
+        rows = [r for r in ws.iter_rows(min_row=2, values_only=True) if r[14] is not None and r[14] != ""]
+        wins   = [r for r in rows if float(r[14] or 0) > 0]
+        losses = [r for r in rows if float(r[14] or 0) < 0]
+        total_trades = len(rows)
+        win_rate     = len(wins) / total_trades * 100 if total_trades else 0.0
+        gross_profit = sum(float(r[14]) for r in wins)
+        gross_loss   = abs(sum(float(r[14]) for r in losses))
+        profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else 0.0
+        net_pnl  = pnl_total + unrealized
+        net_pct  = net_pnl / initial_balance * 100 if initial_balance > 0 else 0.0
+        now_str  = datetime.now(timezone.utc).strftime("%d/%m/%Y à %H:%M:%S UTC")
+
+        def _pct_col(v): return "green" if v >= 0 else "red"
+        def _val_col(v): return "green" if v > 0 else ("red" if v < 0 else "white")
+        def _fmt(v):     return f"+${v:.2f}" if v > 0 else f"-${abs(v):.2f}"
+
+        regime_color = {"BULL": "#4ade80", "BEAR": "#f87171", "DIVERGING": "#f87171", "RANGING": "#fbbf24"}.get(regime, "#e0e0e0")
+
+        # ── Positions ouvertes ─────────────────────────────────────────────────
+        pos_rows = ""
+        for p in open_positions:
+            side_badge = f'<span class="buy-badge">BUY</span>' if p["side"] == "BUY" else f'<span class="sell-badge">SELL</span>'
+            entry = p.get("entry", 0)
+            sl    = p.get("sl", 0)
+            tp    = p.get("tp", 0)
+            pos_rows += f"""
+            <tr>
+              <td><span class="coin-badge">{p['symbol']}/USD</span></td>
+              <td>{side_badge}</td>
+              <td>${entry:.4f}</td>
+              <td>${sl:.4f}</td>
+              <td>${tp:.4f}</td>
+              <td><span class="pending-badge">Ouvert</span></td>
+            </tr>"""
+        if not pos_rows:
+            pos_rows = '<tr><td colspan="6" style="text-align:center;color:#555">Aucune position ouverte</td></tr>'
+
+        # ── Dernier scan ───────────────────────────────────────────────────────
+        scan_rows = ""
+        for e in _last_scan:
+            sig = e.get("signal") or "–"
+            if sig == "buy":
+                sig_badge = '<span class="buy-badge">BUY</span>'
+            elif sig == "sell":
+                sig_badge = '<span class="sell-badge">SELL</span>'
+            else:
+                sig_badge = '<span class="flat-badge">FLAT</span>'
+            score = e.get("score", 0.0)
+            details = e.get("details", "")
+            ts = e.get("ts", "")
+            scan_rows += f"""
+            <tr>
+              <td><span class="coin-badge">{e['coin']}/USD</span></td>
+              <td>{sig_badge}</td>
+              <td style="font-size:0.85em;color:#aaa">{score:.3f}</td>
+              <td style="font-size:0.82em;color:#666">{details}</td>
+              <td style="font-size:0.82em;color:#555">{ts}</td>
+            </tr>"""
+        if not scan_rows:
+            scan_rows = '<tr><td colspan="5" style="text-align:center;color:#555">En attente du prochain scan…</td></tr>'
+
+        # ── Historique trades ──────────────────────────────────────────────────
+        all_rows_sorted = list(reversed(rows))[:40]
+        cumul = pnl_total
+        trade_rows = ""
+        running_total = 0.0
+        for r in reversed(all_rows_sorted):
+            running_total += float(r[14] or 0)
+        cumul_run = running_total
+        for r in all_rows_sorted:
+            pnl_val  = float(r[14] or 0)
+            cumul_run -= pnl_val   # we go reverse so subtract
+            pnl_pct  = pnl_val / initial_balance * 100 if initial_balance > 0 else 0
+            cumul_display = cumul_run + pnl_val   # cumul at this trade
+            pnl_cls  = "gain" if pnl_val > 0 else "loss"
+            cum_cls  = "gain" if cumul_display >= 0 else "loss"
+            side_badge = f'<span class="buy-badge">BUY</span>' if str(r[3]).upper() == "BUY" else f'<span class="sell-badge">SELL</span>'
+            status = str(r[13] or "")
+            if "TP" in status.upper():
+                st_badge = '<span class="tp-badge">TP ✓</span>'
+            elif "SL" in status.upper():
+                st_badge = '<span class="sl-badge">SL ✗</span>'
+            elif "TRAIL" in status.upper():
+                st_badge = '<span class="tp-badge">Trail ✓</span>'
+            else:
+                st_badge = f'<span class="pending-badge">{status}</span>'
+            entry_px = r[5] or 0
+            trade_rows += f"""
+            <tr>
+              <td style="font-size:0.82em;color:#777">{r[1] or ""}</td>
+              <td><span class="coin-badge">{r[2] or ""}</span></td>
+              <td>{side_badge}</td>
+              <td>${float(entry_px):.4f}</td>
+              <td class="{pnl_cls}"><strong>{_fmt(pnl_val)}</strong> <span style="opacity:.7;font-size:.82em">({pnl_pct:+.2f}%)</span></td>
+              <td>{st_badge}</td>
+            </tr>"""
+        if not trade_rows:
+            trade_rows = '<tr><td colspan="6" style="text-align:center;color:#555">Aucun trade fermé encore</td></tr>'
+
+        html = f"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="refresh" content="15">
+  <title>Bot Crypto — Dashboard</title>
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{ font-family: 'Segoe UI', sans-serif; background: #0f1117; color: #e0e0e0; padding: 24px; }}
+    h1 {{ font-size: 1.6em; color: #fff; margin-bottom: 4px; }}
+    .subtitle {{ color: #888; font-size: 0.9em; margin-bottom: 28px; }}
+    .cards {{ display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 32px; }}
+    .card {{ background: #1a1d27; border-radius: 12px; padding: 20px 24px; flex: 1; min-width: 140px; border: 1px solid #2a2d3a; }}
+    .card .label {{ font-size: 0.78em; color: #888; text-transform: uppercase; letter-spacing: .05em; }}
+    .card .value {{ font-size: 2em; font-weight: 700; margin-top: 6px; }}
+    .card .sub {{ font-size: 0.82em; color: #888; margin-top: 3px; }}
+    .value.green {{ color: #4ade80; }} .value.red {{ color: #f87171; }}
+    .value.white {{ color: #fff; }}  .value.yellow {{ color: #fbbf24; }}
+    .section {{ margin-bottom: 32px; }}
+    .section h2 {{ font-size: 1.05em; color: #aaa; margin-bottom: 12px; border-bottom: 1px solid #2a2d3a; padding-bottom: 8px; }}
+    .regime-bar {{ display:inline-flex; align-items:center; gap:10px; background:#1a1d27; border-radius:8px; padding:10px 18px; border:1px solid #2a2d3a; margin-bottom:20px; }}
+    .regime-dot {{ width:10px; height:10px; border-radius:50%; background:{regime_color}; }}
+    .regime-name {{ font-weight:700; color:{regime_color}; font-size:1.05em; }}
+    table {{ width: 100%; border-collapse: collapse; background: #1a1d27; border-radius: 10px; overflow: hidden; }}
+    th {{ background: #12151f; color: #888; font-size: 0.78em; text-transform: uppercase; padding: 10px 14px; text-align: left; letter-spacing: .05em; }}
+    td {{ padding: 10px 14px; border-top: 1px solid #2a2d3a; font-size: 0.9em; }}
+    tr:hover td {{ background: #20243a; }}
+    .gain {{ color: #4ade80; font-weight: 600; }} .loss {{ color: #f87171; font-weight: 600; }}
+    .coin-badge    {{ background:#2a2d3a; color:#e0e0e0; padding:2px 8px; border-radius:20px; font-size:0.82em; font-weight:600; }}
+    .buy-badge     {{ background:#14532d; color:#4ade80; padding:2px 10px; border-radius:20px; font-size:0.82em; font-weight:700; }}
+    .sell-badge    {{ background:#450a0a; color:#f87171; padding:2px 10px; border-radius:20px; font-size:0.82em; font-weight:700; }}
+    .flat-badge    {{ background:#292524; color:#a8a29e; padding:2px 10px; border-radius:20px; font-size:0.82em; }}
+    .tp-badge      {{ background:#14532d; color:#4ade80; padding:2px 10px; border-radius:20px; font-size:0.82em; }}
+    .sl-badge      {{ background:#450a0a; color:#f87171; padding:2px 10px; border-radius:20px; font-size:0.82em; }}
+    .pending-badge {{ background:#1c1917; color:#fbbf24; padding:2px 10px; border-radius:20px; font-size:0.82em; }}
+    .footer {{ color: #444; font-size: 0.78em; margin-top: 24px; text-align: center; }}
+  </style>
+</head>
+<body>
+  <h1>📊 Bot Crypto — Dashboard</h1>
+  <p class="subtitle">Mis à jour le {now_str} · Rafraîchissement auto toutes les 15s · {'⚠️ MAINNET (argent réel)' if not HL_TESTNET else '🟡 TESTNET (simulation)'}</p>
+
+  <div class="cards">
+    <div class="card">
+      <div class="label">Équité</div>
+      <div class="value white">${balance:.2f}</div>
+      <div class="sub">Réf: ${initial_balance:.2f}</div>
+    </div>
+    <div class="card">
+      <div class="label">Dispo</div>
+      <div class="value {'red' if avail_capital <= 0 else 'yellow' if avail_capital < CAPITAL_PER_TRADE * 2 else 'white'}">${avail_capital:.2f}</div>
+      <div class="sub">{len(open_positions)} position(s) ouverte(s)</div>
+    </div>
+    <div class="card">
+      <div class="label">P&amp;L Net</div>
+      <div class="value {_val_col(net_pnl)}">{_fmt(net_pnl)}</div>
+      <div class="sub">{net_pct:+.2f}% du capital initial</div>
+    </div>
+    <div class="card">
+      <div class="label">P&amp;L 7 jours</div>
+      <div class="value {_val_col(pnl_week)}">{_fmt(pnl_week)}</div>
+    </div>
+    <div class="card">
+      <div class="label">Trades fermés</div>
+      <div class="value white">{total_trades}</div>
+      <div class="sub">{len(wins)}W / {len(losses)}L</div>
+    </div>
+    <div class="card">
+      <div class="label">Win Rate</div>
+      <div class="value {'green' if win_rate >= 50 else 'red'}">{win_rate:.1f}%</div>
+    </div>
+    <div class="card">
+      <div class="label">Profit Factor</div>
+      <div class="value {'green' if profit_factor >= 1.5 else 'yellow' if profit_factor >= 1 else 'red'}">{profit_factor:.2f}</div>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>🌍 Régime de marché</h2>
+    <div class="regime-bar">
+      <div class="regime-dot"></div>
+      <span class="regime-name">{regime}</span>
+      <span style="color:#666;font-size:.9em">BTC {btc_chg:+.1f}% · ETH {eth_chg:+.1f}% (7j)</span>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>📂 Positions ouvertes</h2>
+    <table>
+      <thead>
+        <tr><th>Crypto</th><th>Direction</th><th>Entrée</th><th>Stop Loss</th><th>Take Profit</th><th>Statut</th></tr>
+      </thead>
+      <tbody>{pos_rows}</tbody>
+    </table>
+  </div>
+
+  <div class="section">
+    <h2>🔍 Dernier scan du marché</h2>
+    <table>
+      <thead>
+        <tr><th>Crypto</th><th>Signal</th><th>Score</th><th>Détails</th><th>Heure</th></tr>
+      </thead>
+      <tbody>{scan_rows}</tbody>
+    </table>
+  </div>
+
+  <div class="section">
+    <h2>📋 Historique des trades (40 derniers)</h2>
+    <table>
+      <thead>
+        <tr><th>Date</th><th>Crypto</th><th>Direction</th><th>Prix entrée</th><th>P&amp;L</th><th>Statut</th></tr>
+      </thead>
+      <tbody>{trade_rows}</tbody>
+    </table>
+  </div>
+
+  <p class="footer">BotShortTrade · Hyperliquid DEX · Wallet {WALLET_ADDRESS[:6]}…{WALLET_ADDRESS[-4:]}</p>
+</body>
+</html>"""
+
+        with open("dashboard.html", "w", encoding="utf-8") as f:
+            f.write(html)
+    except Exception as e:
+        log_error(f"write_dashboard: {e}")
+
 
 # ── Boucle principale ─────────────────────────────────────────────────────────
 def run():
@@ -958,6 +1194,11 @@ def run():
             _scan_log.clear()
         else:
             _scan_log.clear()
+
+        # Régénérer le dashboard HTML à chaque cycle
+        write_dashboard(wb, open_positions, balance, initial_balance,
+                        pnl_total, pnl_week, unrealized, avail_capital,
+                        regime, btc_chg, eth_chg)
 
         elapsed = time.time() - loop_start
         wait    = max(0.0, LOOP_SECONDS - elapsed)
