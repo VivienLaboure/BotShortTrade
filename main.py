@@ -196,6 +196,114 @@ def update_order_status(wb: Workbook, order_id, status: str, pnl: float | None =
 _scan_log:  list[dict] = []
 _last_scan: list[dict] = []   # snapshot du dernier scan complet (pour le dashboard)
 
+# ── Apprentissage des erreurs ──────────────────────────────────────────────────
+LESSONS_FILE    = "lessons.json"
+_current_regime = "RANGING"   # mis à jour dans run() avant chaque scan
+
+def _load_lessons() -> dict:
+    try:
+        with open(LESSONS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"buckets": {}}
+
+def _save_lessons(data: dict):
+    data["updated_at"] = datetime.now(timezone.utc).isoformat()
+    tmp = LESSONS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, LESSONS_FILE)
+
+def _lesson_buckets(coin: str, side: str, rsi: float, bbp: float,
+                    regime: str, mode: str) -> list[str]:
+    """Retourne les clés de bucket statistiques pour un trade donné."""
+    s = side.lower()
+    # Bucket RSI selon direction et mode
+    if s == "buy":
+        rsi_tag = "rsi<45" if rsi < 45 else ("rsi45-55" if rsi < 55 else "rsi55-70")
+    elif mode == "MOM":
+        rsi_tag = "rsi<20" if rsi < 20 else "rsi20-35"
+    else:  # SELL MR
+        rsi_tag = "rsi35-50" if rsi < 50 else "rsi50-65"
+    # Bucket BBP selon direction et mode
+    if s == "buy":
+        bbp_tag = "bbp<0.20" if bbp < 0.20 else "bbp0.20-0.40"
+    elif mode == "MOM":
+        bbp_tag = "bbp<0.20" if bbp < 0.20 else "bbp0.20-0.35"
+    else:  # SELL MR
+        bbp_tag = "bbp>0.80" if bbp > 0.80 else "bbp0.65-0.80"
+    return [
+        f"{rsi_tag}|{s}|{mode}",      # ex: "rsi45-55|buy|MR"
+        f"{bbp_tag}|{s}|{mode}",      # ex: "bbp0.20-0.40|buy|MR"
+        f"regime_{regime}|{s}|{mode}", # ex: "regime_RANGING|buy|MR"
+        f"coin_{coin}|{s}",            # ex: "coin_AVAX|buy"
+    ]
+
+def record_lesson(position: dict, outcome: str, pnl: float):
+    """Enregistre le résultat d'un trade dans les buckets statistiques."""
+    cond = position.get("conditions")
+    if not cond:
+        return
+    data    = _load_lessons()
+    buckets = data.setdefault("buckets", {})
+    keys    = _lesson_buckets(
+        position["symbol"], position["side"],
+        cond.get("rsi", 50.0), cond.get("bbp", 0.5),
+        cond.get("regime", "RANGING"), cond.get("mode", "MR")
+    )
+    win = "TP" in outcome or "TRAIL" in outcome
+    for k in keys:
+        b = buckets.setdefault(k, {"w": 0, "l": 0, "pnl": 0.0})
+        if win: b["w"] += 1
+        else:   b["l"] += 1
+        b["pnl"] = round(b["pnl"] + pnl, 2)
+    _save_lessons(data)
+    # Afficher une alerte si un bucket devient clairement mauvais
+    if not win:
+        for k in keys:
+            b = buckets[k]
+            total = b["w"] + b["l"]
+            if total >= 3 and b["w"] / total < 0.35:
+                print(f"  {C.BYLW}[LEÇON]{C.RST} Pattern risqué détecté : {C.BOLD}{k}{C.RST} "
+                      f"WR={b['w']/total*100:.0f}% ({b['w']}W/{b['l']}L)")
+
+def get_penalty(coin: str, side: str, rsi: float, bbp: float,
+                regime: str, mode: str) -> float:
+    """Pénalité de score à soustraire si les conditions matchent un historique mauvais."""
+    MIN_SAMPLES = 5   # ne pénaliser qu'avec au moins 5 trades dans le bucket
+    data    = _load_lessons()
+    buckets = data.get("buckets", {})
+    keys    = _lesson_buckets(coin, side, rsi, bbp, regime, mode)
+    penalty = 0.0
+    for k in keys:
+        b = buckets.get(k)
+        if not b:
+            continue
+        total = b["w"] + b["l"]
+        if total < MIN_SAMPLES:
+            continue
+        wr = b["w"] / total
+        if wr < 0.40:
+            penalty += (0.40 - wr) * 0.5   # win_rate=20% → +0.10 | 30% → +0.05
+    return round(min(penalty, 0.25), 3)     # plafond : 0.25 max
+
+def print_lessons_summary():
+    """Affiche les patterns actuellement pénalisés (si assez de données)."""
+    data    = _load_lessons()
+    buckets = data.get("buckets", {})
+    MIN_SAMPLES = 5
+    bad = [(k, v) for k, v in buckets.items()
+           if v["w"] + v["l"] >= MIN_SAMPLES and v["w"] / (v["w"] + v["l"]) < 0.40]
+    if not bad:
+        return
+    print(f"\n  {C.BYLW}── Leçons actives ({len(bad)} patterns pénalisés) ──{C.RST}")
+    for k, v in sorted(bad, key=lambda x: x[1]["w"] / max(1, x[1]["w"] + x[1]["l"])):
+        total = v["w"] + v["l"]
+        wr    = v["w"] / total
+        pen   = round(min((0.40 - wr) * 0.5, 0.25), 3)
+        print(f"    {C.BRED}▸ {k}{C.RST}  WR={wr*100:.0f}% ({v['w']}W/{v['l']}L)  "
+              f"P&L={_cp(v['pnl'])}${v['pnl']:+.2f}{C.RST}  pénalité=−{pen}")
+
 def log_error(msg: str):
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     print(f"  {C.BRED}[ERR {ts}]{C.RST} {msg}")
@@ -376,11 +484,29 @@ def get_signal(coin: str) -> dict | None:
         details = (f"M15={'↑' if bias_up else '↓'} M5={'↑' if confirm_long else '↓'} "
                    f"RSI={rsi1:.1f} BBP={bbp5:.2f} vol={c5[-1]['v']:.2f}/{avg_vol5:.2f} {bars3_str}"
                    + (f" [{mode}]" if mode else ""))
-        log_scan(coin, "M15/M5/M1", signal, score, details)
 
         if signal:
-            return {"symbol": coin, "signal": signal, "score": score,
-                    "atr_m5": atr5, "price": last5}
+            # Appliquer les pénalités apprises des trades perdants
+            penalty = get_penalty(coin, signal, rsi1, bbp5, _current_regime, mode)
+            if penalty > 0:
+                old_score = score
+                score = max(0.0, round(score - penalty, 3))
+                details += f" ⚠pén−{penalty}"
+                log_scan(coin, "M15/M5/M1", signal, score,
+                         details + f" [score {old_score:.3f}→{score:.3f} après leçon]")
+            else:
+                log_scan(coin, "M15/M5/M1", signal, score, details)
+            return {
+                "symbol": coin, "signal": signal, "score": score,
+                "atr_m5": atr5, "price": last5,
+                "conditions": {
+                    "rsi": round(rsi1, 1), "bbp": round(bbp5, 3),
+                    "vol_ratio": round(vol_ratio, 2),
+                    "regime": _current_regime, "mode": mode,
+                }
+            }
+
+        log_scan(coin, "M15/M5/M1", signal, score, details)
         return None
 
     except Exception as e:
@@ -600,7 +726,8 @@ def place_order(sig: dict, wb: Workbook) -> dict:
 
     return {"id": order_id, "symbol": coin, "side": side,
             "entry": entry_px, "qty": qty, "sl": sl, "tp": tp,
-            "sl_oid": sl_oid, "atr": atr, "open_fee": open_fee}
+            "sl_oid": sl_oid, "atr": atr, "open_fee": open_fee,
+            "conditions": sig.get("conditions", {})}
 
 # ── Trailing stop ────────────────────────────────────────────────────────────
 def trail_sl(position: dict, current_price: float):
@@ -694,6 +821,7 @@ def check_position(wb: Workbook, position: dict) -> str | None:
 
         _rc = C.BGRN if "TP" in result else C.BRED
         print(f"  {_rc}[{result}]{C.RST} {C.BOLD}{coin}{C.RST}  P&L={_cp(pnl)}${pnl:.2f}{C.RST}")
+        record_lesson(position, result, pnl)   # apprendre des succès et des erreurs
         update_order_status(wb, position["id"], result, pnl)
         return result
 
@@ -910,6 +1038,31 @@ def write_dashboard(wb: Workbook, open_positions: list, balance: float,
         if not trade_rows:
             trade_rows = '<tr><td colspan="6" style="text-align:center;color:#555">Aucun trade fermé encore</td></tr>'
 
+        # ── Leçons apprises ────────────────────────────────────────────────────
+        MIN_SAMPLES = 5
+        les_data = _load_lessons().get("buckets", {})
+        all_buckets = sorted(les_data.items(),
+                             key=lambda x: x[1]["w"] / max(1, x[1]["w"] + x[1]["l"]))
+        lessons_rows = ""
+        for k, v in all_buckets[:20]:
+            total = v["w"] + v["l"]
+            wr    = v["w"] / total if total else 0
+            pen   = round(min((0.40 - wr) * 0.5, 0.25), 3) if wr < 0.40 and total >= MIN_SAMPLES else 0.0
+            wr_color = "#f87171" if wr < 0.35 else ("#fbbf24" if wr < 0.50 else "#4ade80")
+            pen_str  = f'<span style="color:#f87171;font-weight:600">−{pen}</span>' if pen > 0 else '<span style="color:#555">0 (apprentissage…)</span>'
+            pnl_v    = v["pnl"]
+            pnl_cls  = "gain" if pnl_v > 0 else "loss"
+            lessons_rows += f"""
+            <tr>
+              <td style="font-family:monospace;font-size:0.85em;color:#ccc">{k}</td>
+              <td style="font-weight:700;color:{wr_color}">{wr*100:.0f}%</td>
+              <td style="color:#888">{v['w']}W / {v['l']}L ({total})</td>
+              <td class="{pnl_cls}">{_fmt(pnl_v)}</td>
+              <td>{pen_str}</td>
+            </tr>"""
+        if not lessons_rows:
+            lessons_rows = '<tr><td colspan="5" style="text-align:center;color:#555">Aucune leçon encore — les données s\'accumulent après les premiers trades</td></tr>'
+
         html = f"""<!DOCTYPE html>
 <html lang="fr">
 <head>
@@ -1014,6 +1167,16 @@ def write_dashboard(wb: Workbook, open_positions: list, balance: float,
         <tr><th>Crypto</th><th>Signal</th><th>Score</th><th>Détails</th><th>Heure</th></tr>
       </thead>
       <tbody>{scan_rows}</tbody>
+    </table>
+  </div>
+
+  <div class="section">
+    <h2>🧠 Leçons apprises (patterns pénalisés)</h2>
+    <table>
+      <thead>
+        <tr><th>Pattern</th><th>Win Rate</th><th>W/L</th><th>P&amp;L cumulé</th><th>Pénalité score</th></tr>
+      </thead>
+      <tbody>{lessons_rows}</tbody>
     </table>
   </div>
 
@@ -1138,6 +1301,8 @@ def run():
         if "_regime_cache" not in run.__dict__ or now_min % 30 == 0:
             run._regime_cache = get_market_regime()
         regime, bias, btc_chg, eth_chg = run._regime_cache
+        global _current_regime
+        _current_regime = regime   # partagé avec get_signal() pour les leçons
         _rc = (C.BGRN if regime == "BULL" else
                C.BRED if regime in ("BEAR", "DIVERGING") else C.BYLW)
         print(f"  Régime: {_rc}{regime}{C.RST}  BTC={btc_chg:+.1f}%  ETH={eth_chg:+.1f}%")
@@ -1194,6 +1359,10 @@ def run():
             _scan_log.clear()
         else:
             _scan_log.clear()
+
+        # Afficher le résumé des leçons toutes les 10 min
+        if now_min % 10 == 0:
+            print_lessons_summary()
 
         # Régénérer le dashboard HTML à chaque cycle
         write_dashboard(wb, open_positions, balance, initial_balance,
