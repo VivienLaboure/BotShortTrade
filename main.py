@@ -1269,16 +1269,30 @@ def run():
         except Exception:
             pass
 
+        # ── Auto-recalibrage du capital ───────────────────────────────────────────
+        # Si le solde réel a chuté de >20% depuis la détection au démarrage
+        # ET qu'aucune position n'est ouverte → recalibrer MAX_LIQUIDITY.
+        # (avec positions ouvertes on attend : la marge explique la différence)
+        if balance < MAX_LIQUIDITY * 0.80 and len(open_positions) == 0:
+            old_max = MAX_LIQUIDITY
+            MAX_LIQUIDITY      = max(balance, 0.01)
+            CAPITAL_PER_TRADE  = MAX_LIQUIDITY * CAPITAL_PCT
+            capital_in_use     = 0.0
+            print(f"  {C.BYLW}[RECALIBRAGE]{C.RST} Solde ${old_max:.2f} → ${MAX_LIQUIDITY:.2f} | "
+                  f"par trade ${CAPITAL_PER_TRADE:.2f}")
+
         # Disponible = min(tracking interne, cash libre réel)
-        # Le solde Hyperliquid (balance) inclut déjà la marge des positions ouvertes.
+        # Le solde Hyperliquid (balance) inclut la marge des positions ouvertes.
         # Si balance < capital_in_use, le compte est en sous-marge → bloquer tout nouveau trade.
         internal_avail = MAX_LIQUIDITY - capital_in_use
-        real_free      = max(0.0, balance - capital_in_use)   # cash libre estimé côté exchange
+        real_free      = max(0.0, balance - capital_in_use)
         avail_capital  = min(internal_avail, real_free)
 
-        # Alerte si divergence > 20% entre tracking interne et solde réel
-        if internal_avail > 0 and real_free < internal_avail * 0.8:
-            print(f"  {C.BRED}[ALERTE]{C.RST} Dispo interne ${internal_avail:.2f} vs cash libre estimé ${real_free:.2f} — solde réel à vérifier")
+        # Alerte divergence — seulement toutes les 5 min pour ne pas spammer
+        if (internal_avail > 0 and real_free < internal_avail * 0.8
+                and now_min % 5 == 0):
+            print(f"  {C.BRED}[ALERTE]{C.RST} Dispo interne ${internal_avail:.2f} vs "
+                  f"cash libre ${real_free:.2f} — {len(open_positions)} position(s) en marge")
 
         max_slots     = MAX_TRADES if MAX_TRADES > 0 else 999
         slots_left    = max_slots - len(open_positions)
@@ -1322,6 +1336,12 @@ def run():
         # Raison de non-scan (lisible)
         if not in_session:
             print(f"  {C.BYLW}[PAUSE]{C.RST} Hors session ({hour_utc}h UTC, actif {SESSION_START_UTC}h-{SESSION_END_UTC}h)")
+
+        # Avertissement solde insuffisant (< 2 trades possibles, aucune position ouverte)
+        if balance < CAPITAL_PER_TRADE * 2 and len(open_positions) == 0 and now_min % 5 == 0:
+            print(f"  {C.BRED}[SOLDE BAS]{C.RST} Équité ${balance:.2f} — "
+                  f"insuffisant pour trader (min recommandé ${CAPITAL_PER_TRADE * 3:.2f}). "
+                  f"Déposer des fonds pour reprendre.")
 
         # Chercher un nouveau signal
         if slots_left > 0 and avail_capital >= CAPITAL_PER_TRADE and in_session and not daily_loss_hit and not regime_blocked:
