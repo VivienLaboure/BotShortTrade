@@ -1350,11 +1350,16 @@ def run():
             _print_scan_summary()
 
             # Filtrage par régime :
-            # BULL     → BUY uniquement (dans la tendance)
-            # RANGING  → exige score > 0.75 (marché sans direction claire)
+            # BULL     → BUY dans la tendance + SELL MR autorisé (suracheté, score ≥ 0.75)
+            #            SELL MOM bloqué (ne pas shorter un crash en plein BULL)
+            # RANGING  → exige score ≥ 0.75 (marché sans direction claire)
             min_score = 0.75 if regime == "RANGING" else 0.0
             if regime == "BULL":
-                signals = [s for s in signals if s["signal"] == "buy"]
+                signals = [s for s in signals if
+                           s["signal"] == "buy" or
+                           (s["signal"] == "sell" and
+                            s.get("conditions", {}).get("mode") == "MR" and
+                            s["score"] >= 0.75)]
             signals = [s for s in signals if s["score"] >= min_score]
 
             sig = best_signal(signals)
