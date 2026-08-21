@@ -219,14 +219,18 @@ def _lesson_buckets(coin: str, side: str, rsi: float, bbp: float,
     """Retourne les clés de bucket statistiques pour un trade donné."""
     s = side.lower()
     # Bucket RSI selon direction et mode
-    if s == "buy":
+    if s == "buy" and mode == "BBO":
+        rsi_tag = "rsi50-62" if rsi < 62 else ("rsi62-70" if rsi < 70 else "rsi70-75")
+    elif s == "buy":
         rsi_tag = "rsi<45" if rsi < 45 else ("rsi45-55" if rsi < 55 else "rsi55-70")
     elif mode == "MOM":
         rsi_tag = "rsi<20" if rsi < 20 else "rsi20-35"
     else:  # SELL MR
         rsi_tag = "rsi35-50" if rsi < 50 else "rsi50-65"
     # Bucket BBP selon direction et mode
-    if s == "buy":
+    if s == "buy" and mode == "BBO":
+        bbp_tag = "bbp0.85-1.0" if bbp < 1.0 else "bbp>1.0"
+    elif s == "buy":
         bbp_tag = "bbp<0.20" if bbp < 0.20 else "bbp0.20-0.40"
     elif mode == "MOM":
         bbp_tag = "bbp<0.20" if bbp < 0.20 else "bbp0.20-0.35"
@@ -484,6 +488,17 @@ def get_signal(coin: str) -> dict | None:
             rsi_score = max(0.0, (35 - rsi1) / 35)   # plus RSI bas = momentum fort
             bb_score  = max(0.0, (0.35 - bbp5) / 0.35)
             score     = round(vol_ratio * 0.5 + rsi_score * 0.25 + bb_score * 0.25, 3)
+
+        # ── BUY breakout : cassure haussière au-dessus de la BB haute ────────────
+        # Uniquement en régime BULL — prix > BB haute (BBP ≥ 0.85) + trend ↑ + volume fort
+        # Objectif : catcher la continuation de tendance lors des pumps marqués
+        elif (_current_regime == "BULL" and bias_up and confirm_long and bars2_bull
+              and vol_ok and move_ok and 50 <= rsi1 <= 75 and bbp5 >= 0.85):
+            signal    = "buy"
+            mode      = "BBO"
+            rsi_score = max(0.0, (75 - rsi1) / 25)      # RSI=50 → 1.0 | RSI=75 → 0.0
+            bb_score  = min(1.0, (bbp5 - 0.85) / 0.40)  # cassure plus forte = mieux
+            score     = round(vol_ratio * 0.50 + rsi_score * 0.30 + bb_score * 0.20, 3)
 
         bars3_str = ("3×↑" if bars3_bull else ("3×↓" if bars3_bear else
                      ("2×↑" if bars2_bull else ("2×↓" if bars2_bear else "✗"))))
