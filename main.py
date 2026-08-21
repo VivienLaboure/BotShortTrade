@@ -443,7 +443,11 @@ def get_signal(coin: str) -> dict | None:
         avg_vol1 = _avg_vol(c1)
         vol1_ok  = c1[-1]["v"] >= avg_vol1 * VOL_MULTIPLIER
 
-        # 3 bougies M5 consécutives dans le même sens (confirmation momentum)
+        # Confirmation directionnelle M5 :
+        # MR (mean-reversion) : 2 bougies suffisent — la consolidation génère des candles mixtes
+        # MOM (momentum)      : 3 bougies requises — signal de force, pas de compromis
+        bars2_bull = all(c5[-i]["c"] > c5[-i]["o"] for i in range(1, 3))
+        bars2_bear = all(c5[-i]["c"] < c5[-i]["o"] for i in range(1, 3))
         bars3_bull = all(c5[-i]["c"] > c5[-i]["o"] for i in range(1, 4))
         bars3_bear = all(c5[-i]["c"] < c5[-i]["o"] for i in range(1, 4))
 
@@ -452,11 +456,12 @@ def get_signal(coin: str) -> dict | None:
         mode      = ""
         vol_ratio = c5[-1]["v"] / avg_vol5 if avg_vol5 else 1.0
 
-        base_cond = vol_ok and move_ok and vol1_ok and bars3_bear  # partagé short
-        base_long = vol_ok and move_ok and vol1_ok and bars3_bull   # partagé long
+        base_mr_long = vol_ok and move_ok and vol1_ok and bars2_bull   # BUY MR  : 2 bougies
+        base_mr_sht  = vol_ok and move_ok and vol1_ok and bars2_bear   # SELL MR : 2 bougies
+        base_mom_sht = vol_ok and move_ok and vol1_ok and bars3_bear   # SELL MOM: 3 bougies
 
         # ── BUY mean-reversion : RSI en zone neutre, prix bas de la bande ──────
-        if bias_up and confirm_long and base_long and 30 <= rsi1 <= 70 and bbp5 <= 0.40:
+        if bias_up and confirm_long and base_mr_long and 30 <= rsi1 <= 70 and bbp5 <= 0.40:
             signal    = "buy"
             mode      = "MR"
             rsi_score = (70 - rsi1) / 40
@@ -464,7 +469,7 @@ def get_signal(coin: str) -> dict | None:
             score     = round(rsi_score * 0.25 + vol_ratio * 0.4 + bb_score * 0.15 + 0.2, 3)
 
         # ── SELL mean-reversion : RSI neutre, prix haut de la bande ─────────────
-        elif bias_dn and confirm_short and base_cond and 35 <= rsi1 <= 65 and bb_short_ok:
+        elif bias_dn and confirm_short and base_mr_sht and 35 <= rsi1 <= 65 and bb_short_ok:
             signal    = "sell"
             mode      = "MR"
             rsi_score = (rsi1 - 35) / 30
@@ -473,14 +478,15 @@ def get_signal(coin: str) -> dict | None:
 
         # ── SELL momentum : crash/tendance forte — prix sous la bande basse ─────
         # RSI extrême (<= 35) + prix cassant sous la BB + toute la structure baissière
-        elif bias_dn and confirm_short and base_cond and rsi1 <= 35 and bbp5 <= 0.35:
+        elif bias_dn and confirm_short and base_mom_sht and rsi1 <= 35 and bbp5 <= 0.35:
             signal    = "sell"
             mode      = "MOM"
             rsi_score = max(0.0, (35 - rsi1) / 35)   # plus RSI bas = momentum fort
             bb_score  = max(0.0, (0.35 - bbp5) / 0.35)
             score     = round(vol_ratio * 0.5 + rsi_score * 0.25 + bb_score * 0.25, 3)
 
-        bars3_str = ("3×↑" if bars3_bull else ("3×↓" if bars3_bear else "3×✗"))
+        bars3_str = ("3×↑" if bars3_bull else ("3×↓" if bars3_bear else
+                     ("2×↑" if bars2_bull else ("2×↓" if bars2_bear else "✗"))))
         details = (f"M15={'↑' if bias_up else '↓'} M5={'↑' if confirm_long else '↓'} "
                    f"RSI={rsi1:.1f} BBP={bbp5:.2f} vol={c5[-1]['v']:.2f}/{avg_vol5:.2f} {bars3_str}"
                    + (f" [{mode}]" if mode else ""))
