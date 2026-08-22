@@ -45,7 +45,7 @@ load_dotenv()
 HL_PRIVATE_KEY    = os.environ["HL_PRIVATE_KEY"]
 HL_TESTNET        = os.getenv("HL_TESTNET", "1") == "1"
 _MAX_LIQ_CFG  = float(os.getenv("MAX_LIQUIDITY", 0))  # 0 = auto (solde réel)
-CAPITAL_PCT       = float(os.getenv("CAPITAL_PCT", 0.15))
+CAPITAL_PCT       = float(os.getenv("CAPITAL_PCT", 0.10))
 LEVERAGE          = int(os.getenv("LEVERAGE", 5))
 MIN_MOVE_PCT      = float(os.getenv("MIN_MOVE_PCT", 0.0002))
 VOL_MULTIPLIER    = float(os.getenv("VOL_MULTIPLIER", 1.0))
