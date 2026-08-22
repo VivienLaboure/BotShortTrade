@@ -45,10 +45,10 @@ load_dotenv()
 HL_PRIVATE_KEY    = os.environ["HL_PRIVATE_KEY"]
 HL_TESTNET        = os.getenv("HL_TESTNET", "1") == "1"
 _MAX_LIQ_CFG  = float(os.getenv("MAX_LIQUIDITY", 0))  # 0 = auto (solde réel)
-CAPITAL_PCT       = float(os.getenv("CAPITAL_PCT", 0.10))
+CAPITAL_PCT       = float(os.getenv("CAPITAL_PCT", 0.15))
 LEVERAGE          = int(os.getenv("LEVERAGE", 5))
 MIN_MOVE_PCT      = float(os.getenv("MIN_MOVE_PCT", 0.0002))
-VOL_MULTIPLIER    = float(os.getenv("VOL_MULTIPLIER", 1.2))
+VOL_MULTIPLIER    = float(os.getenv("VOL_MULTIPLIER", 1.0))
 MAX_TRADES        = int(os.getenv("MAX_TRADES", 0))
 MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", 3.0))   # % du capital
 SESSION_START_UTC  = int(os.getenv("SESSION_START_UTC", 0))         # heure UTC (0 = minuit)
@@ -59,7 +59,7 @@ MAX_LIQUIDITY     = _MAX_LIQ_CFG if _MAX_LIQ_CFG > 0 else 100.0  # placeholder
 CAPITAL_PER_TRADE = MAX_LIQUIDITY * CAPITAL_PCT
 
 ATR_SL_MULT   = 1.5
-ATR_TP_MULT   = 3.0   # R:R 2:1 (TP = 3×ATR, SL = 1.5×ATR)
+ATR_TP_MULT   = 4.0   # R:R ~2.7:1 (TP = 4×ATR, SL = 1.5×ATR)
 TRAIL_TRIGGER = 1.5   # activer trailing quand profit ≥ 1.5×ATR
 TRAIL_DIST    = 1.0   # trailing SL à 1×ATR du prix courant
 
@@ -490,14 +490,14 @@ def get_signal(coin: str) -> dict | None:
             score     = round(vol_ratio * 0.5 + rsi_score * 0.25 + bb_score * 0.25, 3)
 
         # ── BUY breakout : cassure haussière au-dessus de la BB haute ────────────
-        # Uniquement en régime BULL — prix > BB haute (BBP ≥ 0.85) + trend ↑ + volume fort
-        # Objectif : catcher la continuation de tendance lors des pumps marqués
-        elif (_current_regime == "BULL" and bias_up and confirm_long and bars2_bull
-              and vol_ok and move_ok and 50 <= rsi1 <= 75 and bbp5 >= 0.85):
+        # Uniquement en régime BULL — prix > BB haute (BBP ≥ 0.75) + trend ↑ + volume fort
+        # confirm_long (EMA8+VWAP) suffit comme confirmation directionnelle M5
+        elif (_current_regime == "BULL" and bias_up and confirm_long
+              and vol_ok and move_ok and 50 <= rsi1 <= 75 and bbp5 >= 0.75):
             signal    = "buy"
             mode      = "BBO"
             rsi_score = max(0.0, (75 - rsi1) / 25)      # RSI=50 → 1.0 | RSI=75 → 0.0
-            bb_score  = min(1.0, (bbp5 - 0.85) / 0.40)  # cassure plus forte = mieux
+            bb_score  = min(1.0, (bbp5 - 0.75) / 0.50)  # cassure plus forte = mieux
             score     = round(vol_ratio * 0.50 + rsi_score * 0.30 + bb_score * 0.20, 3)
 
         bars3_str = ("3×↑" if bars3_bull else ("3×↓" if bars3_bear else
