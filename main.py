@@ -441,6 +441,9 @@ def get_signal(coin: str) -> dict | None:
         bb_long_ok  = bbp5 <= 0.35
         bb_short_ok = bbp5 >= 0.65
 
+        # M5 RSI (stable — pour BBO breakout, évite les spikes M1)
+        rsi5 = _rsi(closes5, 14)
+
         # M1 entrée (RSI14 + volume)
         closes1  = [c["c"] for c in c1]
         rsi1     = _rsi(closes1, 14)
@@ -491,12 +494,13 @@ def get_signal(coin: str) -> dict | None:
 
         # ── BUY breakout : cassure haussière au-dessus de la BB haute ────────────
         # Uniquement en régime BULL — prix > BB haute (BBP ≥ 0.75) + trend ↑ + volume fort
-        # confirm_long (EMA8+VWAP) suffit comme confirmation directionnelle M5
+        # Utilise rsi5 (M5, 14 périodes) — stable pendant les pompes, contrairement à rsi1
+        # qui monte à 90+ en quelques minutes M1 et bloque tous les signaux de breakout.
         elif (_current_regime == "BULL" and bias_up and confirm_long
-              and vol_ok and move_ok and 50 <= rsi1 <= 75 and bbp5 >= 0.75):
+              and vol_ok and move_ok and 45 <= rsi5 <= 85 and bbp5 >= 0.75):
             signal    = "buy"
             mode      = "BBO"
-            rsi_score = max(0.0, (75 - rsi1) / 25)      # RSI=50 → 1.0 | RSI=75 → 0.0
+            rsi_score = max(0.0, (85 - rsi5) / 40)      # rsi5=45 → 1.0 | rsi5=85 → 0.0
             bb_score  = min(1.0, (bbp5 - 0.75) / 0.50)  # cassure plus forte = mieux
             score     = round(vol_ratio * 0.50 + rsi_score * 0.30 + bb_score * 0.20, 3)
 
