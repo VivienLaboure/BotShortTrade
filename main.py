@@ -541,7 +541,10 @@ def get_signal(coin: str) -> dict | None:
 # ── Balance (affichage uniquement) ───────────────────────────────────────────
 def get_equity() -> float:
     user_state = info.user_state(WALLET_ADDRESS)
-    perp_bal = float(user_state["marginSummary"]["accountValue"])
+    # crossMarginSummary = équité totale du compte cross (dépôts + PnL latent)
+    # marginSummary seul peut retourner uniquement la marge utilisée sur les positions
+    cross = user_state.get("crossMarginSummary") or user_state.get("marginSummary") or {}
+    perp_bal = float(cross.get("accountValue") or 0)
     if perp_bal > 0:
         return perp_bal
     spot = info.spot_user_state(WALLET_ADDRESS)
