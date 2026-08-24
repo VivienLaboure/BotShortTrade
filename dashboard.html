@@ -10,38 +10,23 @@
     body { font-family: 'Segoe UI', sans-serif; background: #0f1117; color: #e0e0e0; padding: 24px; }
     h1 { font-size: 1.6em; color: #fff; margin-bottom: 4px; }
     .subtitle { color: #888; font-size: 0.9em; margin-bottom: 28px; }
-
     .cards { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 32px; }
-    .card {
-      background: #1a1d27; border-radius: 12px; padding: 20px 24px;
-      flex: 1; min-width: 150px; border: 1px solid #2a2d3a;
-    }
+    .card { background: #1a1d27; border-radius: 12px; padding: 20px 24px; flex: 1; min-width: 140px; border: 1px solid #2a2d3a; }
     .card .label { font-size: 0.78em; color: #888; text-transform: uppercase; letter-spacing: .05em; }
     .card .value { font-size: 2em; font-weight: 700; margin-top: 6px; }
-    .card .value.green  { color: #4ade80; }
-    .card .value.red    { color: #f87171; }
-    .card .value.white  { color: #fff; }
-    .card .value.yellow { color: #fbbf24; }
-
+    .card .sub { font-size: 0.82em; color: #888; margin-top: 3px; }
+    .value.green { color: #4ade80; } .value.red { color: #f87171; }
+    .value.white { color: #fff; }  .value.yellow { color: #fbbf24; }
     .section { margin-bottom: 32px; }
-    .section h2 { font-size: 1.1em; color: #aaa; margin-bottom: 12px; border-bottom: 1px solid #2a2d3a; padding-bottom: 8px; }
-
-    .strat-box {
-      background: #1a1d27; border-radius: 10px; padding: 16px 20px;
-      border: 1px solid #2a2d3a; display: flex; gap: 32px; flex-wrap: wrap;
-    }
-    .strat-item .strat-label { font-size: 0.75em; color: #666; text-transform: uppercase; }
-    .strat-item .strat-val   { font-size: 1em; color: #e0e0e0; margin-top: 2px; }
-
+    .section h2 { font-size: 1.05em; color: #aaa; margin-bottom: 12px; border-bottom: 1px solid #2a2d3a; padding-bottom: 8px; }
+    .regime-bar { display:inline-flex; align-items:center; gap:10px; background:#1a1d27; border-radius:8px; padding:10px 18px; border:1px solid #2a2d3a; margin-bottom:20px; }
+    .regime-dot { width:10px; height:10px; border-radius:50%; background:#4ade80; }
+    .regime-name { font-weight:700; color:#4ade80; font-size:1.05em; }
     table { width: 100%; border-collapse: collapse; background: #1a1d27; border-radius: 10px; overflow: hidden; }
-    th { background: #12151f; color: #888; font-size: 0.78em; text-transform: uppercase;
-          padding: 10px 14px; text-align: left; letter-spacing: .05em; }
+    th { background: #12151f; color: #888; font-size: 0.78em; text-transform: uppercase; padding: 10px 14px; text-align: left; letter-spacing: .05em; }
     td { padding: 10px 14px; border-top: 1px solid #2a2d3a; font-size: 0.9em; }
     tr:hover td { background: #20243a; }
-
-    .gain  { color: #4ade80; font-weight: 600; }
-    .loss  { color: #f87171; font-weight: 600; }
-
+    .gain { color: #4ade80; font-weight: 600; } .loss { color: #f87171; font-weight: 600; }
     .coin-badge    { background:#2a2d3a; color:#e0e0e0; padding:2px 8px; border-radius:20px; font-size:0.82em; font-weight:600; }
     .buy-badge     { background:#14532d; color:#4ade80; padding:2px 10px; border-radius:20px; font-size:0.82em; font-weight:700; }
     .sell-badge    { background:#450a0a; color:#f87171; padding:2px 10px; border-radius:20px; font-size:0.82em; font-weight:700; }
@@ -49,464 +34,579 @@
     .tp-badge      { background:#14532d; color:#4ade80; padding:2px 10px; border-radius:20px; font-size:0.82em; }
     .sl-badge      { background:#450a0a; color:#f87171; padding:2px 10px; border-radius:20px; font-size:0.82em; }
     .pending-badge { background:#1c1917; color:#fbbf24; padding:2px 10px; border-radius:20px; font-size:0.82em; }
-
     .footer { color: #444; font-size: 0.78em; margin-top: 24px; text-align: center; }
   </style>
 </head>
 <body>
-
   <h1>📊 Bot Crypto — Dashboard</h1>
-  <p class="subtitle">Mis à jour le 07/07/2026 à 23:00:41 · Rafraîchissement auto toutes les 15s · Mode PAPER (simulation)</p>
+  <p class="subtitle">Mis à jour le 24/08/2026 à 20:12:50 UTC · Rafraîchissement auto toutes les 15s · ⚠️ MAINNET (argent réel)</p>
 
-  <!-- Cartes résumé -->
   <div class="cards">
     <div class="card">
-      <div class="label">Trades effectués</div>
-      <div class="value white">27</div>
+      <div class="label">Équité</div>
+      <div class="value white">$159.19</div>
+      <div class="sub">Réf: $150.54</div>
     </div>
     <div class="card">
-      <div class="label">Trades gagnants</div>
-      <div class="value green">16</div>
+      <div class="label">Dispo</div>
+      <div class="value white">$143.23</div>
+      <div class="sub">1 position(s) ouverte(s)</div>
     </div>
     <div class="card">
-      <div class="label">Trades perdants</div>
-      <div class="value red">11</div>
+      <div class="label">P&amp;L Net</div>
+      <div class="value green">+$34.48</div>
+      <div class="sub">+22.90% du capital initial</div>
     </div>
     <div class="card">
-      <div class="label">Taux de réussite</div>
-      <div class="value green">59.3%</div>
+      <div class="label">P&amp;L 7 jours</div>
+      <div class="value green">+$33.37</div>
     </div>
     <div class="card">
-      <div class="label">Profit / Perte total</div>
-      <div class="value green">+$56.04</div>
-      <div style="font-size:0.85em;color:#888;margin-top:2px">+5.6% du capital max</div>
+      <div class="label">Trades fermés</div>
+      <div class="value white">143</div>
+      <div class="sub">121W / 22L</div>
+    </div>
+    <div class="card">
+      <div class="label">Win Rate</div>
+      <div class="value green">84.6%</div>
     </div>
     <div class="card">
       <div class="label">Profit Factor</div>
-      <div class="value yellow">2.35</div>
-    </div>
-    <div class="card">
-      <div class="label">Liquidité max</div>
-      <div class="value white">$1000</div>
+      <div class="value green">4.20</div>
     </div>
   </div>
 
-  <!-- Stratégie -->
   <div class="section">
-    <h2>🧠 Stratégie en cours</h2>
-    <div class="strat-box">
-      <div class="strat-item">
-        <div class="strat-label">Approche</div>
-        <div class="strat-val">Multi-Timeframe (M15 → M5 → M1)</div>
-      </div>
-      <div class="strat-item">
-        <div class="strat-label">Indicateurs</div>
-        <div class="strat-val">VWAP · EMA(8) · RSI(3) · ATR(14)</div>
-      </div>
-      <div class="strat-item">
-        <div class="strat-label">Stop Loss</div>
-        <div class="strat-val">1.5× ATR (dynamique)</div>
-      </div>
-      <div class="strat-item">
-        <div class="strat-label">Take Profit</div>
-        <div class="strat-val">2.5× ATR · R:R 1:1.67</div>
-      </div>
-      <div class="strat-item">
-        <div class="strat-label">Cryptos surveillées</div>
-        <div class="strat-val">BTC/USD, ETH/USD, AVAX/USD, LINK/USD, LTC/USD, DOT/USD, DOGE/USD</div>
-      </div>
-      <div class="strat-item">
-        <div class="strat-label">Capital par trade</div>
-        <div class="strat-val">$800.0 (20% de $1000)</div>
-      </div>
+    <h2>🌍 Régime de marché</h2>
+    <div class="regime-bar">
+      <div class="regime-dot"></div>
+      <span class="regime-name">BULL</span>
+      <span style="color:#666;font-size:.9em">BTC +23.6% · ETH +31.3% (7j)</span>
     </div>
   </div>
 
-  <!-- Dernier scan -->
   <div class="section">
-    <h2>🔍 Dernier scan du marché — 2026-06-28 02:18:58</h2>
+    <h2>📂 Positions ouvertes</h2>
     <table>
       <thead>
-        <tr>
-          <th>Crypto</th><th>Signal</th><th>Tendance M15</th>
-          <th>RSI(3)</th><th>Volume</th><th>Explication</th>
-        </tr>
+        <tr><th>Crypto</th><th>Direction</th><th>Entrée</th><th>Stop Loss</th><th>Take Profit</th><th>Statut</th></tr>
       </thead>
       <tbody>
             <tr>
-              <td><span class="coin-badge">ETH/USD</span></td>
-              <td><span class="flat-badge">FLAT</span></td>
-              <td>▲ bull</td>
-              <td>70.3</td>
-              <td>✓</td>
-              <td style="font-size:0.82em;color:#555">bias bull mais RSI3=70.3 trop élevé</td>
-            </tr>
-            <tr>
-              <td><span class="coin-badge">AVAX/USD</span></td>
-              <td><span class="flat-badge">FLAT</span></td>
-              <td>▲ bull</td>
-              <td>55.6</td>
-              <td>✗</td>
-              <td style="font-size:0.82em;color:#555">volume insuffisant</td>
-            </tr>
-            <tr>
               <td><span class="coin-badge">BTC/USD</span></td>
-              <td><span class="flat-badge">FLAT</span></td>
-              <td>▲ bull</td>
-              <td>93.5</td>
-              <td>✓</td>
-              <td style="font-size:0.82em;color:#555">bias bull mais RSI3=93.5 trop élevé</td>
-            </tr>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$77484.0000</td>
+              <td>$79912.9000</td>
+              <td>$77793.8000</td>
+              <td><span class="pending-badge">Ouvert</span></td>
+            </tr></tbody>
+    </table>
+  </div>
+
+  <div class="section">
+    <h2>🔍 Dernier scan du marché</h2>
+    <table>
+      <thead>
+        <tr><th>Crypto</th><th>Signal</th><th>Score</th><th>Détails</th><th>Heure</th></tr>
+      </thead>
+      <tbody>
             <tr>
               <td><span class="coin-badge">LINK/USD</span></td>
               <td><span class="flat-badge">FLAT</span></td>
-              <td>▲ bull</td>
-              <td>88</td>
-              <td>✗</td>
-              <td style="font-size:0.82em;color:#555">volume insuffisant</td>
+              <td style="font-size:0.85em;color:#aaa">0.000</td>
+              <td style="font-size:0.82em;color:#666">M15=↓ M5=↑ RSI=50.0 BBP=0.40 vol=3739.50/12490.37 ✗</td>
+              <td style="font-size:0.82em;color:#555">20:12:48</td>
+            </tr>
+            <tr>
+              <td><span class="coin-badge">ETH/USD</span></td>
+              <td><span class="flat-badge">FLAT</span></td>
+              <td style="font-size:0.85em;color:#aaa">0.000</td>
+              <td style="font-size:0.82em;color:#666">M15=↓ M5=↓ RSI=56.2 BBP=0.72 vol=1428.46/4514.86 ✗</td>
+              <td style="font-size:0.82em;color:#555">20:12:48</td>
             </tr>
             <tr>
               <td><span class="coin-badge">LTC/USD</span></td>
               <td><span class="flat-badge">FLAT</span></td>
-              <td>▼ bear</td>
-              <td>65.3</td>
-              <td>✗</td>
-              <td style="font-size:0.82em;color:#555">volume insuffisant</td>
+              <td style="font-size:0.85em;color:#aaa">0.000</td>
+              <td style="font-size:0.82em;color:#666">M15=↓ M5=↓ RSI=57.4 BBP=0.42 vol=1117.60/2638.77 ✗</td>
+              <td style="font-size:0.82em;color:#555">20:12:48</td>
             </tr>
             <tr>
-              <td><span class="coin-badge">DOT/USD</span></td>
+              <td><span class="coin-badge">AVAX/USD</span></td>
               <td><span class="flat-badge">FLAT</span></td>
-              <td>▼ bear</td>
-              <td>43.6</td>
-              <td>✗</td>
-              <td style="font-size:0.82em;color:#555">volume insuffisant</td>
+              <td style="font-size:0.85em;color:#aaa">0.000</td>
+              <td style="font-size:0.82em;color:#666">M15=↓ M5=↓ RSI=56.5 BBP=0.81 vol=5801.60/7016.24 ✗</td>
+              <td style="font-size:0.82em;color:#555">20:12:48</td>
             </tr>
             <tr>
               <td><span class="coin-badge">DOGE/USD</span></td>
               <td><span class="flat-badge">FLAT</span></td>
-              <td>▲ bull</td>
-              <td>49.2</td>
-              <td>✗</td>
-              <td style="font-size:0.82em;color:#555">chop (0.001%)</td>
+              <td style="font-size:0.85em;color:#aaa">0.000</td>
+              <td style="font-size:0.82em;color:#666">M15=↓ M5=↓ RSI=50.4 BBP=0.50 vol=3286150.00/5067103.50 ✗</td>
+              <td style="font-size:0.82em;color:#555">20:12:50</td>
+            </tr>
+            <tr>
+              <td><span class="coin-badge">XRP/USD</span></td>
+              <td><span class="flat-badge">FLAT</span></td>
+              <td style="font-size:0.85em;color:#aaa">0.000</td>
+              <td style="font-size:0.82em;color:#666">M15=↓ M5=↓ RSI=52.8 BBP=0.58 vol=652601.90/1679801.84 ✗</td>
+              <td style="font-size:0.82em;color:#555">20:12:50</td>
             </tr></tbody>
     </table>
   </div>
 
-  <!-- Historique trades -->
   <div class="section">
-    <h2>📋 Historique des trades — Bénéfice par trade et cumul</h2>
+    <h2>🧠 Leçons apprises (patterns pénalisés)</h2>
     <table>
       <thead>
-        <tr>
-          <th>Date</th><th>Crypto</th><th>Direction</th>
-          <th>Prix entrée</th><th>Stop Loss</th><th>Take Profit</th>
-          <th>Bénéfice ($)</th><th>Cumul ($)</th><th>Statut</th>
-        </tr>
+        <tr><th>Pattern</th><th>Win Rate</th><th>W/L</th><th>P&amp;L cumulé</th><th>Pénalité score</th></tr>
       </thead>
       <tbody>
             <tr>
-              <td>2026-07-06 22:47:12</td>
-              <td><span class="coin-badge">BTC/USD</span></td>
-              <td><span class="buy-badge">BUY</span></td>
-              <td>$63778.9250</td>
-              <td>$63595.1038</td>
-              <td>$64085.2937</td>
-              <td class="gain"><strong>+$3.84</strong> <span style="font-size:0.82em;opacity:.75">(+0.48%)</span></td>
-              <td class="gain">+$56.04 <span style="font-size:0.82em;opacity:.75">(+5.60%)</span></td>
-              <td><span class="tp-badge">TP touché</span></td>
+              <td style="font-family:monospace;font-size:0.85em;color:#ccc">coin_AVAX|buy</td>
+              <td style="font-weight:700;color:#f87171">9%</td>
+              <td style="color:#888">1W / 10L (11)</td>
+              <td class="loss">-$3.11</td>
+              <td><span style="color:#f87171;font-weight:600">−0.155</span></td>
             </tr>
             <tr>
-              <td>2026-07-06 18:29:13</td>
-              <td><span class="coin-badge">DOT/USD</span></td>
-              <td><span class="buy-badge">BUY</span></td>
-              <td>$0.8829</td>
-              <td>$0.8775</td>
-              <td>$0.8919</td>
-              <td class="gain"><strong>+$8.15</strong> <span style="font-size:0.82em;opacity:.75">(+1.02%)</span></td>
-              <td class="gain">+$52.20 <span style="font-size:0.82em;opacity:.75">(+5.22%)</span></td>
-              <td><span class="tp-badge">TP touché</span></td>
+              <td style="font-family:monospace;font-size:0.85em;color:#ccc">rsi70-75|buy|BBO</td>
+              <td style="font-weight:700;color:#4ade80">70%</td>
+              <td style="color:#888">23W / 10L (33)</td>
+              <td class="gain">+$2.08</td>
+              <td><span style="color:#555">0 (apprentissage…)</span></td>
             </tr>
             <tr>
-              <td>2026-07-06 17:28:09</td>
-              <td><span class="coin-badge">BTC/USD</span></td>
-              <td><span class="buy-badge">BUY</span></td>
-              <td>$62318.5175</td>
-              <td>$61981.6715</td>
-              <td>$62879.9275</td>
-              <td class="gain"><strong>+$7.21</strong> <span style="font-size:0.82em;opacity:.75">(+0.90%)</span></td>
-              <td class="gain">+$44.05 <span style="font-size:0.82em;opacity:.75">(+4.40%)</span></td>
-              <td><span class="tp-badge">TP touché</span></td>
+              <td style="font-family:monospace;font-size:0.85em;color:#ccc">coin_XRP|buy</td>
+              <td style="font-weight:700;color:#4ade80">75%</td>
+              <td style="color:#888">12W / 4L (16)</td>
+              <td class="gain">+$4.54</td>
+              <td><span style="color:#555">0 (apprentissage…)</span></td>
             </tr>
             <tr>
-              <td>2026-07-06 16:01:18</td>
-              <td><span class="coin-badge">ETH/USD</span></td>
-              <td><span class="buy-badge">BUY</span></td>
-              <td>$1744.9995</td>
-              <td>$1735.5050</td>
-              <td>$1760.8238</td>
-              <td class="gain"><strong>+$7.25</strong> <span style="font-size:0.82em;opacity:.75">(+0.91%)</span></td>
-              <td class="gain">+$36.84 <span style="font-size:0.82em;opacity:.75">(+3.68%)</span></td>
-              <td><span class="tp-badge">TP touché</span></td>
+              <td style="font-family:monospace;font-size:0.85em;color:#ccc">bbp>1.0|buy|BBO</td>
+              <td style="font-weight:700;color:#4ade80">80%</td>
+              <td style="color:#888">41W / 10L (51)</td>
+              <td class="gain">+$6.72</td>
+              <td><span style="color:#555">0 (apprentissage…)</span></td>
             </tr>
             <tr>
-              <td>2026-07-06 14:56:19</td>
-              <td><span class="coin-badge">BTC/USD</span></td>
-              <td><span class="buy-badge">BUY</span></td>
-              <td>$61792.2050</td>
-              <td>$61463.9423</td>
-              <td>$62339.3095</td>
-              <td class="loss"><strong>-$4.25</strong> <span style="font-size:0.82em;opacity:.75">(-0.53%)</span></td>
-              <td class="gain">+$29.59 <span style="font-size:0.82em;opacity:.75">(+2.96%)</span></td>
-              <td><span class="sl-badge">SL touché</span></td>
+              <td style="font-family:monospace;font-size:0.85em;color:#ccc">regime_BULL|buy|BBO</td>
+              <td style="font-weight:700;color:#4ade80">84%</td>
+              <td style="color:#888">119W / 22L (141)</td>
+              <td class="gain">+$33.35</td>
+              <td><span style="color:#555">0 (apprentissage…)</span></td>
             </tr>
             <tr>
-              <td>2026-07-06 12:56:15</td>
-              <td><span class="coin-badge">ETH/USD</span></td>
-              <td><span class="buy-badge">BUY</span></td>
-              <td>$1768.6395</td>
-              <td>$1765.4955</td>
-              <td>$1773.8795</td>
-              <td class="loss"><strong>-$1.42</strong> <span style="font-size:0.82em;opacity:.75">(-0.18%)</span></td>
-              <td class="gain">+$33.84 <span style="font-size:0.82em;opacity:.75">(+3.38%)</span></td>
-              <td><span class="sl-badge">SL touché</span></td>
+              <td style="font-family:monospace;font-size:0.85em;color:#ccc">rsi62-70|buy|BBO</td>
+              <td style="font-weight:700;color:#4ade80">86%</td>
+              <td style="color:#888">32W / 5L (37)</td>
+              <td class="gain">+$7.81</td>
+              <td><span style="color:#555">0 (apprentissage…)</span></td>
             </tr>
             <tr>
-              <td>2026-07-06 10:49:06</td>
-              <td><span class="coin-badge">ETH/USD</span></td>
-              <td><span class="buy-badge">BUY</span></td>
-              <td>$1766.2300</td>
-              <td>$1762.4244</td>
-              <td>$1772.5728</td>
-              <td class="loss"><strong>-$1.72</strong> <span style="font-size:0.82em;opacity:.75">(-0.21%)</span></td>
-              <td class="gain">+$35.26 <span style="font-size:0.82em;opacity:.75">(+3.53%)</span></td>
-              <td><span class="sl-badge">SL touché</span></td>
+              <td style="font-family:monospace;font-size:0.85em;color:#ccc">bbp0.85-1.0|buy|BBO</td>
+              <td style="font-weight:700;color:#4ade80">87%</td>
+              <td style="color:#888">78W / 12L (90)</td>
+              <td class="gain">+$26.63</td>
+              <td><span style="color:#555">0 (apprentissage…)</span></td>
             </tr>
             <tr>
-              <td>2026-07-05 14:46:11</td>
-              <td><span class="coin-badge">BTC/USD</span></td>
-              <td><span class="buy-badge">BUY</span></td>
-              <td>$62650.8705</td>
-              <td>$62531.0606</td>
-              <td>$62850.5537</td>
-              <td class="gain"><strong>+$2.55</strong> <span style="font-size:0.82em;opacity:.75">(+0.32%)</span></td>
-              <td class="gain">+$36.98 <span style="font-size:0.82em;opacity:.75">(+3.70%)</span></td>
-              <td><span class="tp-badge">TP touché</span></td>
+              <td style="font-family:monospace;font-size:0.85em;color:#ccc">coin_DOGE|buy</td>
+              <td style="font-weight:700;color:#4ade80">88%</td>
+              <td style="color:#888">15W / 2L (17)</td>
+              <td class="gain">+$4.63</td>
+              <td><span style="color:#555">0 (apprentissage…)</span></td>
             </tr>
             <tr>
-              <td>2026-07-04 20:00:19</td>
-              <td><span class="coin-badge">AVAX/USD</span></td>
-              <td><span class="buy-badge">BUY</span></td>
-              <td>$7.0842</td>
-              <td>$7.0371</td>
-              <td>$7.1627</td>
-              <td class="loss"><strong>-$5.32</strong> <span style="font-size:0.82em;opacity:.75">(-0.67%)</span></td>
-              <td class="gain">+$34.43 <span style="font-size:0.82em;opacity:.75">(+3.44%)</span></td>
-              <td><span class="sl-badge">SL touché</span></td>
+              <td style="font-family:monospace;font-size:0.85em;color:#ccc">coin_LINK|buy</td>
+              <td style="font-weight:700;color:#4ade80">89%</td>
+              <td style="color:#888">17W / 2L (19)</td>
+              <td class="loss">-$0.57</td>
+              <td><span style="color:#555">0 (apprentissage…)</span></td>
             </tr>
             <tr>
-              <td>2026-07-04 19:22:17</td>
-              <td><span class="coin-badge">ETH/USD</span></td>
-              <td><span class="buy-badge">BUY</span></td>
-              <td>$1783.5500</td>
-              <td>$1778.8198</td>
-              <td>$1791.4337</td>
-              <td class="gain"><strong>+$3.54</strong> <span style="font-size:0.82em;opacity:.75">(+0.44%)</span></td>
-              <td class="gain">+$39.75 <span style="font-size:0.82em;opacity:.75">(+3.97%)</span></td>
-              <td><span class="tp-badge">TP touché</span></td>
+              <td style="font-family:monospace;font-size:0.85em;color:#ccc">rsi50-62|buy|BBO</td>
+              <td style="font-weight:700;color:#4ade80">90%</td>
+              <td style="color:#888">64W / 7L (71)</td>
+              <td class="gain">+$23.46</td>
+              <td><span style="color:#555">0 (apprentissage…)</span></td>
             </tr>
             <tr>
-              <td>2026-07-02 19:01:06</td>
-              <td><span class="coin-badge">ETH/USD</span></td>
-              <td><span class="buy-badge">BUY</span></td>
-              <td>$1697.4500</td>
-              <td>$1690.6532</td>
-              <td>$1708.7780</td>
-              <td class="gain"><strong>+$5.34</strong> <span style="font-size:0.82em;opacity:.75">(+0.67%)</span></td>
-              <td class="gain">+$36.21 <span style="font-size:0.82em;opacity:.75">(+3.62%)</span></td>
-              <td><span class="tp-badge">TP touché</span></td>
+              <td style="font-family:monospace;font-size:0.85em;color:#ccc">coin_ETH|buy</td>
+              <td style="font-weight:700;color:#4ade80">90%</td>
+              <td style="color:#888">28W / 3L (31)</td>
+              <td class="gain">+$0.58</td>
+              <td><span style="color:#555">0 (apprentissage…)</span></td>
             </tr>
             <tr>
-              <td>2026-07-02 18:34:06</td>
-              <td><span class="coin-badge">BTC/USD</span></td>
-              <td><span class="buy-badge">BUY</span></td>
-              <td>$61208.5800</td>
-              <td>$60944.1163</td>
-              <td>$61649.3527</td>
-              <td class="gain"><strong>+$5.76</strong> <span style="font-size:0.82em;opacity:.75">(+0.72%)</span></td>
-              <td class="gain">+$30.87 <span style="font-size:0.82em;opacity:.75">(+3.09%)</span></td>
-              <td><span class="tp-badge">TP touché</span></td>
+              <td style="font-family:monospace;font-size:0.85em;color:#ccc">coin_LTC|buy</td>
+              <td style="font-weight:700;color:#4ade80">98%</td>
+              <td style="color:#888">48W / 1L (49)</td>
+              <td class="gain">+$27.30</td>
+              <td><span style="color:#555">0 (apprentissage…)</span></td>
             </tr>
             <tr>
-              <td>2026-07-02 17:24:07</td>
-              <td><span class="coin-badge">BTC/USD</span></td>
-              <td><span class="buy-badge">BUY</span></td>
-              <td>$61577.4980</td>
-              <td>$61229.6940</td>
-              <td>$62157.1712</td>
-              <td class="loss"><strong>-$4.52</strong> <span style="font-size:0.82em;opacity:.75">(-0.56%)</span></td>
-              <td class="gain">+$25.11 <span style="font-size:0.82em;opacity:.75">(+2.51%)</span></td>
-              <td><span class="sl-badge">SL touché</span></td>
+              <td style="font-family:monospace;font-size:0.85em;color:#ccc">rsi55-70|buy|MR</td>
+              <td style="font-weight:700;color:#4ade80">100%</td>
+              <td style="color:#888">1W / 0L (1)</td>
+              <td class="gain">+$0.01</td>
+              <td><span style="color:#555">0 (apprentissage…)</span></td>
             </tr>
             <tr>
-              <td>2026-07-02 16:20:15</td>
-              <td><span class="coin-badge">ETH/USD</span></td>
-              <td><span class="buy-badge">BUY</span></td>
-              <td>$1708.1800</td>
-              <td>$1692.4669</td>
-              <td>$1734.3685</td>
-              <td class="loss"><strong>-$7.36</strong> <span style="font-size:0.82em;opacity:.75">(-0.92%)</span></td>
-              <td class="gain">+$29.63 <span style="font-size:0.82em;opacity:.75">(+2.96%)</span></td>
-              <td><span class="sl-badge">SL touché</span></td>
+              <td style="font-family:monospace;font-size:0.85em;color:#ccc">bbp0.20-0.40|buy|MR</td>
+              <td style="font-weight:700;color:#4ade80">100%</td>
+              <td style="color:#888">2W / 0L (2)</td>
+              <td class="gain">+$0.02</td>
+              <td><span style="color:#555">0 (apprentissage…)</span></td>
             </tr>
             <tr>
-              <td>2026-07-02 14:46:16</td>
-              <td><span class="coin-badge">DOGE/USD</span></td>
-              <td><span class="buy-badge">BUY</span></td>
-              <td>$0.0742</td>
-              <td>$0.0739</td>
-              <td>$0.0747</td>
-              <td class="gain"><strong>+$5.39</strong> <span style="font-size:0.82em;opacity:.75">(+0.67%)</span></td>
-              <td class="gain">+$36.99 <span style="font-size:0.82em;opacity:.75">(+3.70%)</span></td>
-              <td><span class="tp-badge">TP touché</span></td>
+              <td style="font-family:monospace;font-size:0.85em;color:#ccc">regime_BULL|buy|MR</td>
+              <td style="font-weight:700;color:#4ade80">100%</td>
+              <td style="color:#888">2W / 0L (2)</td>
+              <td class="gain">+$0.02</td>
+              <td><span style="color:#555">0 (apprentissage…)</span></td>
             </tr>
             <tr>
-              <td>2026-07-02 11:50:13</td>
-              <td><span class="coin-badge">ETH/USD</span></td>
-              <td><span class="buy-badge">BUY</span></td>
-              <td>$1638.3900</td>
-              <td>$1631.8359</td>
-              <td>$1649.3135</td>
-              <td class="gain"><strong>+$5.33</strong> <span style="font-size:0.82em;opacity:.75">(+0.67%)</span></td>
-              <td class="gain">+$31.60 <span style="font-size:0.82em;opacity:.75">(+3.16%)</span></td>
-              <td><span class="tp-badge">TP touché</span></td>
-            </tr>
-            <tr>
-              <td>2026-07-02 09:52:08</td>
-              <td><span class="coin-badge">BTC/USD</span></td>
-              <td><span class="buy-badge">BUY</span></td>
-              <td>$60085.2000</td>
-              <td>$59943.9072</td>
-              <td>$60320.6880</td>
-              <td class="gain"><strong>+$3.14</strong> <span style="font-size:0.82em;opacity:.75">(+0.39%)</span></td>
-              <td class="gain">+$26.27 <span style="font-size:0.82em;opacity:.75">(+2.63%)</span></td>
-              <td><span class="tp-badge">TP touché</span></td>
-            </tr>
-            <tr>
-              <td>2026-07-01 21:04:11</td>
-              <td><span class="coin-badge">ETH/USD</span></td>
-              <td><span class="buy-badge">BUY</span></td>
-              <td>$1619.2950</td>
-              <td>$1614.4656</td>
-              <td>$1627.3440</td>
-              <td class="loss"><strong>-$2.39</strong> <span style="font-size:0.82em;opacity:.75">(-0.30%)</span></td>
-              <td class="gain">+$23.13 <span style="font-size:0.82em;opacity:.75">(+2.31%)</span></td>
-              <td><span class="sl-badge">SL touché</span></td>
-            </tr>
-            <tr>
-              <td>2026-07-01 19:10:04</td>
-              <td><span class="coin-badge">BTC/USD</span></td>
-              <td><span class="buy-badge">BUY</span></td>
-              <td>$59807.0500</td>
-              <td>$59620.2159</td>
-              <td>$60118.4402</td>
-              <td class="gain"><strong>+$4.17</strong> <span style="font-size:0.82em;opacity:.75">(+0.52%)</span></td>
-              <td class="gain">+$25.52 <span style="font-size:0.82em;opacity:.75">(+2.55%)</span></td>
-              <td><span class="tp-badge">TP touché</span></td>
-            </tr>
-            <tr>
-              <td>2026-06-30 21:14:21</td>
-              <td><span class="coin-badge">BTC/USD</span></td>
-              <td><span class="buy-badge">BUY</span></td>
-              <td>$58524.5980</td>
-              <td>$58322.2675</td>
-              <td>$58861.8155</td>
-              <td class="gain"><strong>+$4.61</strong> <span style="font-size:0.82em;opacity:.75">(+0.58%)</span></td>
-              <td class="gain">+$21.35 <span style="font-size:0.82em;opacity:.75">(+2.13%)</span></td>
-              <td><span class="tp-badge">TP touché</span></td>
-            </tr>
-            <tr>
-              <td>2026-06-29 19:40:03</td>
-              <td><span class="coin-badge">ETH/USD</span></td>
-              <td><span class="buy-badge">BUY</span></td>
-              <td>$1621.2005</td>
-              <td>$1610.2603</td>
-              <td>$1639.4343</td>
-              <td class="gain"><strong>+$9.00</strong> <span style="font-size:0.82em;opacity:.75">(+1.12%)</span></td>
-              <td class="gain">+$16.74 <span style="font-size:0.82em;opacity:.75">(+1.67%)</span></td>
-              <td><span class="tp-badge">TP touché</span></td>
-            </tr>
-            <tr>
-              <td>2026-06-29 18:01:11</td>
-              <td><span class="coin-badge">DOGE/USD</span></td>
-              <td><span class="buy-badge">BUY</span></td>
-              <td>$0.0727</td>
-              <td>$0.0722</td>
-              <td>$0.0734</td>
-              <td class="loss"><strong>-$4.96</strong> <span style="font-size:0.82em;opacity:.75">(-0.62%)</span></td>
-              <td class="gain">+$7.74 <span style="font-size:0.82em;opacity:.75">(+0.77%)</span></td>
-              <td><span class="sl-badge">SL touché</span></td>
-            </tr>
-            <tr>
-              <td>2026-06-29 16:32:10</td>
-              <td><span class="coin-badge">AVAX/USD</span></td>
-              <td><span class="buy-badge">BUY</span></td>
-              <td>$6.4972</td>
-              <td>$6.4339</td>
-              <td>$6.6027</td>
-              <td class="gain"><strong>+$12.99</strong> <span style="font-size:0.82em;opacity:.75">(+1.62%)</span></td>
-              <td class="gain">+$12.70 <span style="font-size:0.82em;opacity:.75">(+1.27%)</span></td>
-              <td><span class="tp-badge">TP touché</span></td>
-            </tr>
-            <tr>
-              <td>2026-06-29 14:25:19</td>
-              <td><span class="coin-badge">ETH/USD</span></td>
-              <td><span class="buy-badge">BUY</span></td>
-              <td>$1585.7970</td>
-              <td>$1577.0956</td>
-              <td>$1600.2993</td>
-              <td class="loss"><strong>-$4.39</strong> <span style="font-size:0.82em;opacity:.75">(-0.55%)</span></td>
-              <td class="loss">-$0.29 <span style="font-size:0.82em;opacity:.75">(-0.03%)</span></td>
-              <td><span class="sl-badge">SL touché</span></td>
-            </tr>
-            <tr>
-              <td>2026-06-29 01:03:18</td>
-              <td><span class="coin-badge">ETH/USD</span></td>
-              <td><span class="buy-badge">BUY</span></td>
-              <td>$1559.7000</td>
-              <td>$1548.8547</td>
-              <td>$1577.7755</td>
-              <td class="gain"><strong>+$9.27</strong> <span style="font-size:0.82em;opacity:.75">(+1.16%)</span></td>
-              <td class="gain">+$4.10 <span style="font-size:0.82em;opacity:.75">(+0.41%)</span></td>
-              <td><span class="tp-badge">TP touché</span></td>
-            </tr>
-            <tr>
-              <td>2026-06-28 21:13:15</td>
-              <td><span class="coin-badge">ETH/USD</span></td>
-              <td><span class="buy-badge">BUY</span></td>
-              <td>$1567.4450</td>
-              <td>$1564.0156</td>
-              <td>$1573.1608</td>
-              <td class="loss"><strong>-$1.75</strong> <span style="font-size:0.82em;opacity:.75">(-0.22%)</span></td>
-              <td class="loss">-$5.17 <span style="font-size:0.82em;opacity:.75">(-0.52%)</span></td>
-              <td><span class="sl-badge">SL touché</span></td>
-            </tr>
-            <tr>
-              <td>2026-06-28 16:27:06</td>
-              <td><span class="coin-badge">LTC/USD</span></td>
-              <td><span class="buy-badge">BUY</span></td>
-              <td>$43.0785</td>
-              <td>$42.8946</td>
-              <td>$43.3850</td>
-              <td class="loss"><strong>-$3.42</strong> <span style="font-size:0.82em;opacity:.75">(-0.43%)</span></td>
-              <td class="loss">-$3.42 <span style="font-size:0.82em;opacity:.75">(-0.34%)</span></td>
-              <td><span class="sl-badge">SL touché</span></td>
+              <td style="font-family:monospace;font-size:0.85em;color:#ccc">rsi45-55|buy|MR</td>
+              <td style="font-weight:700;color:#4ade80">100%</td>
+              <td style="color:#888">1W / 0L (1)</td>
+              <td class="gain">+$0.01</td>
+              <td><span style="color:#555">0 (apprentissage…)</span></td>
             </tr></tbody>
     </table>
   </div>
 
-  <div id="errors-section"></div>
+  <div class="section">
+    <h2>📋 Historique des trades (40 derniers)</h2>
+    <table>
+      <thead>
+        <tr><th>Date</th><th>Crypto</th><th>Direction</th><th>Prix entrée</th><th>P&amp;L</th><th>Statut</th></tr>
+      </thead>
+      <tbody>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 16:20</td>
+              <td><span class="coin-badge">AVAX/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$7.6466</td>
+              <td class="loss"><strong>-$0.72</strong> <span style="opacity:.7;font-size:.82em">(-0.48%)</span></td>
+              <td><span class="sl-badge">SL ✗</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 15:39</td>
+              <td><span class="coin-badge">AVAX/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$7.5796</td>
+              <td class="loss"><strong>-$0.63</strong> <span style="opacity:.7;font-size:.82em">(-0.42%)</span></td>
+              <td><span class="sl-badge">SL ✗</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 15:30</td>
+              <td><span class="coin-badge">DOGE/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$0.0926</td>
+              <td class="loss"><strong>-$0.81</strong> <span style="opacity:.7;font-size:.82em">(-0.54%)</span></td>
+              <td><span class="sl-badge">SL ✗</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 15:26</td>
+              <td><span class="coin-badge">AVAX/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$7.6429</td>
+              <td class="loss"><strong>-$0.62</strong> <span style="opacity:.7;font-size:.82em">(-0.41%)</span></td>
+              <td><span class="sl-badge">SL ✗</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 15:25</td>
+              <td><span class="coin-badge">ETH/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$2528.9000</td>
+              <td class="loss"><strong>-$0.58</strong> <span style="opacity:.7;font-size:.82em">(-0.39%)</span></td>
+              <td><span class="sl-badge">SL ✗</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 14:35</td>
+              <td><span class="coin-badge">XRP/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$1.5187</td>
+              <td class="loss"><strong>-$1.01</strong> <span style="opacity:.7;font-size:.82em">(-0.67%)</span></td>
+              <td><span class="sl-badge">SL ✗</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 13:05</td>
+              <td><span class="coin-badge">XRP/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$1.5195</td>
+              <td class="loss"><strong>-$0.85</strong> <span style="opacity:.7;font-size:.82em">(-0.56%)</span></td>
+              <td><span class="sl-badge">SL ✗</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 13:00</td>
+              <td><span class="coin-badge">AVAX/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$7.5867</td>
+              <td class="loss"><strong>-$0.01</strong> <span style="opacity:.7;font-size:.82em">(-0.01%)</span></td>
+              <td><span class="sl-badge">SL ✗</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 12:57</td>
+              <td><span class="coin-badge">LINK/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$11.7650</td>
+              <td class="loss"><strong>-$0.54</strong> <span style="opacity:.7;font-size:.82em">(-0.36%)</span></td>
+              <td><span class="sl-badge">SL ✗</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 12:56</td>
+              <td><span class="coin-badge">LTC/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$53.4570</td>
+              <td class="loss"><strong>-$0.61</strong> <span style="opacity:.7;font-size:.82em">(-0.41%)</span></td>
+              <td><span class="sl-badge">SL ✗</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 12:55</td>
+              <td><span class="coin-badge">ETH/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$2516.3000</td>
+              <td class="loss"><strong>-$0.58</strong> <span style="opacity:.7;font-size:.82em">(-0.39%)</span></td>
+              <td><span class="sl-badge">SL ✗</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 12:50</td>
+              <td><span class="coin-badge">AVAX/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$7.5736</td>
+              <td class="gain"><strong>+$0.11</strong> <span style="opacity:.7;font-size:.82em">(+0.07%)</span></td>
+              <td><span class="tp-badge">TP ✓</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 12:35</td>
+              <td><span class="coin-badge">XRP/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$1.5030</td>
+              <td class="gain"><strong>+$0.10</strong> <span style="opacity:.7;font-size:.82em">(+0.07%)</span></td>
+              <td><span class="tp-badge">TP ✓</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 12:30</td>
+              <td><span class="coin-badge">DOGE/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$0.0926</td>
+              <td class="gain"><strong>+$0.23</strong> <span style="opacity:.7;font-size:.82em">(+0.15%)</span></td>
+              <td><span class="tp-badge">TP ✓</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 11:49</td>
+              <td><span class="coin-badge">XRP/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$1.4948</td>
+              <td class="loss"><strong>-$0.68</strong> <span style="opacity:.7;font-size:.82em">(-0.45%)</span></td>
+              <td><span class="sl-badge">SL ✗</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 11:47</td>
+              <td><span class="coin-badge">XRP/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$1.5026</td>
+              <td class="loss"><strong>-$0.64</strong> <span style="opacity:.7;font-size:.82em">(-0.43%)</span></td>
+              <td><span class="sl-badge">SL ✗</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 11:46</td>
+              <td><span class="coin-badge">ETH/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$2496.5000</td>
+              <td class="loss"><strong>-$0.18</strong> <span style="opacity:.7;font-size:.82em">(-0.12%)</span></td>
+              <td><span class="sl-badge">SL ✗</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 11:38</td>
+              <td><span class="coin-badge">AVAX/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$7.5667</td>
+              <td class="loss"><strong>-$0.44</strong> <span style="opacity:.7;font-size:.82em">(-0.29%)</span></td>
+              <td><span class="sl-badge">SL ✗</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 11:37</td>
+              <td><span class="coin-badge">DOGE/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$0.0923</td>
+              <td class="loss"><strong>-$0.53</strong> <span style="opacity:.7;font-size:.82em">(-0.35%)</span></td>
+              <td><span class="sl-badge">SL ✗</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 11:36</td>
+              <td><span class="coin-badge">ETH/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$2491.6000</td>
+              <td class="gain"><strong>+$0.30</strong> <span style="opacity:.7;font-size:.82em">(+0.20%)</span></td>
+              <td><span class="tp-badge">TP ✓</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 11:35</td>
+              <td><span class="coin-badge">LINK/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$11.7030</td>
+              <td class="loss"><strong>-$0.20</strong> <span style="opacity:.7;font-size:.82em">(-0.13%)</span></td>
+              <td><span class="sl-badge">SL ✗</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 11:30</td>
+              <td><span class="coin-badge">XRP/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$1.4860</td>
+              <td class="gain"><strong>+$0.87</strong> <span style="opacity:.7;font-size:.82em">(+0.58%)</span></td>
+              <td><span class="tp-badge">TP ✓</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 10:29</td>
+              <td><span class="coin-badge">XRP/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$1.4849</td>
+              <td class="gain"><strong>+$0.70</strong> <span style="opacity:.7;font-size:.82em">(+0.46%)</span></td>
+              <td><span class="tp-badge">TP ✓</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 10:28</td>
+              <td><span class="coin-badge">XRP/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$1.4873</td>
+              <td class="gain"><strong>+$0.70</strong> <span style="opacity:.7;font-size:.82em">(+0.46%)</span></td>
+              <td><span class="tp-badge">TP ✓</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 10:27</td>
+              <td><span class="coin-badge">XRP/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$1.4883</td>
+              <td class="gain"><strong>+$0.70</strong> <span style="opacity:.7;font-size:.82em">(+0.46%)</span></td>
+              <td><span class="tp-badge">TP ✓</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 10:26</td>
+              <td><span class="coin-badge">XRP/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$1.4872</td>
+              <td class="gain"><strong>+$0.70</strong> <span style="opacity:.7;font-size:.82em">(+0.46%)</span></td>
+              <td><span class="tp-badge">TP ✓</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 10:25</td>
+              <td><span class="coin-badge">XRP/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$1.4868</td>
+              <td class="gain"><strong>+$0.70</strong> <span style="opacity:.7;font-size:.82em">(+0.46%)</span></td>
+              <td><span class="tp-badge">TP ✓</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 10:24</td>
+              <td><span class="coin-badge">LINK/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$11.6255</td>
+              <td class="gain"><strong>+$0.01</strong> <span style="opacity:.7;font-size:.82em">(+0.01%)</span></td>
+              <td><span class="tp-badge">TP ✓</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 10:23</td>
+              <td><span class="coin-badge">LINK/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$11.6175</td>
+              <td class="gain"><strong>+$0.01</strong> <span style="opacity:.7;font-size:.82em">(+0.01%)</span></td>
+              <td><span class="tp-badge">TP ✓</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 10:22</td>
+              <td><span class="coin-badge">LINK/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$11.6180</td>
+              <td class="gain"><strong>+$0.01</strong> <span style="opacity:.7;font-size:.82em">(+0.01%)</span></td>
+              <td><span class="tp-badge">TP ✓</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 10:21</td>
+              <td><span class="coin-badge">LINK/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$11.6315</td>
+              <td class="gain"><strong>+$0.01</strong> <span style="opacity:.7;font-size:.82em">(+0.01%)</span></td>
+              <td><span class="tp-badge">TP ✓</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 10:20</td>
+              <td><span class="coin-badge">LINK/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$11.6400</td>
+              <td class="gain"><strong>+$0.01</strong> <span style="opacity:.7;font-size:.82em">(+0.01%)</span></td>
+              <td><span class="tp-badge">TP ✓</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 10:19</td>
+              <td><span class="coin-badge">ETH/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$2479.6500</td>
+              <td class="gain"><strong>+$0.06</strong> <span style="opacity:.7;font-size:.82em">(+0.04%)</span></td>
+              <td><span class="tp-badge">TP ✓</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 10:18</td>
+              <td><span class="coin-badge">ETH/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$2479.5500</td>
+              <td class="gain"><strong>+$0.06</strong> <span style="opacity:.7;font-size:.82em">(+0.04%)</span></td>
+              <td><span class="tp-badge">TP ✓</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 10:17</td>
+              <td><span class="coin-badge">ETH/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$2477.6500</td>
+              <td class="gain"><strong>+$0.06</strong> <span style="opacity:.7;font-size:.82em">(+0.04%)</span></td>
+              <td><span class="tp-badge">TP ✓</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 10:16</td>
+              <td><span class="coin-badge">ETH/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$2478.3500</td>
+              <td class="gain"><strong>+$0.06</strong> <span style="opacity:.7;font-size:.82em">(+0.04%)</span></td>
+              <td><span class="tp-badge">TP ✓</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 10:15</td>
+              <td><span class="coin-badge">ETH/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$2480.3500</td>
+              <td class="gain"><strong>+$0.06</strong> <span style="opacity:.7;font-size:.82em">(+0.04%)</span></td>
+              <td><span class="tp-badge">TP ✓</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 10:14</td>
+              <td><span class="coin-badge">ETH/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$2484.1500</td>
+              <td class="gain"><strong>+$0.06</strong> <span style="opacity:.7;font-size:.82em">(+0.04%)</span></td>
+              <td><span class="tp-badge">TP ✓</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 10:13</td>
+              <td><span class="coin-badge">ETH/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$2476.4500</td>
+              <td class="gain"><strong>+$0.06</strong> <span style="opacity:.7;font-size:.82em">(+0.04%)</span></td>
+              <td><span class="tp-badge">TP ✓</span></td>
+            </tr>
+            <tr>
+              <td style="font-size:0.82em;color:#777">2026-08-24 10:12</td>
+              <td><span class="coin-badge">ETH/USDT</span></td>
+              <td><span class="buy-badge">BUY</span></td>
+              <td>$2477.4500</td>
+              <td class="gain"><strong>+$0.06</strong> <span style="opacity:.7;font-size:.82em">(+0.04%)</span></td>
+              <td><span class="tp-badge">TP ✓</span></td>
+            </tr></tbody>
+    </table>
+  </div>
 
-  <p class="footer">Bot en paper trading (simulation) · Aucun argent réel engagé · 07/07/2026 à 23:00:41</p>
-
+  <p class="footer">BotShortTrade · Hyperliquid DEX · Wallet 0xE0e0…91dA</p>
 </body>
 </html>

@@ -1143,6 +1143,51 @@ def write_dashboard(wb: Workbook, open_positions: list, balance: float,
     .sl-badge      {{ background:#450a0a; color:#f87171; padding:2px 10px; border-radius:20px; font-size:0.82em; }}
     .pending-badge {{ background:#1c1917; color:#fbbf24; padding:2px 10px; border-radius:20px; font-size:0.82em; }}
     .footer {{ color: #444; font-size: 0.78em; margin-top: 24px; text-align: center; }}
+    /* ── Tooltips ─────────────────────────────────────────── */
+    [data-tip] {{ position: relative; cursor: help; display: inline-block; }}
+    [data-tip]::after {{
+      content: attr(data-tip);
+      position: absolute;
+      bottom: calc(100% + 10px);
+      left: 50%;
+      transform: translateX(-50%);
+      background: #161b2e;
+      color: #c8d0e4;
+      font-size: 0.77em;
+      line-height: 1.6;
+      padding: 9px 13px;
+      border-radius: 8px;
+      border: 1px solid #2e3350;
+      width: max-content;
+      max-width: 280px;
+      white-space: normal;
+      text-transform: none;
+      letter-spacing: 0;
+      font-weight: 400;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity .18s;
+      z-index: 1000;
+      box-shadow: 0 6px 24px rgba(0,0,0,.75);
+    }}
+    [data-tip]:hover::after {{ opacity: 1; }}
+    [data-tip]::before {{
+      content: '';
+      position: absolute;
+      bottom: calc(100% + 4px);
+      left: 50%;
+      transform: translateX(-50%);
+      border: 6px solid transparent;
+      border-top-color: #2e3350;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity .18s;
+      z-index: 1001;
+    }}
+    [data-tip]:hover::before {{ opacity: 1; }}
+    th[data-tip]::after  {{ bottom: auto; top: calc(100% + 10px); left: 0; transform: none; }}
+    th[data-tip]::before {{ bottom: auto; top: calc(100% + 4px); border-top-color: transparent; border-bottom-color: #2e3350; }}
+    .label [data-tip] {{ border-bottom: 1px dotted #555; padding-bottom: 1px; }}
   </style>
 </head>
 <body>
@@ -1151,35 +1196,35 @@ def write_dashboard(wb: Workbook, open_positions: list, balance: float,
 
   <div class="cards">
     <div class="card">
-      <div class="label">Équité</div>
+      <div class="label"><span data-tip="Valeur totale du compte (perp + USDC spot). Sert de base pour calculer la taille des positions. Réf = capital initial au démarrage du bot.">Équité</span></div>
       <div class="value white">${balance:.2f}</div>
       <div class="sub">Réf: ${initial_balance:.2f}</div>
     </div>
     <div class="card">
-      <div class="label">Dispo</div>
+      <div class="label"><span data-tip="Capital libre pour ouvrir de nouvelles positions = Équité − capital engagé dans les positions ouvertes.">Dispo</span></div>
       <div class="value {'red' if avail_capital <= 0 else 'yellow' if avail_capital < CAPITAL_PER_TRADE * 2 else 'white'}">${avail_capital:.2f}</div>
       <div class="sub">{len(open_positions)} position(s) ouverte(s)</div>
     </div>
     <div class="card">
-      <div class="label">P&amp;L Net</div>
+      <div class="label"><span data-tip="Profit/Perte net depuis le démarrage : gains réalisés (trades fermés) + non-réalisés (positions en cours). Exprimé en % du capital initial.">P&amp;L Net</span></div>
       <div class="value {_val_col(net_pnl)}">{_fmt(net_pnl)}</div>
       <div class="sub">{net_pct:+.2f}% du capital initial</div>
     </div>
     <div class="card">
-      <div class="label">P&amp;L 7 jours</div>
+      <div class="label"><span data-tip="Gains réalisés sur les 7 derniers jours (trades fermés uniquement, hors positions ouvertes).">P&amp;L 7 jours</span></div>
       <div class="value {_val_col(pnl_week)}">{_fmt(pnl_week)}</div>
     </div>
     <div class="card">
-      <div class="label">Trades fermés</div>
+      <div class="label"><span data-tip="Nombre total de positions clôturées (TP = Take Profit touché, SL = Stop Loss touché). W = gagnants, L = perdants.">Trades fermés</span></div>
       <div class="value white">{total_trades}</div>
       <div class="sub">{len(wins)}W / {len(losses)}L</div>
     </div>
     <div class="card">
-      <div class="label">Win Rate</div>
+      <div class="label"><span data-tip="Pourcentage de trades fermés avec un profit. 84%+ = excellent. Le bot vise >70% grâce aux filtres RSI, BBP et volume.">Win Rate</span></div>
       <div class="value {'green' if win_rate >= 50 else 'red'}">{win_rate:.1f}%</div>
     </div>
     <div class="card">
-      <div class="label">Profit Factor</div>
+      <div class="label"><span data-tip="Gains bruts / Pertes brutes. >2 = très rentable, >1 = rentable, <1 = perte nette. Idéalement >3 pour un scalper.">Profit Factor</span></div>
       <div class="value {'green' if profit_factor >= 1.5 else 'yellow' if profit_factor >= 1 else 'red'}">{profit_factor:.2f}</div>
     </div>
   </div>
@@ -1188,7 +1233,7 @@ def write_dashboard(wb: Workbook, open_positions: list, balance: float,
     <h2>🌍 Régime de marché</h2>
     <div class="regime-bar">
       <div class="regime-dot"></div>
-      <span class="regime-name">{regime}</span>
+      <span class="regime-name" data-tip="BULL = BTC+ETH en hausse sur 7j → signaux BUY prioritaires (+ SELL MR score>0.75). BEAR = baissiers → SELL MOM. RANGING = lateral → Mean-Reversion. DIVERGING = BTC et ETH en directions opposées.">{regime}</span>
       <span style="color:#666;font-size:.9em">BTC {btc_chg:+.1f}% · ETH {eth_chg:+.1f}% (7j)</span>
     </div>
   </div>
@@ -1197,7 +1242,7 @@ def write_dashboard(wb: Workbook, open_positions: list, balance: float,
     <h2>📂 Positions ouvertes</h2>
     <table>
       <thead>
-        <tr><th>Crypto</th><th>Direction</th><th>Entrée</th><th>Stop Loss</th><th>Take Profit</th><th>Statut</th></tr>
+        <tr><th>Crypto</th><th>Direction</th><th data-tip="Prix d'ouverture de la position.">Entrée</th><th data-tip="Niveau de prix qui déclenche la fermeture automatique pour limiter la perte. Calculé à 1.5×ATR sous/sur l'entrée.">Stop Loss</th><th data-tip="Prix cible pour clôturer avec profit. Calculé à 4×ATR (ratio gain/risque ≈ 2.7). Le prix doit l'atteindre pour clôturer.">Take Profit</th><th>Statut</th></tr>
       </thead>
       <tbody>{pos_rows}</tbody>
     </table>
@@ -1207,7 +1252,7 @@ def write_dashboard(wb: Workbook, open_positions: list, balance: float,
     <h2>🔍 Dernier scan du marché</h2>
     <table>
       <thead>
-        <tr><th>Crypto</th><th>Signal</th><th>Score</th><th>Détails</th><th>Heure</th></tr>
+        <tr><th>Crypto</th><th data-tip="BUY = signal d'achat détecté · SELL = signal de vente · FLAT = aucun signal ce cycle">Signal</th><th data-tip="Force du signal de 0 à ~2. Plus c'est élevé, plus le bot est confiant dans l'entrée.">Score</th><th data-tip="M15/M5 = tendance haussière (↑) ou baissière (↓) sur 15min et 5min. RSI = momentum 14 périodes (>70 suracheté, <30 survendu). BBP = position dans les Bollinger Bands (0=bord bas, 1=bord haut, négatif=sous la bande). vol = volume actuel / volume moyen (✗=insuffisant, Nx↓=en déclin)">Détails</th><th>Heure</th></tr>
       </thead>
       <tbody>{scan_rows}</tbody>
     </table>
@@ -1217,7 +1262,7 @@ def write_dashboard(wb: Workbook, open_positions: list, balance: float,
     <h2>🧠 Leçons apprises (patterns pénalisés)</h2>
     <table>
       <thead>
-        <tr><th>Pattern</th><th>Win Rate</th><th>W/L</th><th>P&amp;L cumulé</th><th>Pénalité score</th></tr>
+        <tr><th data-tip="Catégorie de trade apprise par le bot. Ex: coin_AVAX|buy = achats AVAX · rsi70-75|buy|BBO = breakout avec RSI 70-75 · bbp&gt;1.0 = prix au-dessus de la Bollinger haute · regime_BULL = trade en régime BULL">Pattern</th><th data-tip="Taux de réussite du pattern. Rouge &lt;35% (dangereux), orange &lt;50% (faible), vert &ge;50% (bon).">Win Rate</th><th>W/L</th><th>P&amp;L cumulé</th><th data-tip="Malus sur le score si WR &lt;40% avec &ge;5 trades. Plus le malus est fort, moins le bot entre dans ce type de trade. Max -0.25.">Pénalité score</th></tr>
       </thead>
       <tbody>{lessons_rows}</tbody>
     </table>
