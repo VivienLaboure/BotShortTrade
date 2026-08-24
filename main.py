@@ -541,21 +541,29 @@ def get_signal(coin: str) -> dict | None:
 # ── Balance (affichage uniquement) ───────────────────────────────────────────
 def get_equity() -> float:
     user_state = info.user_state(WALLET_ADDRESS)
-    # Mode Unified Hyperliquid : équité totale = withdrawable + marge engagée
-    # withdrawable = USDC libre (spot + marge libre perp)
-    # totalMarginUsed = marge actuellement dans des positions ouvertes
-    withdrawable  = float(user_state.get("withdrawable") or 0)
-    cross         = user_state.get("crossMarginSummary") or user_state.get("marginSummary") or {}
-    margin_used   = float(cross.get("totalMarginUsed") or 0)
-    total_unified = withdrawable + margin_used
-    if total_unified > 0:
-        return total_unified
-    # Fallback : accountValue seul (comptes non-unified)
+    cross        = user_state.get("crossMarginSummary") or user_state.get("marginSummary") or {}
+    withdrawable = float(user_state.get("withdrawable") or 0)
+    margin_used  = float(cross.get("totalMarginUsed") or 0)
+    perp_total   = withdrawable + margin_used   # solde perp (libre + engagé)
+
+    # Mode Unified Hyperliquid : le USDC Spot sert aussi de marge perp.
+    # Il n'est PAS dans withdrawable — on l'ajoute séparément.
+    spot_usdc = 0.0
+    try:
+        spot_state = info.spot_user_state(WALLET_ADDRESS)
+        for b in spot_state.get("balances", []):
+            if b["coin"] == "USDC":
+                spot_usdc = float(b.get("total") or 0)
+                break
+    except Exception:
+        pass
+
+    total = perp_total + spot_usdc
+    if total > 0:
+        return total
+    # Fallback pour comptes non-Unified : accountValue seul
     acv = float(cross.get("accountValue") or 0)
-    if acv > 0:
-        return acv
-    spot = info.spot_user_state(WALLET_ADDRESS)
-    return sum(float(b["total"]) for b in spot.get("balances", []) if b["coin"] == "USDC")
+    return acv if acv > 0 else 0.0
 
 def get_unrealized_pnl() -> float:
     try:
