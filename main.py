@@ -1295,15 +1295,17 @@ def run():
             pass
 
         # ── Auto-recalibrage du capital ───────────────────────────────────────────
-        # Si le solde réel a chuté de >20% depuis la détection au démarrage
-        # ET qu'aucune position n'est ouverte → recalibrer MAX_LIQUIDITY.
-        # (avec positions ouvertes on attend : la marge explique la différence)
-        if balance < MAX_LIQUIDITY * 0.80 and len(open_positions) == 0:
+        # Recalibrer si le solde réel s'écarte significativement de MAX_LIQUIDITY
+        # (baisse > 20% OU hausse > 20%) ET aucune position ouverte.
+        # Hausse = dépôt ou profit accumulé. Baisse = perte ou retrait.
+        balance_drift = abs(balance - MAX_LIQUIDITY) / max(MAX_LIQUIDITY, 0.01)
+        if balance_drift > 0.20 and len(open_positions) == 0:
             old_max = MAX_LIQUIDITY
             MAX_LIQUIDITY      = max(balance, 0.01)
             CAPITAL_PER_TRADE  = MAX_LIQUIDITY * CAPITAL_PCT
             capital_in_use     = 0.0
-            print(f"  {C.BYLW}[RECALIBRAGE]{C.RST} Solde ${old_max:.2f} → ${MAX_LIQUIDITY:.2f} | "
+            direction = "↑" if balance > old_max else "↓"
+            print(f"  {C.BYLW}[RECALIBRAGE {direction}]{C.RST} Solde ${old_max:.2f} → ${MAX_LIQUIDITY:.2f} | "
                   f"par trade ${CAPITAL_PER_TRADE:.2f}")
 
         # Disponible = min(tracking interne, cash libre réel)
