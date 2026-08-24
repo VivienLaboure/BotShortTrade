@@ -541,12 +541,19 @@ def get_signal(coin: str) -> dict | None:
 # ── Balance (affichage uniquement) ───────────────────────────────────────────
 def get_equity() -> float:
     user_state = info.user_state(WALLET_ADDRESS)
-    # crossMarginSummary = équité totale du compte cross (dépôts + PnL latent)
-    # marginSummary seul peut retourner uniquement la marge utilisée sur les positions
-    cross = user_state.get("crossMarginSummary") or user_state.get("marginSummary") or {}
-    perp_bal = float(cross.get("accountValue") or 0)
-    if perp_bal > 0:
-        return perp_bal
+    # Mode Unified Hyperliquid : équité totale = withdrawable + marge engagée
+    # withdrawable = USDC libre (spot + marge libre perp)
+    # totalMarginUsed = marge actuellement dans des positions ouvertes
+    withdrawable  = float(user_state.get("withdrawable") or 0)
+    cross         = user_state.get("crossMarginSummary") or user_state.get("marginSummary") or {}
+    margin_used   = float(cross.get("totalMarginUsed") or 0)
+    total_unified = withdrawable + margin_used
+    if total_unified > 0:
+        return total_unified
+    # Fallback : accountValue seul (comptes non-unified)
+    acv = float(cross.get("accountValue") or 0)
+    if acv > 0:
+        return acv
     spot = info.spot_user_state(WALLET_ADDRESS)
     return sum(float(b["total"]) for b in spot.get("balances", []) if b["coin"] == "USDC")
 
