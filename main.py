@@ -1153,9 +1153,9 @@ def write_dashboard(wb: Workbook, open_positions: list, balance: float,
       transform: translateX(-50%);
       background: #161b2e;
       color: #c8d0e4;
-      font-size: 0.77em;
+      font-size: 0.88em;
       line-height: 1.6;
-      padding: 9px 13px;
+      padding: 10px 14px;
       border-radius: 8px;
       border: 1px solid #2e3350;
       width: max-content;
