@@ -1144,50 +1144,28 @@ def write_dashboard(wb: Workbook, open_positions: list, balance: float,
     .pending-badge {{ background:#1c1917; color:#fbbf24; padding:2px 10px; border-radius:20px; font-size:0.82em; }}
     .footer {{ color: #444; font-size: 0.78em; margin-top: 24px; text-align: center; }}
     /* ── Tooltips ─────────────────────────────────────────── */
-    [data-tip] {{ position: relative; cursor: help; display: inline-block; }}
-    [data-tip]::after {{
-      content: attr(data-tip);
-      position: absolute;
-      bottom: calc(100% + 10px);
-      left: 50%;
-      transform: translateX(-50%);
+    [data-tip]          {{ cursor: help; }}
+    .label [data-tip]   {{ border-bottom: 1px dotted #555; padding-bottom: 1px; }}
+    th[data-tip]        {{ cursor: help; }}
+    #_tip {{
+      position: fixed;
       background: #161b2e;
-      color: #c8d0e4;
-      font-size: 0.88em;
-      line-height: 1.6;
-      padding: 10px 14px;
-      border-radius: 8px;
+      color: #d4daf0;
+      font-size: 1em;
+      line-height: 1.65;
+      padding: 11px 15px;
+      border-radius: 9px;
       border: 1px solid #2e3350;
-      width: max-content;
-      max-width: 280px;
+      max-width: 320px;
+      z-index: 9999;
+      box-shadow: 0 6px 28px rgba(0,0,0,.8);
+      pointer-events: none;
+      display: none;
       white-space: normal;
       text-transform: none;
       letter-spacing: 0;
       font-weight: 400;
-      opacity: 0;
-      pointer-events: none;
-      transition: opacity .18s;
-      z-index: 1000;
-      box-shadow: 0 6px 24px rgba(0,0,0,.75);
     }}
-    [data-tip]:hover::after {{ opacity: 1; }}
-    [data-tip]::before {{
-      content: '';
-      position: absolute;
-      bottom: calc(100% + 4px);
-      left: 50%;
-      transform: translateX(-50%);
-      border: 6px solid transparent;
-      border-top-color: #2e3350;
-      opacity: 0;
-      pointer-events: none;
-      transition: opacity .18s;
-      z-index: 1001;
-    }}
-    [data-tip]:hover::before {{ opacity: 1; }}
-    th[data-tip]::after  {{ bottom: auto; top: calc(100% + 10px); left: 0; transform: none; }}
-    th[data-tip]::before {{ bottom: auto; top: calc(100% + 4px); border-top-color: transparent; border-bottom-color: #2e3350; }}
-    .label [data-tip] {{ border-bottom: 1px dotted #555; padding-bottom: 1px; }}
   </style>
 </head>
 <body>
@@ -1279,6 +1257,34 @@ def write_dashboard(wb: Workbook, open_positions: list, balance: float,
   </div>
 
   <p class="footer">BotShortTrade · Hyperliquid DEX · Wallet {WALLET_ADDRESS[:6]}…{WALLET_ADDRESS[-4:]}</p>
+<script>
+(function(){{
+  var tip=document.createElement('div'); tip.id='_tip';
+  document.body.appendChild(tip);
+  function show(e){{
+    var txt=this.getAttribute('data-tip');
+    if(!txt)return;
+    tip.textContent=txt;
+    tip.style.display='block';
+    move(e);
+  }}
+  function move(e){{
+    var m=16, w=tip.offsetWidth, h=tip.offsetHeight;
+    var vw=window.innerWidth, vh=window.innerHeight;
+    var x=e.clientX+m, y=e.clientY-h-m;
+    if(x+w>vw-10) x=e.clientX-w-m;
+    if(y<10) y=e.clientY+m;
+    if(x<10) x=10;
+    tip.style.left=x+'px'; tip.style.top=y+'px';
+  }}
+  function hide(){{ tip.style.display='none'; }}
+  document.querySelectorAll('[data-tip]').forEach(function(el){{
+    el.addEventListener('mouseenter',show);
+    el.addEventListener('mousemove',move);
+    el.addEventListener('mouseleave',hide);
+  }});
+}})();
+</script>
 </body>
 </html>"""
 
