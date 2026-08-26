@@ -1510,7 +1510,9 @@ def run():
 
         # ── Détection d'anomalies + alertes Discord ───────────────────────────────
         # 1) Flash crash : équité chute > 5% en 1 cycle (60s)
-        if hasattr(run, '_prev_equity') and run._prev_equity > 0:
+        #    Ignoré si des positions viennent de se fermer ce cycle (faux positif
+        #    courant : la marge libérée par un SL/TP n'est pas encore reflétée)
+        if hasattr(run, '_prev_equity') and run._prev_equity > 0 and not closed_this_loop:
             equity_drop_pct = (run._prev_equity - balance) / run._prev_equity * 100
             if equity_drop_pct > 5.0:
                 msg = (f"Équité: **${run._prev_equity:.2f}** → **${balance:.2f}** "
