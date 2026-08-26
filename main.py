@@ -53,6 +53,7 @@ MAX_TRADES        = int(os.getenv("MAX_TRADES", 0))
 MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", 3.0))   # % du capital
 SESSION_START_UTC  = int(os.getenv("SESSION_START_UTC", 0))         # heure UTC (0 = minuit)
 SESSION_END_UTC    = int(os.getenv("SESSION_END_UTC", 24))          # heure UTC (24 = H24)
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")          # webhook Discord (alertes anomalies)
 
 # Initialisées au démarrage dans run() depuis le solde réel
 MAX_LIQUIDITY     = _MAX_LIQ_CFG if _MAX_LIQ_CFG > 0 else 100.0  # placeholder
@@ -694,6 +695,27 @@ def set_leverage(coin: str):
     except Exception as e:
         print(f"  {C.BYLW}[WARN]{C.RST} Levier {coin}: {e}")
 
+# ── Alertes Discord ───────────────────────────────────────────────────────────
+def send_discord_alert(title: str, description: str, color: int = 0xe74c3c):
+    """Envoie une alerte embed sur Discord via webhook. Silencieux si pas configuré."""
+    if not DISCORD_WEBHOOK_URL:
+        return
+    payload = {
+        "embeds": [{
+            "title": title,
+            "description": description,
+            "color": color,
+            "footer": {"text": f"BotShortTrade · {WALLET_ADDRESS[:6]}…{WALLET_ADDRESS[-4:]}"},
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }]
+    }
+    try:
+        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5)
+        r.raise_for_status()
+    except Exception:
+        pass  # Ne jamais crasher le bot à cause de Discord
+
+
 # ── Passer un ordre ───────────────────────────────────────────────────────────
 def place_order(sig: dict, wb: Workbook) -> dict:
     coin   = sig["symbol"]
@@ -770,7 +792,8 @@ def place_order(sig: dict, wb: Workbook) -> dict:
     return {"id": order_id, "symbol": coin, "side": side,
             "entry": entry_px, "qty": qty, "sl": sl, "tp": tp,
             "sl_oid": sl_oid, "atr": atr, "open_fee": open_fee,
-            "conditions": sig.get("conditions", {})}
+            "conditions": sig.get("conditions", {}),
+            "opened_at": time.time()}
 
 # ── Trailing stop ────────────────────────────────────────────────────────────
 def trail_sl(position: dict, current_price: float):
@@ -1484,6 +1507,43 @@ def run():
         # Afficher le résumé des leçons toutes les 10 min
         if now_min % 10 == 0:
             print_lessons_summary()
+
+        # ── Détection d'anomalies + alertes Discord ───────────────────────────────
+        # 1) Flash crash : équité chute > 5% en 1 cycle (60s)
+        if hasattr(run, '_prev_equity') and run._prev_equity > 0:
+            equity_drop_pct = (run._prev_equity - balance) / run._prev_equity * 100
+            if equity_drop_pct > 5.0:
+                msg = (f"Équité: **${run._prev_equity:.2f}** → **${balance:.2f}** "
+                       f"(**-{equity_drop_pct:.1f}%** en 1 cycle)")
+                print(f"  {C.BRED}[🔴 FLASH CRASH]{C.RST} {equity_drop_pct:.1f}% en 1 cycle")
+                send_discord_alert("⚡ Flash Crash Détecté", msg, color=0xe74c3c)
+        run._prev_equity = balance
+
+        # 2) Drawdown non-réalisé > 4% de l'équité
+        if len(open_positions) > 0 and balance > 0:
+            dd_pct = abs(unrealized) / balance * 100
+            if unrealized < -balance * 0.04:
+                if not getattr(run, '_drawdown_alerted', False):
+                    msg = (f"P&L non-réalisé: **${unrealized:.2f}** ({dd_pct:.1f}% de l'équité)\n"
+                           f"{len(open_positions)} position(s) ouverte(s)")
+                    print(f"  {C.BRED}[📉 DRAWDOWN]{C.RST} {dd_pct:.1f}% de l'équité non-réalisé")
+                    send_discord_alert("📉 Drawdown Élevé", msg, color=0xe67e22)
+                    run._drawdown_alerted = True
+            else:
+                run._drawdown_alerted = False
+
+        # 3) Position zombie : ouverte depuis > 6h sans fermeture
+        for pos in open_positions:
+            opened_at = pos.get('opened_at')
+            if opened_at:
+                age_h = (time.time() - opened_at) / 3600
+                alert_key = f"_zombie_{pos['symbol']}_{pos['id']}"
+                if age_h > 6.0 and not getattr(run, alert_key, False):
+                    msg = (f"**{pos['symbol']}** ouverte depuis **{age_h:.1f}h** sans TP/SL\n"
+                           f"Entrée: ${pos.get('entry', 0):.4f} | SL: ${pos.get('sl', 0):.4f}")
+                    print(f"  {C.BYLW}[🧟 ZOMBIE]{C.RST} {pos['symbol']} ouverte depuis {age_h:.1f}h")
+                    send_discord_alert("🧟 Position Zombie", msg, color=0xf39c12)
+                    setattr(run, alert_key, True)
 
         # Régénérer le dashboard HTML à chaque cycle
         write_dashboard(wb, open_positions, balance, initial_balance,
