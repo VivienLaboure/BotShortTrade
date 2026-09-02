@@ -437,7 +437,7 @@ def get_signal(coin: str) -> dict | None:
         confirm_long_mr  = last5 > ema8_5[-1]
         confirm_short_mr = last5 < ema8_5[-1]
 
-        avg_vol5 = _avg_vol(c5)
+        avg_vol5 = _avg_vol(c5, 50)   # 50 bougies ≈ 4h → baseline plus stable que 20 (1h40)
         vol_ok   = c5[-1]["v"] >= avg_vol5 * VOL_MULTIPLIER
         move_ok  = move_pct >= MIN_MOVE_PCT
 
@@ -511,7 +511,7 @@ def get_signal(coin: str) -> dict | None:
 
         bars3_str = ("3×↑" if bars3_bull else ("3×↓" if bars3_bear else
                      ("2×↑" if bars2_bull else ("2×↓" if bars2_bear else "✗"))))
-        details = (f"M15={'↑' if bias_up else '↓'} M5={'↑' if confirm_long else '↓'} "
+        details = (f"M15={'↑' if bias_up else '↓'} M5={'↑' if confirm_long_mr else '↓'} "
                    f"RSI={rsi1:.1f} BBP={bbp5:.2f} vol={c5[-1]['v']:.2f}/{avg_vol5:.2f} {bars3_str}"
                    + (f" [{mode}]" if mode else ""))
 
@@ -675,9 +675,16 @@ def best_signal(sigs: list[dict]) -> dict | None:
     return max(sigs, key=lambda s: s["score"]) if sigs else None
 
 # ── Taille de position ─────────────────────────────────────────────────────────
-def calc_qty(coin: str, price: float) -> float:
+def _size_mult(score: float) -> float:
+    """Multiplicateur de capital selon la qualité du signal.
+    Score ≥ 1.5 → +15% (signal fort)  |  Score < 0.9 → -15% (signal marginal)."""
+    if score >= 1.5: return 1.15
+    if score >= 0.9: return 1.0
+    return 0.85
+
+def calc_qty(coin: str, price: float, size_mult: float = 1.0) -> float:
     f = _flt(coin)
-    notional = CAPITAL_PER_TRADE * LEVERAGE
+    notional = CAPITAL_PER_TRADE * LEVERAGE * size_mult
     sz = notional / price
     factor = 10 ** f["sz_dec"]
     sz = math.floor(sz * factor) / factor
@@ -734,7 +741,8 @@ def place_order(sig: dict, wb: Workbook) -> dict:
     if not price:
         raise RuntimeError(f"Prix indisponible: {coin}")
 
-    qty = calc_qty(coin, price)
+    smult = _size_mult(sig.get("score", 1.0))
+    qty   = calc_qty(coin, price, smult)
 
     if is_buy:
         sl = round_px(price - ATR_SL_MULT * atr)
@@ -810,6 +818,11 @@ def place_order(sig: dict, wb: Workbook) -> dict:
 
 # ── Trailing stop ────────────────────────────────────────────────────────────
 def trail_sl(position: dict, current_price: float):
+    """
+    Deux phases de protection automatique :
+      Phase 0 — Breakeven   : dès 1×ATR de profit → SL au prix d'entrée (aucune perte possible)
+      Phase 1 — Trailing    : dès 1.5×ATR de profit → SL suit le prix à 1×ATR (TRAIL_DIST)
+    """
     coin   = position["symbol"]
     is_buy = position["side"] == "BUY"
     entry  = position["entry"]
@@ -817,12 +830,23 @@ def trail_sl(position: dict, current_price: float):
     sl     = position["sl"]
     sl_oid = position.get("sl_oid")
 
-    profit_atr = ((current_price - entry) / atr) if is_buy else ((entry - current_price) / atr)
-    if profit_atr < TRAIL_TRIGGER:
+    if atr <= 0:
         return
 
-    new_sl = round_px(current_price - TRAIL_DIST * atr) if is_buy \
-             else round_px(current_price + TRAIL_DIST * atr)
+    profit_atr = ((current_price - entry) / atr) if is_buy else ((entry - current_price) / atr)
+
+    # Cible SL selon la phase
+    if profit_atr >= TRAIL_TRIGGER:
+        # Phase trailing : SL à TRAIL_DIST×ATR du prix courant
+        new_sl = round_px(current_price - TRAIL_DIST * atr) if is_buy \
+                 else round_px(current_price + TRAIL_DIST * atr)
+        phase_label = f"TRAIL (profit={profit_atr:.1f}×ATR)"
+    elif profit_atr >= 1.0:
+        # Phase breakeven : SL au prix d'entrée
+        new_sl = round_px(entry)
+        phase_label = f"BREAKEVEN (profit={profit_atr:.1f}×ATR)"
+    else:
+        return  # Pas encore assez en profit
 
     # N'avancer le SL que dans le sens favorable
     if (is_buy and new_sl <= sl) or (not is_buy and new_sl >= sl):
@@ -850,7 +874,8 @@ def trail_sl(position: dict, current_price: float):
             position["sl_oid"] = (st[0].get("resting") or {}).get("oid")
             position["sl"] = new_sl
             arrow = "↑" if is_buy else "↓"
-            print(f"  {C.BCYN}[TRAIL {arrow}]{C.RST} {coin} SL={new_sl:.6g} (profit={profit_atr:.1f}×ATR)")
+            tag   = "TRAIL" if profit_atr >= TRAIL_TRIGGER else "BKEVEN"
+            print(f"  {C.BCYN}[{tag} {arrow}]{C.RST} {coin} SL={new_sl:.6g} ({phase_label})")
         else:
             print(f"  {C.BYLW}[TRAIL]{C.RST} rejeté : {r}")
     except Exception as e:
@@ -987,6 +1012,23 @@ def reconcile_zombie_orders(wb: Workbook, open_positions: list) -> None:
 
 # ── Affichage scan ────────────────────────────────────────────────────────────
 # ── P&L portefeuille ──────────────────────────────────────────────────────────
+def calc_daily_pnl(wb: Workbook) -> float:
+    """P&L des trades fermés aujourd'hui (minuit UTC)."""
+    ws = wb["Trades"]
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    daily = 0.0
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        pnl = row[14]
+        if pnl is None or pnl == "":
+            continue
+        date_str = str(row[1] or "")
+        if date_str.startswith(today):
+            try:
+                daily += float(pnl)
+            except (ValueError, TypeError):
+                pass
+    return round(daily, 2)
+
 def calc_portfolio_pnl(wb: Workbook) -> tuple[float, float]:
     ws = wb["Trades"]
     now = datetime.now(timezone.utc)
@@ -1464,12 +1506,12 @@ def run():
                C.BRED if regime in ("BEAR", "DIVERGING") else C.BYLW)
         print(f"  Régime: {_rc}{regime}{C.RST}  BTC={btc_chg:+.1f}%  ETH={eth_chg:+.1f}%")
 
-        # Limite de perte journalière
-        _, pnl_today = calc_portfolio_pnl(wb)
+        # Limite de perte journalière (P&L du jour UTC — trades fermés depuis minuit)
+        pnl_today = calc_daily_pnl(wb)
         daily_loss_limit = -MAX_LIQUIDITY * MAX_DAILY_LOSS_PCT / 100
         daily_loss_hit = pnl_today <= daily_loss_limit
         if daily_loss_hit:
-            print(f"  {C.BRED}[STOP]{C.RST} Perte journalière atteinte (${pnl_today:.2f} ≤ ${daily_loss_limit:.2f})")
+            print(f"  {C.BRED}[STOP]{C.RST} Perte du jour atteinte (${pnl_today:.2f} ≤ ${daily_loss_limit:.2f})")
 
         # Bloquer les nouveaux trades en régime dangereux
         regime_blocked = regime in ("BEAR", "DIVERGING")
