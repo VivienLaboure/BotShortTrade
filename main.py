@@ -320,29 +320,37 @@ def log_scan(coin: str, tf: str, signal: str | None, score: float, details: str)
 
 # ── Bougies — données Bybit public (sans clé API) ────────────────────────────
 def fetch_candles(coin: str, interval: str, count: int, drop_incomplete: bool = True) -> list[dict]:
-    symbol = SYM_BYBIT[coin]
-    iv     = _BYBIT_IV[interval]
-    resp = requests.get(BYBIT_KLINE, params={
-        "category": "linear",
-        "symbol":   symbol,
-        "interval": iv,
-        "limit":    count + 2,
-    }, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("retCode") != 0:
-        raise RuntimeError(f"Bybit kline {symbol}: {data.get('retMsg')}")
-    # Bybit retourne du plus récent au plus ancien → on inverse
-    raw = data["result"]["list"]
-    candles = sorted(
-        [{"ts": int(r[0]), "o": float(r[1]), "h": float(r[2]),
-          "l": float(r[3]), "c": float(r[4]), "v": float(r[5])}
-         for r in raw],
-        key=lambda x: x["ts"]
-    )
-    if drop_incomplete and candles:
-        candles = candles[:-1]
-    return candles[-count:]
+    symbol   = SYM_BYBIT[coin]
+    iv       = _BYBIT_IV[interval]
+    last_err: Exception | None = None
+    for attempt in range(2):   # 1 retry automatique (rate limit Bybit ponctuel)
+        try:
+            resp = requests.get(BYBIT_KLINE, params={
+                "category": "linear",
+                "symbol":   symbol,
+                "interval": iv,
+                "limit":    count + 2,
+            }, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("retCode") != 0:
+                raise RuntimeError(f"Bybit kline {symbol}: {data.get('retMsg')}")
+            # Bybit retourne du plus récent au plus ancien → on inverse
+            raw = data["result"]["list"]
+            candles = sorted(
+                [{"ts": int(r[0]), "o": float(r[1]), "h": float(r[2]),
+                  "l": float(r[3]), "c": float(r[4]), "v": float(r[5])}
+                 for r in raw],
+                key=lambda x: x["ts"]
+            )
+            if drop_incomplete and candles:
+                candles = candles[:-1]
+            return candles[-count:]
+        except Exception as e:
+            last_err = e
+            if attempt == 0:
+                time.sleep(0.5)   # courte pause avant retry
+    raise last_err  # type: ignore[misc]
 
 # ── Indicateurs ───────────────────────────────────────────────────────────────
 def _ema(closes: list[float], n: int) -> list[float]:
@@ -432,10 +440,8 @@ def get_signal(coin: str) -> dict | None:
 
         confirm_long  = last5 > ema8_5[-1] and last5 > vwap5
         confirm_short = last5 < ema8_5[-1] and last5 < vwap5
-        # MR : prix à la BB basse/haute → souvent hors VWAP par définition.
-        # On exige seulement EMA8 (rebond court-terme confirmé), pas VWAP.
+        # MR BUY (lower BB) : rebond court-terme → EMA8 suffit, VWAP non requis
         confirm_long_mr  = last5 > ema8_5[-1]
-        confirm_short_mr = last5 < ema8_5[-1]
 
         avg_vol5 = _avg_vol(c5, 50)   # 50 bougies ≈ 4h → baseline plus stable que 20 (1h40)
         vol_ok   = c5[-1]["v"] >= avg_vol5 * VOL_MULTIPLIER
@@ -445,6 +451,8 @@ def get_signal(coin: str) -> dict | None:
         # 0.35 = tiers bas de la bande  |  0.65 = tiers haut
         bb_long_ok  = bbp5 <= 0.35
         bb_short_ok = bbp5 >= 0.65
+        # MR SELL (upper BB) : prix souvent AU-DESSUS de EMA8 quand à la bande haute → bb_short_ok suffit
+        confirm_short_mr = last5 < ema8_5[-1] or bb_short_ok
 
         # M5 RSI (stable — pour BBO breakout, évite les spikes M1)
         rsi5 = _rsi(closes5, 14)
@@ -585,6 +593,9 @@ def get_market_regime() -> tuple[str, str, float, float]:
       RANGING   : les deux dans ±5%               → exige score élevé
       DIVERGING : l'un monte, l'autre descend      → aucun nouveau trade (marché incohérent)
 
+    Confirmation court-terme (3j) : si BULL sur 7j mais recul > -2% sur 3j → RANGING
+    (évite les signaux BBO breakout pendant les pullbacks d'un bull market)
+
     Retourne (regime, bias, btc_chg_pct, eth_chg_pct)
     """
     try:
@@ -602,6 +613,12 @@ def get_market_regime() -> tuple[str, str, float, float]:
         avg_chg = (btc_chg + eth_chg) / 2
 
         if avg_chg > 5:
+            # Confirmation court-terme : vérifier que le BULL n'est pas en pullback 3j
+            btc_3d = (btc[-1]["c"] - btc[-4]["c"]) / btc[-4]["c"] * 100 if len(btc) >= 4 else 0.0
+            eth_3d = (eth[-1]["c"] - eth[-4]["c"]) / eth[-4]["c"] * 100 if len(eth) >= 4 else 0.0
+            if (btc_3d + eth_3d) / 2 < -2.0:
+                # Pullback court-terme dans un bull market → traiter comme RANGING
+                return "RANGING", "neutral", btc_chg, eth_chg
             return "BULL",    "up",      btc_chg, eth_chg
         if avg_chg < -5:
             return "BEAR",    "down",    btc_chg, eth_chg
@@ -663,7 +680,7 @@ def load_positions_state() -> dict[str, dict]:
 def scan_all(open_coins: set[str]) -> list[dict]:
     candidates = [c for c in WATCHLIST if c not in open_coins]
     results = []
-    with ThreadPoolExecutor(max_workers=4) as ex:
+    with ThreadPoolExecutor(max_workers=max(1, len(candidates))) as ex:
         futs = {ex.submit(get_signal, c): c for c in candidates}
         for fut in as_completed(futs):
             sig = fut.result()
@@ -751,8 +768,9 @@ def place_order(sig: dict, wb: Workbook) -> dict:
         sl = round_px(price + ATR_SL_MULT * atr)
         tp = round_px(price - ATR_TP_MULT * atr)
 
-    _sc = C.BGRN if is_buy else C.BRED
-    print(f"  {_sc}[{side}]{C.RST} {C.BOLD}{coin}{C.RST} {qty} @ ${price:.6g}  {C.RED}SL=${sl:.6g}{C.RST}  {C.GRN}TP=${tp:.6g}{C.RST}  {LEVERAGE}x")
+    _sc    = C.BGRN if is_buy else C.BRED
+    _smtag = f" {C.BYLW}({smult*100:.0f}%){C.RST}" if smult != 1.0 else ""
+    print(f"  {_sc}[{side}]{C.RST} {C.BOLD}{coin}{C.RST} {qty}{_smtag} @ ${price:.6g}  {C.RED}SL=${sl:.6g}{C.RST}  {C.GRN}TP=${tp:.6g}{C.RST}  {LEVERAGE}x")
 
     # Ouverture de la position au marché
     result = exchange.market_open(coin, is_buy, qty, px=None, slippage=0.02)
@@ -1483,13 +1501,14 @@ def run():
         slots_left    = max_slots - len(open_positions)
 
         pnl_total, pnl_week = calc_portfolio_pnl(wb)
+        pnl_today  = calc_daily_pnl(wb)   # P&L du jour calculé ici → réutilisé pour le filtre
         unrealized = get_unrealized_pnl()
         net_pnl = pnl_total + unrealized
         net_pct = (net_pnl / initial_balance * 100) if initial_balance > 0 else 0.0
         _dispo_c = C.BRED if avail_capital <= 0 else (C.BYLW if avail_capital < CAPITAL_PER_TRADE * 2 else C.WHT)
         print(f"  Positions: {C.BOLD}{len(open_positions)}{C.RST}  Dispo: {_dispo_c}${avail_capital:.2f}{C.RST}  Équité: {C.BOLD}${balance:.2f}{C.RST}")
         print(f"  P&L réalisé: {_cp(pnl_total)}${pnl_total:+.2f}{C.RST}  |  Non réalisé: {_cp(unrealized)}${unrealized:+.2f}{C.RST}  |  Net: {_cp(net_pnl)}{C.BOLD}${net_pnl:+.2f} ({net_pct:+.1f}%){C.RST}")
-        print(f"  P&L 7j: {_cp(pnl_week)}${pnl_week:+.2f}{C.RST}")
+        print(f"  P&L 7j: {_cp(pnl_week)}${pnl_week:+.2f}{C.RST}  |  Aujourd'hui: {_cp(pnl_today)}${pnl_today:+.2f}{C.RST}")
 
         # Filtre horaire (heures UTC)
         hour_utc = datetime.now(timezone.utc).hour
@@ -1506,8 +1525,7 @@ def run():
                C.BRED if regime in ("BEAR", "DIVERGING") else C.BYLW)
         print(f"  Régime: {_rc}{regime}{C.RST}  BTC={btc_chg:+.1f}%  ETH={eth_chg:+.1f}%")
 
-        # Limite de perte journalière (P&L du jour UTC — trades fermés depuis minuit)
-        pnl_today = calc_daily_pnl(wb)
+        # Limite de perte journalière (pnl_today déjà calculé plus haut)
         daily_loss_limit = -MAX_LIQUIDITY * MAX_DAILY_LOSS_PCT / 100
         daily_loss_hit = pnl_today <= daily_loss_limit
         if daily_loss_hit:
