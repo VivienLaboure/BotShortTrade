@@ -201,19 +201,33 @@ _last_scan: list[dict] = []   # snapshot du dernier scan complet (pour le dashbo
 LESSONS_FILE    = "lessons.json"
 _current_regime = "RANGING"   # mis à jour dans run() avant chaque scan
 
+# Cache en mémoire pour lessons.json — évite 7 lectures JSON par cycle (1 par coin + dashboard)
+_lessons_cache:    dict  = {}
+_lessons_cache_ts: float = 0.0
+_LESSONS_CACHE_TTL = 300.0  # 5 min — les leçons changent rarement
+
 def _load_lessons() -> dict:
-    try:
-        with open(LESSONS_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"buckets": {}}
+    global _lessons_cache, _lessons_cache_ts
+    now = time.time()
+    if now - _lessons_cache_ts > _LESSONS_CACHE_TTL or not _lessons_cache:
+        try:
+            with open(LESSONS_FILE, encoding="utf-8") as f:
+                _lessons_cache = json.load(f)
+            _lessons_cache_ts = now
+        except Exception:
+            _lessons_cache = {"buckets": {}}
+    return _lessons_cache
 
 def _save_lessons(data: dict):
+    global _lessons_cache, _lessons_cache_ts
     data["updated_at"] = datetime.now(timezone.utc).isoformat()
     tmp = LESSONS_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     os.replace(tmp, LESSONS_FILE)
+    # Invalider le cache pour que le prochain _load_lessons() lise la version fraîche
+    _lessons_cache    = data
+    _lessons_cache_ts = time.time()
 
 def _lesson_buckets(coin: str, side: str, rsi: float, bbp: float,
                     regime: str, mode: str) -> list[str]:
@@ -354,9 +368,18 @@ def fetch_candles(coin: str, interval: str, count: int, drop_incomplete: bool = 
 
 # ── Indicateurs ───────────────────────────────────────────────────────────────
 def _ema(closes: list[float], n: int) -> list[float]:
+    """EMA initialisée sur la SMA des n premières valeurs (standard Bloomberg/TradingView).
+    Évite la dérive des 20-30 premières bougies qu'on obtient en seedant sur closes[0]."""
+    if len(closes) < n:
+        # Pas assez de données — seed minimal
+        k = 2 / (n + 1)
+        ema = [closes[0]]
+        for p in closes[1:]:
+            ema.append(p * k + ema[-1] * (1 - k))
+        return ema
     k = 2 / (n + 1)
-    ema = [closes[0]]
-    for p in closes[1:]:
+    ema = [sum(closes[:n]) / n]   # seed = SMA(n) — convergence quasi-immédiate
+    for p in closes[n:]:
         ema.append(p * k + ema[-1] * (1 - k))
     return ema
 
@@ -787,15 +810,6 @@ def place_order(sig: dict, wb: Workbook) -> dict:
 
     print(f"  {C.BGRN}[OK]{C.RST} oid={order_id}  entrée=${entry_px:.6g}  frais=${open_fee}")
 
-    # Notification Discord — ouverture de trade
-    _ds = "🟢 LONG" if is_buy else "🔴 SHORT"
-    send_discord_alert(
-        f"{_ds} {coin} ouvert",
-        f"Entrée: **${entry_px:.6g}** | SL: **${sl:.6g}** | TP: **${tp:.6g}**\n"
-        f"Qty: {qty} | Notionnel: **${notional}** | {LEVERAGE}x levier",
-        color=0x2ecc71 if is_buy else 0xe74c3c,
-    )
-
     # Ordres SL / TP (trigger reduce-only)
     close_buy = not is_buy
     sl_lim = round_px(sl * 0.90) if is_buy else round_px(sl * 1.10)
@@ -829,6 +843,16 @@ def place_order(sig: dict, wb: Workbook) -> dict:
     pnl_sl   = round(-abs(sl - entry_px) * qty, 2)
 
     log_order(wb, order_id, coin, side, qty, entry_px, sl, tp, atr, notional, pnl_tp, pnl_sl)
+
+    # Notification Discord — ouverture de trade (après notional calculé)
+    _ds   = "🟢 LONG" if is_buy else "🔴 SHORT"
+    _mode = sig.get("conditions", {}).get("mode", "?")
+    send_discord_alert(
+        f"{_ds} {coin} ouvert [{_mode}]",
+        f"Entrée: **${entry_px:.6g}** | SL: **${sl:.6g}** | TP: **${tp:.6g}**\n"
+        f"Score: **{sig.get('score', 0):.3f}** | Notionnel: **${notional}** | {LEVERAGE}x levier",
+        color=0x2ecc71 if is_buy else 0xe74c3c,
+    )
 
     return {"id": order_id, "symbol": coin, "side": side,
             "entry": entry_px, "qty": qty, "sl": sl, "tp": tp,
@@ -1012,12 +1036,13 @@ def recover_open_positions() -> tuple[list, float]:
             open_fee = 0.0
             oid      = f"recovered-{coin}"
 
-        # Restaurer opened_at pour que la détection zombie fonctionne après redémarrage
-        opened_at = saved.get("opened_at", time.time()) if enriched else time.time()
-        position  = {"id": oid, "symbol": coin, "side": side,
-                     "entry": entry, "qty": qty, "sl": sl, "tp": tp,
-                     "sl_oid": sl_oid, "atr": atr, "open_fee": open_fee,
-                     "opened_at": opened_at}
+        # Restaurer opened_at + conditions — essentiels pour zombie-detection et enregistrement leçons
+        opened_at  = saved.get("opened_at", time.time()) if enriched else time.time()
+        conditions = saved.get("conditions", {}) if enriched else {}
+        position   = {"id": oid, "symbol": coin, "side": side,
+                      "entry": entry, "qty": qty, "sl": sl, "tp": tp,
+                      "sl_oid": sl_oid, "atr": atr, "open_fee": open_fee,
+                      "opened_at": opened_at, "conditions": conditions}
         recovered.append(position)
         capital_used += CAPITAL_PER_TRADE
 
@@ -1094,7 +1119,8 @@ def _print_scan_summary():
 def write_dashboard(wb: Workbook, open_positions: list, balance: float,
                     initial_balance: float, pnl_total: float, pnl_week: float,
                     unrealized: float, avail_capital: float,
-                    regime: str, btc_chg: float, eth_chg: float):
+                    regime: str, btc_chg: float, eth_chg: float,
+                    pnl_today: float = 0.0):
     try:
         ws = wb["Trades"]
         rows = [r for r in ws.iter_rows(min_row=2, values_only=True) if r[14] is not None and r[14] != ""]
@@ -1306,6 +1332,10 @@ def write_dashboard(wb: Workbook, open_positions: list, balance: float,
     <div class="card">
       <div class="label"><span data-tip="Gains réalisés sur les 7 derniers jours (trades fermés uniquement, hors positions ouvertes).">P&amp;L 7 jours</span></div>
       <div class="value {_val_col(pnl_week)}">{_fmt(pnl_week)}</div>
+    </div>
+    <div class="card">
+      <div class="label"><span data-tip="Gains réalisés aujourd'hui (depuis minuit UTC). Sert aussi de limite de perte journalière.">Aujourd'hui</span></div>
+      <div class="value {_val_col(pnl_today)}">{_fmt(pnl_today)}</div>
     </div>
     <div class="card">
       <div class="label"><span data-tip="Nombre total de positions clôturées (TP = Take Profit touché, SL = Stop Loss touché). W = gagnants, L = perdants.">Trades fermés</span></div>
@@ -1533,7 +1563,6 @@ def run():
         in_session = SESSION_START_UTC <= hour_utc < SESSION_END_UTC
 
         # Régime de marché — mis à jour toutes les 30 min (candles journalières, pas besoin de plus)
-        now_min = datetime.now(timezone.utc).minute
         if "_regime_cache" not in run.__dict__ or now_min % 30 == 0:
             run._regime_cache = get_market_regime()
         regime, bias, btc_chg, eth_chg = run._regime_cache
@@ -1662,7 +1691,7 @@ def run():
         # Régénérer le dashboard HTML à chaque cycle
         write_dashboard(wb, open_positions, balance, initial_balance,
                         pnl_total, pnl_week, unrealized, avail_capital,
-                        regime, btc_chg, eth_chg)
+                        regime, btc_chg, eth_chg, pnl_today)
 
         elapsed = time.time() - loop_start
         wait    = max(0.0, LOOP_SECONDS - elapsed)
