@@ -384,16 +384,20 @@ def _ema(closes: list[float], n: int) -> list[float]:
     return ema
 
 def _atr(candles: list[dict], n: int = 14) -> float:
+    """ATR de Wilder initialisé sur la SMA des n premières TR (même logique que _ema).
+    Un ATR mal initialisé fausse directement les niveaux SL/TP."""
     trs = []
     for i in range(1, len(candles)):
-        c = candles[i]
+        c  = candles[i]
         pc = candles[i - 1]["c"]
         trs.append(max(c["h"] - c["l"], abs(c["h"] - pc), abs(c["l"] - pc)))
     if not trs:
         return 0.0
-    atr = trs[0]
-    k = 1 / n
-    for tr in trs[1:]:
+    if len(trs) < n:
+        return sum(trs) / len(trs)
+    k   = 1 / n
+    atr = sum(trs[:n]) / n   # seed = SMA(n) — convergence immédiate
+    for tr in trs[n:]:
         atr = tr * k + atr * (1 - k)
     return atr
 
@@ -471,11 +475,9 @@ def get_signal(coin: str) -> dict | None:
         move_ok  = move_pct >= MIN_MOVE_PCT
 
         # BBP : prix dans la zone basse pour BUY, haute pour SELL
-        # 0.35 = tiers bas de la bande  |  0.65 = tiers haut
-        bb_long_ok  = bbp5 <= 0.35
+        # 0.35 = tiers bas strict (tiers inférieur)  |  0.65 = tiers haut
+        bb_long_ok  = bbp5 <= 0.35   # seuil strict — plus oversold = rebond plus probable
         bb_short_ok = bbp5 >= 0.65
-        # MR SELL (upper BB) : prix souvent AU-DESSUS de EMA8 quand à la bande haute → bb_short_ok suffit
-        confirm_short_mr = last5 < ema8_5[-1] or bb_short_ok
 
         # M5 RSI (stable — pour BBO breakout, évite les spikes M1)
         rsi5 = _rsi(closes5, 14)
@@ -505,7 +507,8 @@ def get_signal(coin: str) -> dict | None:
         base_mom_sht = vol_ok and move_ok and vol1_ok and bars3_bear   # SELL MOM: 3 bougies
 
         # ── BUY mean-reversion : RSI en zone neutre, prix bas de la bande ──────
-        if bias_up and confirm_long_mr and base_mr_long and 30 <= rsi1 <= 70 and bbp5 <= 0.40:
+        # bb_long_ok = bbp5 <= 0.35 (tiers inférieur strict — plus oversold que 0.40)
+        if bias_up and confirm_long_mr and base_mr_long and 30 <= rsi1 <= 70 and bb_long_ok:
             signal    = "buy"
             mode      = "MR"
             rsi_score = (70 - rsi1) / 40
@@ -513,7 +516,8 @@ def get_signal(coin: str) -> dict | None:
             score     = round(rsi_score * 0.25 + vol_ratio_capped * 0.4 + bb_score * 0.15 + 0.2, 3)
 
         # ── SELL mean-reversion : RSI neutre, prix haut de la bande ─────────────
-        elif bias_dn and confirm_short_mr and base_mr_sht and 35 <= rsi1 <= 65 and bb_short_ok:
+        # confirm_short_mr supprimé — était toujours True (bb_short_ok est déjà requis)
+        elif bias_dn and base_mr_sht and 35 <= rsi1 <= 65 and bb_short_ok:
             signal    = "sell"
             mode      = "MR"
             rsi_score = (rsi1 - 35) / 30
@@ -578,8 +582,8 @@ def get_signal(coin: str) -> dict | None:
         return None
 
 # ── Balance (affichage uniquement) ───────────────────────────────────────────
-def get_equity() -> float:
-    user_state = info.user_state(WALLET_ADDRESS)
+def get_equity(cached_state: dict | None = None) -> float:
+    user_state = cached_state if cached_state is not None else info.user_state(WALLET_ADDRESS)
     cross        = user_state.get("crossMarginSummary") or user_state.get("marginSummary") or {}
     withdrawable = float(user_state.get("withdrawable") or 0)
     margin_used  = float(cross.get("totalMarginUsed") or 0)
@@ -604,10 +608,10 @@ def get_equity() -> float:
     acv = float(cross.get("accountValue") or 0)
     return acv if acv > 0 else 0.0
 
-def get_unrealized_pnl() -> float:
+def get_unrealized_pnl(cached_state: dict | None = None) -> float:
     try:
-        positions = info.user_state(WALLET_ADDRESS).get("assetPositions", [])
-        return sum(float(p["position"]["unrealizedPnl"]) for p in positions)
+        state = cached_state if cached_state is not None else info.user_state(WALLET_ADDRESS)
+        return sum(float(p["position"]["unrealizedPnl"]) for p in state.get("assetPositions", []))
     except Exception:
         return 0.0
 
@@ -910,8 +914,11 @@ def trail_sl(position: dict, current_price: float):
             print(f"  {C.BYLW}[TRAIL]{C.RST} annulation SL : {e}")
 
     # Placer le nouveau SL
+    # Slippage max 2% pour le trailing/breakeven SL (protège un profit, pas une perte).
+    # Contrairement au SL initial (10%), on ne veut pas remplir à n'importe quel prix :
+    # un BUY trail à $103 avec limite à $92.70 (10%) ne remplit pas si crash à $93 → perte.
     close_buy = not is_buy
-    sl_lim = round_px(new_sl * 0.90) if is_buy else round_px(new_sl * 1.10)
+    sl_lim = round_px(new_sl * 0.98) if is_buy else round_px(new_sl * 1.02)
     try:
         r = exchange.order(
             coin, close_buy, position["qty"],
@@ -1502,19 +1509,25 @@ def run():
         now_min = datetime.now(timezone.utc).minute   # défini tôt — utilisé avant la section régime
         print(f"\n{C.DIM}[{ts}] ──────────────────────────────────────────────────{C.RST}")
 
+        # ── Fetch unique par cycle : user_state sert pour check_position + equity + unrealized ──
+        # Avant : 3–4 appels info.user_state() par cycle (check × N + get_equity + get_unrealized)
+        # Maintenant : 1 seul appel, partagé par tous.
+        _user_state: dict | None = None
+        try:
+            _user_state = info.user_state(WALLET_ADDRESS)
+        except Exception as e:
+            log_error(f"user_state: {e}")
+
         # Suivi des positions ouvertes
-        # Pré-charger user_state + mids UNE SEULE FOIS pour tout le cycle (évite N appels API)
         closed_this_loop = []
-        _cycle_state: dict | None = None
-        _cycle_mids:  dict | None = None
-        if open_positions:
+        _cycle_mids: dict | None = None
+        if open_positions and _user_state is not None:
             try:
-                _cycle_state = info.user_state(WALLET_ADDRESS)
-                _cycle_mids  = info.all_mids()
+                _cycle_mids = info.all_mids()
             except Exception:
                 pass
         for pos in list(open_positions):
-            result = check_position(wb, pos, _cycle_state, _cycle_mids)
+            result = check_position(wb, pos, _user_state, _cycle_mids)
             if result is not None:
                 closed_this_loop.append(pos)
 
@@ -1526,9 +1539,9 @@ def run():
         if closed_this_loop:
             save_positions_state(open_positions)
 
-        # Balance à jour
+        # Balance et non-réalisé depuis le même user_state déjà chargé
         try:
-            balance = get_equity()
+            balance = get_equity(_user_state)
         except Exception:
             pass
 
@@ -1564,7 +1577,7 @@ def run():
 
         pnl_total, pnl_week = calc_portfolio_pnl(wb)
         pnl_today  = calc_daily_pnl(wb)   # P&L du jour calculé ici → réutilisé pour le filtre
-        unrealized = get_unrealized_pnl()
+        unrealized = get_unrealized_pnl(_user_state)
         net_pnl = pnl_total + unrealized
         net_pct = (net_pnl / initial_balance * 100) if initial_balance > 0 else 0.0
         _dispo_c = C.BRED if avail_capital <= 0 else (C.BYLW if avail_capital < CAPITAL_PER_TRADE * 2 else C.WHT)
