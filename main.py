@@ -512,7 +512,7 @@ def get_signal(coin: str) -> dict | None:
             signal    = "buy"
             mode      = "MR"
             rsi_score = (70 - rsi1) / 40
-            bb_score  = (0.40 - bbp5) / 0.40
+            bb_score  = (0.35 - bbp5) / 0.35   # calibré sur seuil 0.35 : bbp=0.35→0.0, bbp=0.0→1.0
             score     = round(rsi_score * 0.25 + vol_ratio_capped * 0.4 + bb_score * 0.15 + 0.2, 3)
 
         # ── SELL mean-reversion : RSI neutre, prix haut de la bande ─────────────
@@ -1535,13 +1535,15 @@ def run():
             open_positions.remove(pos)
             capital_in_use = max(0.0, capital_in_use - CAPITAL_PER_TRADE)
 
-        # Persister l'état si des positions ont changé ce cycle
-        if closed_this_loop:
-            save_positions_state(open_positions)
+        # Persister l'état après chaque cycle de vérification :
+        # - positions fermées : évident
+        # - positions ouvertes : sl, sl_oid et trailed peuvent avoir changé via trail_sl()
+        #   Si le bot crashe avant le prochain save, le nouvel sl_oid serait perdu sur disque
+        save_positions_state(open_positions)
 
-        # Balance et non-réalisé depuis le même user_state déjà chargé
+        # Balance : si des positions ont fermé ce cycle, user_state est stale → refetch
         try:
-            balance = get_equity(_user_state)
+            balance = get_equity(None if closed_this_loop else _user_state)
         except Exception:
             pass
 
