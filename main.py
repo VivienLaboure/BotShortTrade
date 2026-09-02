@@ -432,6 +432,10 @@ def get_signal(coin: str) -> dict | None:
 
         confirm_long  = last5 > ema8_5[-1] and last5 > vwap5
         confirm_short = last5 < ema8_5[-1] and last5 < vwap5
+        # MR : prix à la BB basse/haute → souvent hors VWAP par définition.
+        # On exige seulement EMA8 (rebond court-terme confirmé), pas VWAP.
+        confirm_long_mr  = last5 > ema8_5[-1]
+        confirm_short_mr = last5 < ema8_5[-1]
 
         avg_vol5 = _avg_vol(c5)
         vol_ok   = c5[-1]["v"] >= avg_vol5 * VOL_MULTIPLIER
@@ -469,7 +473,7 @@ def get_signal(coin: str) -> dict | None:
         base_mom_sht = vol_ok and move_ok and vol1_ok and bars3_bear   # SELL MOM: 3 bougies
 
         # ── BUY mean-reversion : RSI en zone neutre, prix bas de la bande ──────
-        if bias_up and confirm_long and base_mr_long and 30 <= rsi1 <= 70 and bbp5 <= 0.40:
+        if bias_up and confirm_long_mr and base_mr_long and 30 <= rsi1 <= 70 and bbp5 <= 0.40:
             signal    = "buy"
             mode      = "MR"
             rsi_score = (70 - rsi1) / 40
@@ -477,7 +481,7 @@ def get_signal(coin: str) -> dict | None:
             score     = round(rsi_score * 0.25 + vol_ratio * 0.4 + bb_score * 0.15 + 0.2, 3)
 
         # ── SELL mean-reversion : RSI neutre, prix haut de la bande ─────────────
-        elif bias_dn and confirm_short and base_mr_sht and 35 <= rsi1 <= 65 and bb_short_ok:
+        elif bias_dn and confirm_short_mr and base_mr_sht and 35 <= rsi1 <= 65 and bb_short_ok:
             signal    = "sell"
             mode      = "MR"
             rsi_score = (rsi1 - 35) / 30
@@ -755,6 +759,15 @@ def place_order(sig: dict, wb: Workbook) -> dict:
 
     print(f"  {C.BGRN}[OK]{C.RST} oid={order_id}  entrée=${entry_px:.6g}  frais=${open_fee}")
 
+    # Notification Discord — ouverture de trade
+    _ds = "🟢 LONG" if is_buy else "🔴 SHORT"
+    send_discord_alert(
+        f"{_ds} {coin} ouvert",
+        f"Entrée: **${entry_px:.6g}** | SL: **${sl:.6g}** | TP: **${tp:.6g}**\n"
+        f"Qty: {qty} | Notionnel: **${notional}** | {LEVERAGE}x levier",
+        color=0x2ecc71 if is_buy else 0xe74c3c,
+    )
+
     # Ordres SL / TP (trigger reduce-only)
     close_buy = not is_buy
     sl_lim = round_px(sl * 0.90) if is_buy else round_px(sl * 1.10)
@@ -887,6 +900,16 @@ def check_position(wb: Workbook, position: dict) -> str | None:
 
         _rc = C.BGRN if "TP" in result else C.BRED
         print(f"  {_rc}[{result}]{C.RST} {C.BOLD}{coin}{C.RST}  P&L={_cp(pnl)}${pnl:.2f}{C.RST}")
+
+        # Notification Discord — fermeture de trade
+        _emoji = "✅" if pnl >= 0 else "🛑"
+        _pnl_s = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+        send_discord_alert(
+            f"{_emoji} {coin} — {result}",
+            f"P&L: **{_pnl_s}** | Entrée: **${position.get('entry', 0):.6g}**",
+            color=0x2ecc71 if pnl >= 0 else 0xe74c3c,
+        )
+
         record_lesson(position, result, pnl)   # apprendre des succès et des erreurs
         update_order_status(wb, position["id"], result, pnl)
         return result
@@ -1362,7 +1385,8 @@ def run():
 
     while True:
         loop_start = time.time()
-        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        ts      = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        now_min = datetime.now(timezone.utc).minute   # défini tôt — utilisé avant la section régime
         print(f"\n{C.DIM}[{ts}] ──────────────────────────────────────────────────{C.RST}")
 
         # Suivi des positions ouvertes
@@ -1481,19 +1505,29 @@ def run():
                             s["score"] >= 0.75)]
             signals = [s for s in signals if s["score"] >= min_score]
 
-            sig = best_signal(signals)
-            if sig:
+            # Ouvrir jusqu'à slots_left positions si plusieurs bons signaux disponibles
+            opened_this_cycle = 0
+            while signals and slots_left > 0 and avail_capital >= CAPITAL_PER_TRADE:
+                sig = best_signal(signals)
+                if not sig:
+                    break
+                signals = [s for s in signals if s["symbol"] != sig["symbol"]]
                 _ss = C.BGRN if sig["signal"] == "buy" else C.BRED
                 print(f"\n  {_ss}[SIGNAL] {sig['symbol']} {sig['signal'].upper()}{C.RST}  score={sig['score']:.3f}  régime={regime}")
                 try:
                     pos = place_order(sig, wb)
                     open_positions.append(pos)
                     capital_in_use += CAPITAL_PER_TRADE
-                    save_positions_state(open_positions)  # persister immédiatement
+                    avail_capital  -= CAPITAL_PER_TRADE
+                    slots_left     -= 1
+                    opened_this_cycle += 1
+                    save_positions_state(open_positions)
                 except Exception as e:
                     log_error(f"place_order: {e}")
                     traceback.print_exc()
-            else:
+                    break  # ne pas tenter un 2e ordre si le 1er échoue
+
+            if opened_this_cycle == 0:
                 print(f"  {C.DIM}Pas de signal retenu ce cycle{C.RST}")
         elif slots_left <= 0:
             print(f"  {C.DIM}Toutes les positions sont ouvertes — scan ignoré{C.RST}")
