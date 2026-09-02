@@ -461,7 +461,7 @@ def get_signal(coin: str) -> dict | None:
         closes1  = [c["c"] for c in c1]
         rsi1     = _rsi(closes1, 14)
         avg_vol1 = _avg_vol(c1)
-        vol1_ok  = c1[-1]["v"] >= avg_vol1 * VOL_MULTIPLIER
+        vol1_ok  = c1[-1]["v"] >= avg_vol1   # M1 : seuil simple — le M5 filtre déjà à ×1.2
 
         # Confirmation directionnelle M5 :
         # MR (mean-reversion) : 2 bougies suffisent — la consolidation génère des candles mixtes
@@ -506,11 +506,13 @@ def get_signal(coin: str) -> dict | None:
             score     = round(vol_ratio * 0.5 + rsi_score * 0.25 + bb_score * 0.25, 3)
 
         # ── BUY breakout : cassure haussière au-dessus de la BB haute ────────────
-        # Uniquement en régime BULL — prix > BB haute (BBP ≥ 0.75) + trend ↑ + volume fort
+        # BULL    : BBP ≥ 0.75 (breakout standard dans le sens de la tendance)
+        # RANGING : BBP ≥ 0.85 (seuil plus strict — évite les faux cassures en range)
         # Utilise rsi5 (M5, 14 périodes) — stable pendant les pompes, contrairement à rsi1
         # qui monte à 90+ en quelques minutes M1 et bloque tous les signaux de breakout.
-        elif (_current_regime == "BULL" and bias_up and confirm_long
-              and vol_ok and move_ok and 45 <= rsi5 <= 85 and bbp5 >= 0.75):
+        elif (bias_up and confirm_long and vol_ok and move_ok and 45 <= rsi5 <= 85
+              and ((_current_regime == "BULL" and bbp5 >= 0.75)
+                   or (_current_regime == "RANGING" and bbp5 >= 0.85))):
             signal    = "buy"
             mode      = "BBO"
             rsi_score = max(0.0, (85 - rsi5) / 40)      # rsi5=45 → 1.0 | rsi5=85 → 0.0
@@ -900,10 +902,14 @@ def trail_sl(position: dict, current_price: float):
         print(f"  {C.BYLW}[TRAIL]{C.RST} erreur : {e}")
 
 # ── Suivi de position ─────────────────────────────────────────────────────────
-def check_position(wb: Workbook, position: dict) -> str | None:
+def check_position(wb: Workbook, position: dict,
+                   cached_state: dict | None = None,
+                   cached_mids: dict | None = None) -> str | None:
+    """Vérifie l'état d'une position ouverte. cached_state/mids évitent des appels API redondants
+    quand plusieurs positions sont vérifiées dans le même cycle."""
     coin = position["symbol"]
     try:
-        user_state = info.user_state(WALLET_ADDRESS)
+        user_state = cached_state if cached_state is not None else info.user_state(WALLET_ADDRESS)
         asset_pos  = user_state.get("assetPositions", [])
         pos = next(
             (p["position"] for p in asset_pos
@@ -912,7 +918,7 @@ def check_position(wb: Workbook, position: dict) -> str | None:
         )
 
         if pos:
-            mids  = info.all_mids()
+            mids  = cached_mids if cached_mids is not None else info.all_mids()
             price = float(mids.get(coin, position["entry"]))
             pnl   = float(pos.get("unrealizedPnl", 0))
             pct   = (price - position["entry"]) / position["entry"] * 100
@@ -1006,9 +1012,12 @@ def recover_open_positions() -> tuple[list, float]:
             open_fee = 0.0
             oid      = f"recovered-{coin}"
 
-        position = {"id": oid, "symbol": coin, "side": side,
-                    "entry": entry, "qty": qty, "sl": sl, "tp": tp,
-                    "sl_oid": sl_oid, "atr": atr, "open_fee": open_fee}
+        # Restaurer opened_at pour que la détection zombie fonctionne après redémarrage
+        opened_at = saved.get("opened_at", time.time()) if enriched else time.time()
+        position  = {"id": oid, "symbol": coin, "side": side,
+                     "entry": entry, "qty": qty, "sl": sl, "tp": tp,
+                     "sl_oid": sl_oid, "atr": atr, "open_fee": open_fee,
+                     "opened_at": opened_at}
         recovered.append(position)
         capital_used += CAPITAL_PER_TRADE
 
@@ -1450,9 +1459,18 @@ def run():
         print(f"\n{C.DIM}[{ts}] ──────────────────────────────────────────────────{C.RST}")
 
         # Suivi des positions ouvertes
+        # Pré-charger user_state + mids UNE SEULE FOIS pour tout le cycle (évite N appels API)
         closed_this_loop = []
+        _cycle_state: dict | None = None
+        _cycle_mids:  dict | None = None
+        if open_positions:
+            try:
+                _cycle_state = info.user_state(WALLET_ADDRESS)
+                _cycle_mids  = info.all_mids()
+            except Exception:
+                pass
         for pos in list(open_positions):
-            result = check_position(wb, pos)
+            result = check_position(wb, pos, _cycle_state, _cycle_mids)
             if result is not None:
                 closed_this_loop.append(pos)
 
@@ -1556,7 +1574,7 @@ def run():
             # BULL     → BUY dans la tendance + SELL MR autorisé (suracheté, score ≥ 0.75)
             #            SELL MOM bloqué (ne pas shorter un crash en plein BULL)
             # RANGING  → exige score ≥ 0.75 (marché sans direction claire)
-            min_score = 0.75 if regime == "RANGING" else 0.0
+            min_score = 0.75 if regime == "RANGING" else 0.45  # BULL : filtre les signaux trop faibles
             if regime == "BULL":
                 signals = [s for s in signals if
                            s["signal"] == "buy" or
