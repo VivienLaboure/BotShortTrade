@@ -277,12 +277,12 @@ def record_lesson(position: dict, outcome: str, pnl: float):
         else:   b["l"] += 1
         b["pnl"] = round(b["pnl"] + pnl, 2)
     _save_lessons(data)
-    # Afficher une alerte si un bucket devient clairement mauvais
+    # Afficher une alerte si un bucket devient clairement mauvais (même seuil MIN_SAMPLES que la pénalité)
     if not win:
         for k in keys:
             b = buckets[k]
             total = b["w"] + b["l"]
-            if total >= 3 and b["w"] / total < 0.35:
+            if total >= 5 and b["w"] / total < 0.35:
                 print(f"  {C.BYLW}[LEÇON]{C.RST} Pattern risqué détecté : {C.BOLD}{k}{C.RST} "
                       f"WR={b['w']/total*100:.0f}% ({b['w']}W/{b['l']}L)")
 
@@ -497,7 +497,8 @@ def get_signal(coin: str) -> dict | None:
         signal    = None
         score     = 0.0
         mode      = ""
-        vol_ratio = c5[-1]["v"] / avg_vol5 if avg_vol5 else 1.0
+        vol_ratio        = c5[-1]["v"] / avg_vol5 if avg_vol5 else 1.0
+        vol_ratio_capped = min(vol_ratio, 3.0)  # spike >3× ignoré pour le score — évite les faux signaux sur panique
 
         base_mr_long = vol_ok and move_ok and vol1_ok and bars2_bull   # BUY MR  : 2 bougies
         base_mr_sht  = vol_ok and move_ok and vol1_ok and bars2_bear   # SELL MR : 2 bougies
@@ -509,7 +510,7 @@ def get_signal(coin: str) -> dict | None:
             mode      = "MR"
             rsi_score = (70 - rsi1) / 40
             bb_score  = (0.40 - bbp5) / 0.40
-            score     = round(rsi_score * 0.25 + vol_ratio * 0.4 + bb_score * 0.15 + 0.2, 3)
+            score     = round(rsi_score * 0.25 + vol_ratio_capped * 0.4 + bb_score * 0.15 + 0.2, 3)
 
         # ── SELL mean-reversion : RSI neutre, prix haut de la bande ─────────────
         elif bias_dn and confirm_short_mr and base_mr_sht and 35 <= rsi1 <= 65 and bb_short_ok:
@@ -517,7 +518,7 @@ def get_signal(coin: str) -> dict | None:
             mode      = "MR"
             rsi_score = (rsi1 - 35) / 30
             bb_score  = (bbp5 - 0.65) / 0.35
-            score     = round(rsi_score * 0.25 + vol_ratio * 0.4 + bb_score * 0.15 + 0.2, 3)
+            score     = round(rsi_score * 0.25 + vol_ratio_capped * 0.4 + bb_score * 0.15 + 0.2, 3)
 
         # ── SELL momentum : crash/tendance forte — prix sous la bande basse ─────
         # RSI extrême (<= 35) + prix cassant sous la BB + toute la structure baissière
@@ -526,7 +527,7 @@ def get_signal(coin: str) -> dict | None:
             mode      = "MOM"
             rsi_score = max(0.0, (35 - rsi1) / 35)   # plus RSI bas = momentum fort
             bb_score  = max(0.0, (0.35 - bbp5) / 0.35)
-            score     = round(vol_ratio * 0.5 + rsi_score * 0.25 + bb_score * 0.25, 3)
+            score     = round(vol_ratio_capped * 0.5 + rsi_score * 0.25 + bb_score * 0.25, 3)
 
         # ── BUY breakout : cassure haussière au-dessus de la BB haute ────────────
         # BULL    : BBP ≥ 0.75 (breakout standard dans le sens de la tendance)
@@ -540,7 +541,7 @@ def get_signal(coin: str) -> dict | None:
             mode      = "BBO"
             rsi_score = max(0.0, (85 - rsi5) / 40)      # rsi5=45 → 1.0 | rsi5=85 → 0.0
             bb_score  = min(1.0, (bbp5 - 0.75) / 0.50)  # cassure plus forte = mieux
-            score     = round(vol_ratio * 0.50 + rsi_score * 0.30 + bb_score * 0.20, 3)
+            score     = round(vol_ratio_capped * 0.50 + rsi_score * 0.30 + bb_score * 0.20, 3)
 
         bars3_str = ("3×↑" if bars3_bull else ("3×↓" if bars3_bear else
                      ("2×↑" if bars2_bull else ("2×↓" if bars2_bear else "✗"))))
@@ -672,8 +673,14 @@ def _save_initial_balance(balance: float):
         except Exception:
             pass
     state["initial_balance"] = round(balance, 4)
-    with open(STATE_FILE, "w") as f:
+    _state_atomic_write(state)
+
+def _state_atomic_write(state: dict):
+    """Écriture atomique de bot_state.json via tmp+replace (même pattern que _safe_save)."""
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(state, f, indent=2)
+    os.replace(tmp, STATE_FILE)
 
 def save_positions_state(positions: list):
     """Persiste les positions ouvertes dans bot_state.json après chaque changement."""
@@ -685,8 +692,7 @@ def save_positions_state(positions: list):
         except Exception:
             pass
     state["open_positions"] = positions
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    _state_atomic_write(state)
 
 def load_positions_state() -> dict[str, dict]:
     """Charge l'état enrichi des positions depuis bot_state.json.
@@ -915,8 +921,9 @@ def trail_sl(position: dict, current_price: float):
         )
         if r.get("status") == "ok":
             st = r["response"]["data"]["statuses"]
-            position["sl_oid"] = (st[0].get("resting") or {}).get("oid")
-            position["sl"] = new_sl
+            position["sl_oid"]  = (st[0].get("resting") or {}).get("oid")
+            position["sl"]      = new_sl
+            position["trailed"] = True   # flag pour classifier "TRAIL touché" à la fermeture
             arrow = "↑" if is_buy else "↓"
             tag   = "TRAIL" if profit_atr >= TRAIL_TRIGGER else "BKEVEN"
             print(f"  {C.BCYN}[{tag} {arrow}]{C.RST} {coin} SL={new_sl:.6g} ({phase_label})")
@@ -966,7 +973,13 @@ def check_position(wb: Workbook, position: dict,
                 open_fee  = position.get("open_fee", close_fee)
                 gross     = float(recent.get("closedPnl", 0))
                 pnl       = round(gross - open_fee - close_fee, 2)
-                result    = "TP touché" if pnl >= 0 else "SL touché"
+                # Trailing stop activé et pertes ≤ frais : c'est une protection réussie, pas un SL
+                if position.get("trailed") and pnl >= -0.20:
+                    result = "TRAIL touché"
+                elif pnl >= 0:
+                    result = "TP touché"
+                else:
+                    result = "SL touché"
                 print(f"  {C.DIM}[FRAIS] ouv=${open_fee:.4f}  ferm=${close_fee:.4f}  net=${pnl:.2f}{C.RST}")
         except Exception:
             pass
@@ -1036,13 +1049,14 @@ def recover_open_positions() -> tuple[list, float]:
             open_fee = 0.0
             oid      = f"recovered-{coin}"
 
-        # Restaurer opened_at + conditions — essentiels pour zombie-detection et enregistrement leçons
-        opened_at  = saved.get("opened_at", time.time()) if enriched else time.time()
-        conditions = saved.get("conditions", {}) if enriched else {}
+        # Restaurer opened_at, conditions, trailed — essentiels pour zombie-detection, leçons, TRAIL
+        opened_at  = saved.get("opened_at",  time.time()) if enriched else time.time()
+        conditions = saved.get("conditions", {})           if enriched else {}
+        trailed    = saved.get("trailed",    False)        if enriched else False
         position   = {"id": oid, "symbol": coin, "side": side,
                       "entry": entry, "qty": qty, "sl": sl, "tp": tp,
                       "sl_oid": sl_oid, "atr": atr, "open_fee": open_fee,
-                      "opened_at": opened_at, "conditions": conditions}
+                      "opened_at": opened_at, "conditions": conditions, "trailed": trailed}
         recovered.append(position)
         capital_used += CAPITAL_PER_TRADE
 
