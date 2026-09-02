@@ -76,7 +76,7 @@ _net_color = C.BYLW if HL_TESTNET else C.BRED
 print(f"  Réseau : {_net_color}{'TESTNET' if HL_TESTNET else 'MAINNET'}{C.RST}")
 
 # ── Symboles ───────────────────────────────────────────────────────────────────
-WATCHLIST = ["BTC", "ETH", "AVAX", "LINK", "LTC", "DOGE", "XRP"]
+WATCHLIST = ["BTC", "ETH", "LTC", "DOGE", "XRP", "SOL"]
 SYM_LABEL   = {c: f"{c}/USDT" for c in WATCHLIST}
 SYM_BYBIT   = {c: f"{c}USDT" for c in WATCHLIST}   # format Bybit
 
