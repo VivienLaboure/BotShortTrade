@@ -15,9 +15,10 @@ Utilisation :
 import json, os, shutil
 from datetime import datetime, timezone
 
-STATE_FILE   = "bot_state.json"
-EXCEL_FILE   = "trades.xlsx"
-LESSONS_FILE = "lessons.json"
+STATE_FILE     = "bot_state.json"
+EXCEL_FILE     = "trades.xlsx"
+LESSONS_FILE   = "lessons.json"
+DASHBOARD_FILE = "dashboard.html"
 
 now_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 print("=" * 55)
@@ -39,7 +40,14 @@ for tmp in [EXCEL_FILE + ".tmp", STATE_FILE + ".tmp"]:
         os.remove(tmp)
         print(f"✓ {tmp} supprimé")
 
-# ── 2. Archiver et supprimer lessons.json ────────────────────
+# ── 2. Supprimer dashboard.html ──────────────────────────────
+if os.path.exists(DASHBOARD_FILE):
+    os.remove(DASHBOARD_FILE)
+    print(f"✓ dashboard.html → supprimé (régénéré au 1er cycle du bot)")
+else:
+    print("  dashboard.html   introuvable — ignoré")
+
+# ── 3. Archiver et supprimer lessons.json ────────────────────
 if os.path.exists(LESSONS_FILE):
     archive_l = f"lessons_archive_{now_str}.json"
     shutil.copy(LESSONS_FILE, archive_l)
@@ -48,7 +56,7 @@ if os.path.exists(LESSONS_FILE):
 else:
     print("  lessons.json     introuvable — ignoré")
 
-# ── 3. Préserver open_positions, effacer initial_balance ──────
+# ── 4. Préserver open_positions, effacer initial_balance ──────
 open_positions = []
 if os.path.exists(STATE_FILE):
     try:
