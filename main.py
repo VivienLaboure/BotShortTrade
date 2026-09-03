@@ -855,11 +855,13 @@ def place_order(sig: dict, wb: Workbook) -> dict:
     log_order(wb, order_id, coin, side, qty, entry_px, sl, tp, atr, notional, pnl_tp, pnl_sl)
 
     # Notification Discord — ouverture de trade (après notional calculé)
-    _ds   = "🟢 LONG" if is_buy else "🔴 SHORT"
-    _mode = sig.get("conditions", {}).get("mode", "?")
+    _ds     = "🟢 LONG" if is_buy else "🔴 SHORT"
+    _mode   = sig.get("conditions", {}).get("mode", "?")
+    _sl_pct = abs(sl - entry_px) / entry_px * 100 if entry_px else 0
+    _tp_pct = abs(tp - entry_px) / entry_px * 100 if entry_px else 0
     send_discord_alert(
         f"{_ds} {coin} ouvert [{_mode}]",
-        f"Entrée: **${entry_px:.6g}** | SL: **${sl:.6g}** | TP: **${tp:.6g}**\n"
+        f"Entrée: **${entry_px:.6g}** | SL: **-{_sl_pct:.2f}%** | TP: **+{_tp_pct:.2f}%**\n"
         f"Score: **{sig.get('score', 0):.3f}** | Notionnel: **${notional}** | {LEVERAGE}x levier",
         color=0x2ecc71 if is_buy else 0xe74c3c,
     )
@@ -995,11 +997,15 @@ def check_position(wb: Workbook, position: dict,
         print(f"  {_rc}[{result}]{C.RST} {C.BOLD}{coin}{C.RST}  P&L={_cp(pnl)}${pnl:.2f}{C.RST}")
 
         # Notification Discord — fermeture de trade
-        _emoji = "✅" if pnl >= 0 else "🛑"
-        _pnl_s = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+        _emoji  = "✅" if pnl >= 0 else "🛑"
+        _entry  = position.get("entry", 0)
+        _qty    = position.get("qty", 0)
+        _cap    = _entry * _qty / LEVERAGE if _entry and _qty else 0
+        _pnl_pct = pnl / _cap * 100 if _cap > 0 else 0
+        _pnl_s  = f"+{_pnl_pct:.2f}%" if pnl >= 0 else f"{_pnl_pct:.2f}%"
         send_discord_alert(
             f"{_emoji} {coin} — {result}",
-            f"P&L: **{_pnl_s}** | Entrée: **${position.get('entry', 0):.6g}**",
+            f"P&L: **{_pnl_s}** | Entrée: **${_entry:.6g}**",
             color=0x2ecc71 if pnl >= 0 else 0xe74c3c,
         )
 
