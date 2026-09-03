@@ -941,6 +941,67 @@ def trail_sl(position: dict, current_price: float):
     except Exception as e:
         print(f"  {C.BYLW}[TRAIL]{C.RST} erreur : {e}")
 
+# ── Fermeture forcée (zombie) ─────────────────────────────────────────────────
+def force_close_zombie(wb: Workbook, position: dict) -> float:
+    """Ferme de force une position zombie (>6h en drawdown) via market_close.
+    Annule le SL existant, place un IOC reduce-only, enregistre le P&L."""
+    coin   = position["symbol"]
+    is_buy = position["side"] == "BUY"
+    sl_oid = position.get("sl_oid")
+
+    # Annuler le SL sur l'exchange
+    if sl_oid:
+        try:
+            exchange.cancel(coin, int(sl_oid))
+        except Exception as e:
+            print(f"  {C.BYLW}[ZOMBIE]{C.RST} annulation SL : {e}")
+
+    # Fermeture au marché (SDK Hyperliquid)
+    try:
+        r = exchange.market_close(coin, slippage=0.05)
+        if r.get("status") != "ok":
+            log_error(f"zombie market_close {coin}: {r}")
+            return 0.0
+        print(f"  {C.BRED}[ZOMBIE]{C.RST} {C.BOLD}{coin}{C.RST} order envoyé")
+    except Exception as e:
+        log_error(f"zombie market_close {coin}: {e}")
+        return 0.0
+
+    # Récupérer le P&L depuis les fills (courte pause pour la propagation)
+    time.sleep(1)
+    pnl = 0.0
+    try:
+        fills   = info.user_fills(WALLET_ADDRESS)
+        closing = [f for f in fills if f["coin"] == coin and "Close" in f.get("dir", "")]
+        if closing:
+            recent    = max(closing, key=lambda f: f["time"])
+            close_fee = float(recent.get("fee", 0))
+            open_fee  = position.get("open_fee", close_fee)
+            gross     = float(recent.get("closedPnl", 0))
+            pnl       = round(gross - open_fee - close_fee, 2)
+    except Exception:
+        pass
+
+    result = "Zombie (fermé)"
+    _rc = C.BGRN if pnl >= 0 else C.BRED
+    print(f"  {_rc}[{result}]{C.RST} {C.BOLD}{coin}{C.RST}  P&L={_cp(pnl)}${pnl:.2f}{C.RST}")
+
+    # Notification Discord
+    _entry   = position.get("entry", 0)
+    _qty     = position.get("qty", 0)
+    _cap     = _entry * _qty / LEVERAGE if _entry and _qty else 0
+    _pnl_pct = pnl / _cap * 100 if _cap > 0 else 0
+    _pnl_s   = f"+{_pnl_pct:.2f}%" if pnl >= 0 else f"{_pnl_pct:.2f}%"
+    send_discord_alert(
+        f"🧟 {coin} — Zombie fermé automatiquement",
+        f"P&L: **{_pnl_s}** | Ouvert depuis >6h en drawdown\nEntrée: **${_entry:.6g}**",
+        color=0xe67e22,
+    )
+
+    record_lesson(position, result, pnl)
+    update_order_status(wb, position["id"], result, pnl)
+    return pnl
+
 # ── Suivi de position ─────────────────────────────────────────────────────────
 def check_position(wb: Workbook, position: dict,
                    cached_state: dict | None = None,
@@ -1711,17 +1772,41 @@ def run():
                 run._drawdown_alerted = False
 
         # 3) Position zombie : ouverte depuis > 6h sans fermeture
-        for pos in open_positions:
+        #    • En drawdown → fermeture automatique (capital libéré pour de nouveaux trades)
+        #    • En profit   → alerte seulement (le trailing stop protège)
+        _zombie_closed = []
+        for pos in list(open_positions):
             opened_at = pos.get('opened_at')
             if opened_at:
                 age_h = (time.time() - opened_at) / 3600
                 alert_key = f"_zombie_{pos['symbol']}_{pos['id']}"
                 if age_h > 6.0 and not getattr(run, alert_key, False):
-                    msg = (f"**{pos['symbol']}** ouverte depuis **{age_h:.1f}h** sans TP/SL\n"
-                           f"Entrée: ${pos.get('entry', 0):.4f} | SL: ${pos.get('sl', 0):.4f}")
-                    print(f"  {C.BYLW}[🧟 ZOMBIE]{C.RST} {pos['symbol']} ouverte depuis {age_h:.1f}h")
-                    send_discord_alert("🧟 Position Zombie", msg, color=0xf39c12)
+                    # P&L non-réalisé depuis le cache user_state du cycle
+                    _zpnl = 0.0
+                    if _user_state:
+                        for _ap in _user_state.get("assetPositions", []):
+                            if _ap["position"]["coin"] == pos["symbol"]:
+                                _zpnl = float(_ap["position"].get("unrealizedPnl", 0))
+                                break
+                    print(f"  {C.BRED}[🧟 ZOMBIE]{C.RST} {pos['symbol']} ouverte depuis "
+                          f"{age_h:.1f}h  P&L={_cp(_zpnl)}${_zpnl:.2f}{C.RST}")
+                    if _zpnl < 0:
+                        # Drawdown → fermer automatiquement
+                        force_close_zombie(wb, pos)
+                        _zombie_closed.append(pos)
+                    else:
+                        # En profit → alerter seulement, laisser le trailing gérer
+                        msg = (f"**{pos['symbol']}** ouverte depuis **{age_h:.1f}h** — en profit ${_zpnl:.2f}\n"
+                               f"SL trailing actif : ${pos.get('sl', 0):.4f}")
+                        send_discord_alert("🧟 Position Zombie (profitable)", msg, color=0xf39c12)
                     setattr(run, alert_key, True)
+
+        for pos in _zombie_closed:
+            if pos in open_positions:
+                open_positions.remove(pos)
+                capital_in_use = max(0.0, capital_in_use - CAPITAL_PER_TRADE)
+        if _zombie_closed:
+            save_positions_state(open_positions)
 
         # Régénérer le dashboard HTML à chaque cycle
         write_dashboard(wb, open_positions, balance, initial_balance,
