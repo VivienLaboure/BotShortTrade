@@ -1774,7 +1774,6 @@ def run():
         # 3) Position zombie : ouverte depuis > 6h sans fermeture
         #    • En drawdown → fermeture automatique (capital libéré pour de nouveaux trades)
         #    • En profit   → alerte seulement (le trailing stop protège)
-        _zombie_closed = []
         for pos in list(open_positions):
             opened_at = pos.get('opened_at')
             if opened_at:
@@ -1791,22 +1790,20 @@ def run():
                     print(f"  {C.BRED}[🧟 ZOMBIE]{C.RST} {pos['symbol']} ouverte depuis "
                           f"{age_h:.1f}h  P&L={_cp(_zpnl)}${_zpnl:.2f}{C.RST}")
                     if _zpnl < 0:
-                        # Drawdown → fermer automatiquement
+                        # Retirer et sauvegarder AVANT la fermeture sur l'exchange.
+                        # Si le bot s'arrête mid-close, au prochain redémarrage la position
+                        # n'a plus d'enrichissement → opened_at = time.time() → pas zombie.
+                        if pos in open_positions:
+                            open_positions.remove(pos)
+                            capital_in_use = max(0.0, capital_in_use - CAPITAL_PER_TRADE)
+                        save_positions_state(open_positions)
                         force_close_zombie(wb, pos)
-                        _zombie_closed.append(pos)
                     else:
                         # En profit → alerter seulement, laisser le trailing gérer
                         msg = (f"**{pos['symbol']}** ouverte depuis **{age_h:.1f}h** — en profit ${_zpnl:.2f}\n"
                                f"SL trailing actif : ${pos.get('sl', 0):.4f}")
                         send_discord_alert("🧟 Position Zombie (profitable)", msg, color=0xf39c12)
                     setattr(run, alert_key, True)
-
-        for pos in _zombie_closed:
-            if pos in open_positions:
-                open_positions.remove(pos)
-                capital_in_use = max(0.0, capital_in_use - CAPITAL_PER_TRADE)
-        if _zombie_closed:
-            save_positions_state(open_positions)
 
         # Régénérer le dashboard HTML à chaque cycle
         write_dashboard(wb, open_positions, balance, initial_balance,
