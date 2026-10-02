@@ -76,7 +76,7 @@ _net_color = C.BYLW if HL_TESTNET else C.BRED
 print(f"  Réseau : {_net_color}{'TESTNET' if HL_TESTNET else 'MAINNET'}{C.RST}")
 
 # ── Symboles ───────────────────────────────────────────────────────────────────
-WATCHLIST = ["BTC", "ETH", "LTC", "DOGE", "XRP", "SOL"]
+WATCHLIST = ["ETH", "LTC", "DOGE", "XRP", "SOL"]   # BTC retiré : 0W/15L −$12.83 historique
 SYM_LABEL   = {c: f"{c}/USDT" for c in WATCHLIST}
 SYM_BYBIT   = {c: f"{c}USDT" for c in WATCHLIST}   # format Bybit
 
@@ -526,7 +526,9 @@ def get_signal(coin: str) -> dict | None:
 
         # ── SELL momentum : crash/tendance forte — prix sous la bande basse ─────
         # RSI extrême (<= 35) + prix cassant sous la BB + toute la structure baissière
-        elif bias_dn and confirm_short and base_mom_sht and rsi1 <= 35 and bbp5 <= 0.35:
+        # Bloqué en RANGING : 40% WR, −$10.42 historique (rebonds fréquents en range)
+        elif (bias_dn and confirm_short and base_mom_sht and rsi1 <= 35 and bbp5 <= 0.35
+              and _current_regime != "RANGING"):
             signal    = "sell"
             mode      = "MOM"
             rsi_score = max(0.0, (35 - rsi1) / 35)   # plus RSI bas = momentum fort
@@ -534,13 +536,12 @@ def get_signal(coin: str) -> dict | None:
             score     = round(vol_ratio_capped * 0.5 + rsi_score * 0.25 + bb_score * 0.25, 3)
 
         # ── BUY breakout : cassure haussière au-dessus de la BB haute ────────────
-        # BULL    : BBP ≥ 0.75 (breakout standard dans le sens de la tendance)
-        # RANGING : BBP ≥ 0.85 (seuil plus strict — évite les faux cassures en range)
+        # BULL uniquement : 69% WR, +$34.75 historique
+        # RANGING bloqué  : 44% WR, −$11.62 (les cassures en range échouent trop souvent)
         # Utilise rsi5 (M5, 14 périodes) — stable pendant les pompes, contrairement à rsi1
         # qui monte à 90+ en quelques minutes M1 et bloque tous les signaux de breakout.
         elif (bias_up and confirm_long and vol_ok and move_ok and 45 <= rsi5 <= 85
-              and ((_current_regime == "BULL" and bbp5 >= 0.75)
-                   or (_current_regime == "RANGING" and bbp5 >= 0.85))):
+              and _current_regime == "BULL" and bbp5 >= 0.75):
             signal    = "buy"
             mode      = "BBO"
             rsi_score = max(0.0, (85 - rsi5) / 40)      # rsi5=45 → 1.0 | rsi5=85 → 0.0
