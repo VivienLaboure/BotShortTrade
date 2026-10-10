@@ -334,7 +334,7 @@ def log_scan(coin: str, tf: str, signal: str | None, score: float, details: str)
 
 # ── Bougies — données Bybit public (sans clé API) ────────────────────────────
 def fetch_candles(coin: str, interval: str, count: int, drop_incomplete: bool = True) -> list[dict]:
-    symbol   = SYM_BYBIT[coin]
+    symbol   = SYM_BYBIT.get(coin, f"{coin}USDT")   # BTC hors watchlist mais utilisé pour le régime
     iv       = _BYBIT_IV[interval]
     last_err: Exception | None = None
     for attempt in range(2):   # 1 retry automatique (rate limit Bybit ponctuel)
