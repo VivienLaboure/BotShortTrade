@@ -54,6 +54,7 @@ MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", 3.0))   # % du capita
 SESSION_START_UTC  = int(os.getenv("SESSION_START_UTC", 0))         # heure UTC (0 = minuit)
 SESSION_END_UTC    = int(os.getenv("SESSION_END_UTC", 24))          # heure UTC (24 = H24)
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")          # webhook Discord (alertes anomalies)
+HEARTBEAT_HOURS    = float(os.getenv("HEARTBEAT_HOURS", 6))          # résumé Discord périodique (0 = désactivé)
 
 # Initialisées au démarrage dans run() depuis le solde réel
 MAX_LIQUIDITY     = _MAX_LIQ_CFG if _MAX_LIQ_CFG > 0 else 100.0  # placeholder
@@ -1571,6 +1572,25 @@ def run():
     LOOP_SECONDS = 60
     print(f"\n  {C.DIM}Démarrage — scan toutes les {LOOP_SECONDS}s{C.RST}\n")
 
+    send_discord_alert(
+        "🚀 Bot démarré",
+        f"Réseau : **{'TESTNET' if HL_TESTNET else 'MAINNET'}**\n"
+        f"Équité : **${balance:.2f}** · par trade ${CAPITAL_PER_TRADE:.2f} (levier ×{LEVERAGE})\n"
+        f"Positions reprises : {len(open_positions)}\n"
+        f"Watchlist : {', '.join(WATCHLIST)}",
+        color=0x3498db)
+
+    # Stats du heartbeat Discord — remises à zéro après chaque envoi
+    hb_last    = time.time()
+    hb_cycles  = 0   # cycles de boucle
+    hb_scans   = 0   # cycles où le marché a réellement été scanné
+    hb_raw     = 0   # signaux détectés (avant filtre régime/score)
+    hb_kept    = 0   # signaux retenus (après filtre)
+    hb_opened  = 0   # trades ouverts
+    hb_closed  = 0   # trades fermés
+    hb_best    = None  # meilleur signal brut vu sur la période
+    hb_blocked: dict[str, int] = {}   # raison → nb de cycles sans scan
+
     while True:
         loop_start = time.time()
         ts      = datetime.now(timezone.utc).strftime("%H:%M:%S")
@@ -1695,6 +1715,11 @@ def run():
             open_coins = {p["symbol"] for p in open_positions}
             signals    = scan_all(open_coins)
             _print_scan_summary()
+            hb_scans += 1
+            hb_raw   += len(signals)
+            for s_ in signals:
+                if hb_best is None or s_["score"] > hb_best["score"]:
+                    hb_best = s_
 
             # Filtrage par régime :
             # BULL     → BUY dans la tendance + SELL MR autorisé (suracheté, score ≥ 0.75)
@@ -1708,6 +1733,7 @@ def run():
                             s.get("conditions", {}).get("mode") == "MR" and
                             s["score"] >= 0.75)]
             signals = [s for s in signals if s["score"] >= min_score]
+            hb_kept += len(signals)
 
             # Ouvrir jusqu'à slots_left positions si plusieurs bons signaux disponibles
             opened_this_cycle = 0
@@ -1731,6 +1757,7 @@ def run():
                     traceback.print_exc()
                     break  # ne pas tenter un 2e ordre si le 1er échoue
 
+            hb_opened += opened_this_cycle
             if opened_this_cycle == 0:
                 print(f"  {C.DIM}Pas de signal retenu ce cycle{C.RST}")
         elif slots_left <= 0:
@@ -1805,6 +1832,37 @@ def run():
                                f"SL trailing actif : ${pos.get('sl', 0):.4f}")
                         send_discord_alert("🧟 Position Zombie (profitable)", msg, color=0xf39c12)
                     setattr(run, alert_key, True)
+
+        # ── Heartbeat Discord : preuve de vie + résumé de la période ──
+        hb_cycles += 1
+        hb_closed += len(closed_this_loop)
+        if not (slots_left > 0 and avail_capital >= CAPITAL_PER_TRADE and in_session
+                and not daily_loss_hit and not regime_blocked):
+            _why = ("positions max" if slots_left <= 0 else
+                    "capital insuffisant" if avail_capital < CAPITAL_PER_TRADE else
+                    "hors session" if not in_session else
+                    "perte du jour" if daily_loss_hit else f"régime {regime}")
+            hb_blocked[_why] = hb_blocked.get(_why, 0) + 1
+        if HEARTBEAT_HOURS > 0 and time.time() - hb_last >= HEARTBEAT_HOURS * 3600:
+            _best = (f"{hb_best['symbol']} {hb_best['signal'].upper()} "
+                     f"[{hb_best.get('conditions', {}).get('mode', '?')}] score {hb_best['score']:.3f}"
+                     if hb_best else "aucun")
+            _blk = (" · ".join(f"{k} ×{v}" for k, v in hb_blocked.items())) or "—"
+            send_discord_alert(
+                f"💓 Bot actif — résumé {HEARTBEAT_HOURS:g}h",
+                f"Régime : **{regime}** (BTC {btc_chg:+.1f}% · ETH {eth_chg:+.1f}% 7j)\n"
+                f"Équité : **${balance:.2f}** · positions ouvertes : {len(open_positions)}\n"
+                f"P&L aujourd'hui : ${pnl_today:+.2f}\n"
+                f"Cycles : {hb_cycles} · scans : {hb_scans}\n"
+                f"Signaux : {hb_raw} détectés → {hb_kept} retenus (min score {0.75 if regime == 'RANGING' else 0.45})\n"
+                f"Trades : {hb_opened} ouverts · {hb_closed} fermés\n"
+                f"Meilleur signal vu : {_best}\n"
+                f"Scans bloqués : {_blk}",
+                color=0x2ecc71 if hb_opened else 0x95a5a6)
+            hb_last = time.time()
+            hb_cycles = hb_scans = hb_raw = hb_kept = hb_opened = hb_closed = 0
+            hb_best = None
+            hb_blocked = {}
 
         # Régénérer le dashboard HTML à chaque cycle
         write_dashboard(wb, open_positions, balance, initial_balance,
