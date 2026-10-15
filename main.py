@@ -197,6 +197,7 @@ def update_order_status(wb: Workbook, order_id, status: str, pnl: float | None =
 # ── Journalisation ────────────────────────────────────────────────────────────
 _scan_log:  list[dict] = []
 _last_scan: list[dict] = []   # snapshot du dernier scan complet (pour le dashboard)
+_reject_stats: dict[str, int] = {}   # 1er filtre bloquant par symbole scanné sans signal (heartbeat)
 
 # ── Apprentissage des erreurs ──────────────────────────────────────────────────
 LESSONS_FILE    = "lessons.json"
@@ -576,6 +577,16 @@ def get_signal(coin: str) -> dict | None:
                 }
             }
 
+        # Diagnostic : premier filtre qui a empêché un signal (agrégé dans le heartbeat)
+        mom_ok = bias_dn and confirm_short and base_mom_sht and rsi1 <= 35 and bbp5 <= 0.35
+        _why = ("volume M5"   if not vol_ok else
+                "mouvement"   if not move_ok else
+                "volume M1"   if not vol1_ok else
+                "bougies M5"  if not (bars2_bull or bars2_bear) else
+                f"MOM bloqué {_current_regime}" if mom_ok else
+                "biais/RSI/BBP")
+        _reject_stats[_why] = _reject_stats.get(_why, 0) + 1
+
         log_scan(coin, "M15/M5/M1", signal, score, details)
         return None
 
@@ -620,9 +631,9 @@ def get_unrealized_pnl(cached_state: dict | None = None) -> float:
 def get_market_regime() -> tuple[str, str, float, float]:
     """
     Analyse BTC et ETH sur 7 jours — 4 régimes (inspiré de tbot) :
-      BULL      : BTC et ETH tous les deux > +5%  → trade normal, favorise BUY
-      BEAR      : BTC et ETH tous les deux < -5%  → aucun nouveau trade
-      RANGING   : les deux dans ±5%               → exige score élevé
+      BULL      : moyenne BTC/ETH > +5%            → trade normal, favorise BUY
+      BEAR      : moyenne BTC/ETH < -5%            → aucun nouveau trade
+      RANGING   : moyenne dans ±5%                 → exige score élevé
       DIVERGING : l'un monte, l'autre descend      → aucun nouveau trade (marché incohérent)
 
     Confirmation court-terme (3j) : si BULL sur 7j mais recul > -2% sur 3j → RANGING
@@ -1848,6 +1859,8 @@ def run():
                      f"[{hb_best.get('conditions', {}).get('mode', '?')}] score {hb_best['score']:.3f}"
                      if hb_best else "aucun")
             _blk = (" · ".join(f"{k} ×{v}" for k, v in hb_blocked.items())) or "—"
+            _rej = (" · ".join(f"{k} ×{v}" for k, v in
+                               sorted(_reject_stats.items(), key=lambda kv: -kv[1]))) or "—"
             send_discord_alert(
                 f"💓 Bot actif — résumé {HEARTBEAT_HOURS:g}h",
                 f"Régime : **{regime}** (BTC {btc_chg:+.1f}% · ETH {eth_chg:+.1f}% 7j)\n"
@@ -1857,12 +1870,14 @@ def run():
                 f"Signaux : {hb_raw} détectés → {hb_kept} retenus (min score {0.75 if regime == 'RANGING' else 0.45})\n"
                 f"Trades : {hb_opened} ouverts · {hb_closed} fermés\n"
                 f"Meilleur signal vu : {_best}\n"
-                f"Scans bloqués : {_blk}",
+                f"Scans bloqués : {_blk}\n"
+                f"Rejets (1er filtre) : {_rej}",
                 color=0x2ecc71 if hb_opened else 0x95a5a6)
             hb_last = time.time()
             hb_cycles = hb_scans = hb_raw = hb_kept = hb_opened = hb_closed = 0
             hb_best = None
             hb_blocked = {}
+            _reject_stats.clear()
 
         # Régénérer le dashboard HTML à chaque cycle
         write_dashboard(wb, open_positions, balance, initial_balance,
