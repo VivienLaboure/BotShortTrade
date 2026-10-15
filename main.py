@@ -119,6 +119,7 @@ COL_HEADERS = [
     "ID Ordre", "Date/Heure", "Symbole", "Côté", "Qté", "Prix entrée",
     "SL", "TP", "ATR M5", "Notionnel $", "P&L TP $", "P&L SL $",
     "Prix actuel", "Statut", "P&L final $",
+    "Mode", "Régime", "Score",   # ajoutés en fin pour garder les index existants (analyze_weekly)
 ]
 
 _FILLS = {
@@ -138,7 +139,18 @@ def _safe_save(wb: Workbook):
 def init_excel() -> Workbook:
     if os.path.exists(EXCEL_FILE):
         try:
-            return openpyxl.load_workbook(EXCEL_FILE)
+            wb = openpyxl.load_workbook(EXCEL_FILE)
+            ws = wb["Trades"]
+            # Migration : ajoute les en-têtes manquants d'un fichier créé avec moins de colonnes
+            if ws.max_column < len(COL_HEADERS):
+                for c in range(ws.max_column + 1, len(COL_HEADERS) + 1):
+                    cell = ws.cell(1, c, COL_HEADERS[c - 1])
+                    cell.fill = _FILLS["header"]
+                    cell.font = Font(bold=True, color="FFFFFF")
+                    cell.alignment = Alignment(horizontal="center")
+                    ws.column_dimensions[get_column_letter(c)].width = 14
+                _safe_save(wb)
+            return wb
         except Exception:
             pass
     wb = Workbook()
@@ -163,12 +175,13 @@ def _find_row(ws, order_id: str) -> int | None:
             return row[0].row
     return None
 
-def log_order(wb: Workbook, order_id, coin, side, qty, entry, sl, tp, atr, notional, pnl_tp, pnl_sl):
+def log_order(wb: Workbook, order_id, coin, side, qty, entry, sl, tp, atr, notional, pnl_tp, pnl_sl,
+              mode: str = "", regime: str = "", score: float | None = None):
     ws = wb["Trades"]
     fill = _FILLS["buy"] if side == "BUY" else _FILLS["sell"]
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
     row = [order_id, ts, SYM_LABEL[coin], side, qty, entry, sl, tp, round(atr, 6),
-           notional, pnl_tp, pnl_sl, entry, "Ordre placé", ""]
+           notional, pnl_tp, pnl_sl, entry, "Ordre placé", "", mode, regime, score]
     ws.append(row)
     for cell in ws[ws.max_row]:
         cell.fill = fill
@@ -809,16 +822,9 @@ def place_order(sig: dict, wb: Workbook) -> dict:
     smult = _size_mult(sig.get("score", 1.0))
     qty   = calc_qty(coin, price, smult)
 
-    if is_buy:
-        sl = round_px(price - ATR_SL_MULT * atr)
-        tp = round_px(price + ATR_TP_MULT * atr)
-    else:
-        sl = round_px(price + ATR_SL_MULT * atr)
-        tp = round_px(price - ATR_TP_MULT * atr)
-
     _sc    = C.BGRN if is_buy else C.BRED
     _smtag = f" {C.BYLW}({smult*100:.0f}%){C.RST}" if smult != 1.0 else ""
-    print(f"  {_sc}[{side}]{C.RST} {C.BOLD}{coin}{C.RST} {qty}{_smtag} @ ${price:.6g}  {C.RED}SL=${sl:.6g}{C.RST}  {C.GRN}TP=${tp:.6g}{C.RST}  {LEVERAGE}x")
+    print(f"  {_sc}[{side}]{C.RST} {C.BOLD}{coin}{C.RST} {qty}{_smtag} @ ~${price:.6g}  {LEVERAGE}x")
 
     # Ouverture de la position au marché
     result = exchange.market_open(coin, is_buy, qty, px=None, slippage=0.02)
@@ -833,39 +839,85 @@ def place_order(sig: dict, wb: Workbook) -> dict:
 
     print(f"  {C.BGRN}[OK]{C.RST} oid={order_id}  entrée=${entry_px:.6g}  frais=${open_fee}")
 
+    # SL/TP calculés sur le prix réellement exécuté (pas le mid d'avant l'ordre) :
+    # le slippage autorisé (2%) dépasse largement la distance SL (1.5×ATR M5 ≈ 0.3-0.5%)
+    if is_buy:
+        sl = round_px(entry_px - ATR_SL_MULT * atr)
+        tp = round_px(entry_px + ATR_TP_MULT * atr)
+    else:
+        sl = round_px(entry_px + ATR_SL_MULT * atr)
+        tp = round_px(entry_px - ATR_TP_MULT * atr)
+
     # Ordres SL / TP (trigger reduce-only)
     close_buy = not is_buy
     sl_lim = round_px(sl * 0.90) if is_buy else round_px(sl * 1.10)
     tp_lim = round_px(tp * 1.10) if is_buy else round_px(tp * 0.90)
     sl_oid = None
+    sl_ok  = False
 
     for label, trig_px, lim_px, tpsl in [
         ("SL", sl, sl_lim, "sl"),
         ("TP", tp, tp_lim, "tp"),
     ]:
-        try:
-            r = exchange.order(
-                coin, close_buy, qty,
-                limit_px=lim_px,
-                order_type={"trigger": {"triggerPx": float(trig_px), "isMarket": True, "tpsl": tpsl}},
-                reduce_only=True,
-            )
-            if r.get("status") == "ok":
-                _lc = C.RED if label == "SL" else C.GRN
-                print(f"  {_lc}[{label}]{C.RST} ${trig_px:.6g} → OK")
-                if label == "SL":
-                    st = r["response"]["data"]["statuses"]
-                    sl_oid = (st[0].get("resting") or st[0].get("filled") or {}).get("oid")
-            else:
-                print(f"  {C.BRED}[{label}] REJETÉ{C.RST} : {r}")
-        except Exception as e:
-            print(f"  {C.BRED}[{label}] ERREUR{C.RST} : {e}")
+        err = None
+        for attempt in range(2 if label == "SL" else 1):   # SL : 1 retry (protection obligatoire)
+            try:
+                r = exchange.order(
+                    coin, close_buy, qty,
+                    limit_px=lim_px,
+                    order_type={"trigger": {"triggerPx": float(trig_px), "isMarket": True, "tpsl": tpsl}},
+                    reduce_only=True,
+                )
+                st = (r.get("response") or {}).get("data", {}).get("statuses", [{}])
+                if r.get("status") == "ok" and "error" not in st[0]:
+                    _lc = C.RED if label == "SL" else C.GRN
+                    print(f"  {_lc}[{label}]{C.RST} ${trig_px:.6g} → OK")
+                    if label == "SL":
+                        sl_ok  = True
+                        sl_oid = (st[0].get("resting") or st[0].get("filled") or {}).get("oid")
+                    err = None
+                    break
+                err = r
+            except Exception as e:
+                err = e
+            print(f"  {C.BRED}[{label}] REJETÉ (essai {attempt + 1}){C.RST} : {err}")
+            if attempt == 0 and label == "SL":
+                time.sleep(1)
+
+        if label == "SL" and not sl_ok:
+            # Position ouverte sans stop avec levier : on la ferme immédiatement
+            log_error(f"SL impossible {coin} — fermeture d'urgence : {err}")
+            closed = False
+            try:
+                rc = exchange.market_close(coin, slippage=0.05)
+                closed = rc is not None and rc.get("status") == "ok"
+            except Exception as e:
+                log_error(f"market_close urgence {coin}: {e}")
+            if closed:
+                send_discord_alert(
+                    f"🛑 {coin} fermé — SL refusé",
+                    f"Le stop-loss a été refusé 2× par Hyperliquid ; position fermée au marché.\n"
+                    f"Erreur : `{str(err)[:300]}`",
+                    color=0xe67e22)
+                raise RuntimeError(f"SL refusé pour {coin}, position fermée d'urgence")
+            send_discord_alert(
+                f"🚨 {coin} OUVERT SANS STOP-LOSS",
+                f"SL refusé ET fermeture d'urgence échouée. **Intervention manuelle requise.**\n"
+                f"Erreur SL : `{str(err)[:300]}`",
+                color=0xff0000)
+            break   # on renvoie quand même la position pour qu'elle soit suivie (zombie/trailing)
+        if label == "TP" and err is not None:
+            send_discord_alert(f"⚠️ TP refusé {coin}",
+                               f"Position protégée par le SL mais sans TP.\nErreur : `{str(err)[:300]}`",
+                               color=0xf39c12)
 
     notional = round(qty * entry_px, 2)
     pnl_tp   = round(abs(tp - entry_px) * qty, 2)
     pnl_sl   = round(-abs(sl - entry_px) * qty, 2)
 
-    log_order(wb, order_id, coin, side, qty, entry_px, sl, tp, atr, notional, pnl_tp, pnl_sl)
+    _cond = sig.get("conditions", {})
+    log_order(wb, order_id, coin, side, qty, entry_px, sl, tp, atr, notional, pnl_tp, pnl_sl,
+              mode=_cond.get("mode", ""), regime=_cond.get("regime", ""), score=sig.get("score"))
 
     # Notification Discord — ouverture de trade (après notional calculé)
     _ds     = "🟢 LONG" if is_buy else "🔴 SHORT"
