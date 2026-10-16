@@ -1,0 +1,311 @@
+"""
+Tests de non-régression — BotShortTrade
+
+Usage :
+    python3 -m unittest discover -s tests -v
+
+Aucun appel réseau, aucun ordre réel, aucun message Discord :
+  - dotenv neutralisé (le vrai .env n'est jamais lu) + clé privée factice
+  - SDK Hyperliquid remplacé par des stubs avant l'import de main.py
+  - requests.get/post lèvent une erreur si un test oublie de les mocker
+  - exécution dans un dossier temporaire (trades.xlsx, bot_state.json… factices)
+"""
+import os, sys, tempfile, types, unittest
+from unittest import mock
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# ── Isolation AVANT l'import de main.py ──────────────────────────────────────
+_dotenv = types.ModuleType("dotenv")
+_dotenv.load_dotenv = lambda *a, **k: None
+sys.modules["dotenv"] = _dotenv
+
+os.environ.update({
+    "HL_PRIVATE_KEY": "0x" + "11" * 32,   # clé factice
+    "HL_TESTNET": "1",
+    "DISCORD_WEBHOOK_URL": "",
+    "LEVERAGE": "5", "CAPITAL_PCT": "0.15", "VOL_MULTIPLIER": "1.2",
+    "MIN_MOVE_PCT": "0.0002", "MAX_TRADES": "3", "HEARTBEAT_HOURS": "6",
+})
+
+class _StubInfo:
+    def __init__(self, *a, **k): pass
+class _StubExchange:
+    def __init__(self, *a, **k): pass
+for name, attr, cls in [("hyperliquid.info", "Info", _StubInfo),
+                        ("hyperliquid.exchange", "Exchange", _StubExchange)]:
+    mod = types.ModuleType(name); setattr(mod, attr, cls); sys.modules[name] = mod
+if "hyperliquid" not in sys.modules:
+    sys.modules["hyperliquid"] = types.ModuleType("hyperliquid")
+try:
+    import hyperliquid.utils.constants  # noqa: F401  (vrai module, sans réseau)
+except Exception:
+    _u = types.ModuleType("hyperliquid.utils"); _c = types.ModuleType("hyperliquid.utils.constants")
+    _c.TESTNET_API_URL = _c.MAINNET_API_URL = "http://stub"; _u.constants = _c
+    sys.modules["hyperliquid.utils"] = _u; sys.modules["hyperliquid.utils.constants"] = _c
+
+import requests
+def _no_network(*a, **k):
+    raise AssertionError(f"Appel réseau interdit dans les tests : {a[:1]}")
+requests.get = requests.post = _no_network
+
+_TMP = tempfile.mkdtemp(prefix="bst_tests_")
+os.chdir(_TMP)
+sys.path.insert(0, ROOT)
+import contextlib, io
+with contextlib.redirect_stdout(io.StringIO()):
+    import main as m
+import openpyxl
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+def _ok(oid=2):
+    return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": oid}}]}}}
+
+def _err(msg="Invalid TP/SL price"):
+    return {"status": "ok", "response": {"data": {"statuses": [{"error": msg}]}}}
+
+class FakeExchange:
+    """Simule Hyperliquid : fill à avgPx, réponses SL/TP/close configurables."""
+    def __init__(self, avg_px=2010.0, sl=None, tp=None, close_ok=True):
+        self.avg_px, self.close_ok = avg_px, close_ok
+        self.sl = sl or [_ok(11)]
+        self.tp = tp or [_ok(12)]
+        self.orders, self.closed = [], 0
+    def update_leverage(self, *a, **k): return {"status": "ok"}
+    def market_open(self, *a, **k):
+        return {"status": "ok", "response": {"data": {"statuses": [
+            {"filled": {"oid": 1, "avgPx": str(self.avg_px), "totalSz": "0.04"}}]}}}
+    def order(self, coin, is_buy, qty, limit_px, order_type, reduce_only):
+        trig = order_type["trigger"]; self.orders.append(trig)
+        seq = self.sl if trig["tpsl"] == "sl" else self.tp
+        return seq.pop(0) if len(seq) > 1 else seq[0]
+    def market_close(self, coin, slippage=0.05):
+        self.closed += 1
+        return {"status": "ok"} if self.close_ok else {"status": "err"}
+    def cancel(self, *a, **k): return {"status": "ok"}
+
+class FakeInfo:
+    def __init__(self, mids=None, perp=None, spot=None, fills=None):
+        self.mids = mids or {"ETH": "2000"}
+        self.perp, self.spot, self.fills = perp or {}, spot or {"balances": []}, fills or []
+    def all_mids(self): return self.mids
+    def user_state(self, addr): return self.perp
+    def spot_user_state(self, addr): return self.spot
+    def user_fills(self, addr): return self.fills
+
+SIG = {"symbol": "ETH", "signal": "buy", "score": 0.8, "atr_m5": 5.0, "price": 2000,
+       "conditions": {"mode": "MR", "regime": "RANGING", "rsi": 50, "bbp": 0.3, "vol_ratio": 1.5}}
+
+
+class BaseTest(unittest.TestCase):
+    def setUp(self):
+        for f in (m.EXCEL_FILE, m.STATE_FILE, m.LESSONS_FILE):
+            if os.path.exists(f):
+                os.remove(f)
+        self.alerts = []
+        self._p = [
+            mock.patch.object(m, "send_discord_alert",
+                              lambda t, d, color=0: self.alerts.append((t, d))),
+            mock.patch.object(m.time, "sleep", lambda s: None),
+            mock.patch("sys.stdout", new_callable=io.StringIO),
+        ]
+        for p in self._p: p.start()
+    def tearDown(self):
+        for p in self._p: p.stop()
+    def titles(self):
+        return [t for t, _ in self.alerts]
+
+
+# ── place_order : SL/TP et sécurité stop-loss ────────────────────────────────
+class TestPlaceOrder(BaseTest):
+    def run_order(self, ex, sig=SIG):
+        with mock.patch.object(m, "exchange", ex), mock.patch.object(m, "info", FakeInfo()):
+            wb = m.init_excel()
+            return m.place_order(dict(sig), wb), wb
+
+    def test_sl_tp_calcules_sur_prix_execute(self):
+        pos, _ = self.run_order(FakeExchange(avg_px=2010.0))
+        self.assertEqual(pos["entry"], 2010.0)
+        self.assertAlmostEqual(pos["sl"], 2010.0 - m.ATR_SL_MULT * 5.0)
+        self.assertAlmostEqual(pos["tp"], 2010.0 + m.ATR_TP_MULT * 5.0)
+        self.assertEqual(pos["sl_oid"], 11)
+
+    def test_sl_tp_short(self):
+        sig = dict(SIG, signal="sell")
+        pos, _ = self.run_order(FakeExchange(avg_px=1990.0), sig)
+        self.assertAlmostEqual(pos["sl"], 1990.0 + m.ATR_SL_MULT * 5.0)
+        self.assertAlmostEqual(pos["tp"], 1990.0 - m.ATR_TP_MULT * 5.0)
+
+    def test_sl_refuse_puis_accepte_au_retry(self):
+        ex = FakeExchange(sl=[_err(), _ok(33)])
+        pos, _ = self.run_order(ex)
+        self.assertEqual(pos["sl_oid"], 33)
+        self.assertEqual(ex.closed, 0)
+
+    def test_sl_refuse_deux_fois_ferme_la_position(self):
+        ex = FakeExchange(sl=[_err()])
+        with self.assertRaises(RuntimeError):
+            self.run_order(ex)
+        self.assertEqual(ex.closed, 1)
+        self.assertTrue(any("SL refusé" in t for t in self.titles()))
+        self.assertFalse(any(o["tpsl"] == "tp" for o in ex.orders))   # pas de TP posé
+
+    def test_sl_status_error_global(self):
+        ex = FakeExchange(sl=[{"status": "err", "response": "rate limited"}])
+        with self.assertRaises(RuntimeError):
+            self.run_order(ex)
+        self.assertEqual(ex.closed, 1)
+
+    def test_sl_refuse_et_fermeture_echoue_alerte_critique(self):
+        ex = FakeExchange(sl=[_err()], close_ok=False)
+        pos, _ = self.run_order(ex)          # position renvoyée pour rester suivie
+        self.assertIsNone(pos["sl_oid"])
+        self.assertTrue(any("SANS STOP-LOSS" in t for t in self.titles()))
+
+    def test_tp_refuse_alerte_mais_position_gardee(self):
+        ex = FakeExchange(tp=[_err()])
+        pos, _ = self.run_order(ex)
+        self.assertEqual(pos["sl_oid"], 11)
+        self.assertEqual(ex.closed, 0)
+        self.assertTrue(any("TP refusé" in t for t in self.titles()))
+
+    def test_ligne_excel_mode_regime_score(self):
+        _, wb = self.run_order(FakeExchange())
+        ws = wb["Trades"]
+        row = [c.value for c in ws[ws.max_row]]
+        hdr = [c.value for c in ws[1]]
+        self.assertEqual(row[hdr.index("Mode")], "MR")
+        self.assertEqual(row[hdr.index("Régime")], "RANGING")
+        self.assertEqual(row[hdr.index("Score")], 0.8)
+        self.assertEqual(hdr[14], "P&L final $")   # index utilisé par analyze_weekly.py
+
+
+# ── Excel ────────────────────────────────────────────────────────────────────
+class TestExcel(BaseTest):
+    def test_migration_ancien_fichier_15_colonnes(self):
+        wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Trades"
+        ws.append(m.COL_HEADERS[:15]); ws.append(["1", "2026-01-01 00:00"] + [0] * 13)
+        wb.save(m.EXCEL_FILE)
+        ws2 = m.init_excel()["Trades"]
+        self.assertEqual([c.value for c in ws2[1]], m.COL_HEADERS)
+        self.assertEqual(ws2.cell(2, 1).value, "1")   # données conservées
+
+
+# ── Équité ───────────────────────────────────────────────────────────────────
+class TestEquity(BaseTest):
+    def eq(self, perp, spot):
+        with mock.patch.object(m, "info", FakeInfo(spot=spot)):
+            return m.get_equity(perp)
+
+    def test_unified_marge_pas_comptee_deux_fois(self):
+        # Valeurs réelles relevées le 2026-10-16 avec 1 position DOGE ouverte
+        perp = {"withdrawable": "0.0", "crossMarginSummary":
+                {"accountValue": "16.556911", "totalMarginUsed": "16.68719"}}
+        spot = {"balances": [{"coin": "USDC", "total": "111.343455", "hold": "16.68719"}]}
+        self.assertAlmostEqual(self.eq(perp, spot), 111.21, places=2)
+
+    def test_unified_sans_position(self):
+        perp = {"withdrawable": "0.0", "crossMarginSummary":
+                {"accountValue": "0.0", "totalMarginUsed": "0.0"}}
+        spot = {"balances": [{"coin": "USDC", "total": "111.5483", "hold": "0.0"}]}
+        self.assertAlmostEqual(self.eq(perp, spot), 111.5483, places=4)
+
+    def test_compte_classique_perp_seul(self):
+        perp = {"withdrawable": "80", "crossMarginSummary":
+                {"accountValue": "100", "totalMarginUsed": "20"}}
+        self.assertAlmostEqual(self.eq(perp, {"balances": []}), 100.0)
+
+    def test_compte_classique_perp_plus_spot(self):
+        perp = {"crossMarginSummary": {"accountValue": "100", "totalMarginUsed": "20"}}
+        spot = {"balances": [{"coin": "USDC", "total": "50", "hold": "0"}]}
+        self.assertAlmostEqual(self.eq(perp, spot), 150.0)
+
+
+# ── P&L : frais d'ouverture ──────────────────────────────────────────────────
+class TestFees(BaseTest):
+    def test_zombie_pnl_deduit_frais_ouverture_estimes(self):
+        fills = [{"coin": "ETH", "dir": "Close Long", "time": 1, "fee": "0.04", "closedPnl": "1.00"}]
+        pos = {"id": "1", "symbol": "ETH", "side": "BUY", "entry": 2000, "qty": 0.04,
+               "sl_oid": None, "open_fee": 0.0, "conditions": {}}
+        with mock.patch.object(m, "exchange", FakeExchange()), \
+             mock.patch.object(m, "info", FakeInfo(fills=fills)), \
+             mock.patch.object(m, "update_order_status", lambda *a, **k: None), \
+             mock.patch.object(m, "record_lesson", lambda *a, **k: None):
+            pnl = m.force_close_zombie(m.init_excel(), pos)
+        self.assertAlmostEqual(pnl, 1.00 - 0.04 - 0.04, places=2)
+
+
+# ── Régime de marché ─────────────────────────────────────────────────────────
+def _daily(chg_pct, chg3_pct=None):
+    """8 bougies D1 : variation totale chg_pct, et variation 3j chg3_pct."""
+    start, end = 100.0, 100.0 * (1 + chg_pct / 100)
+    closes = [start + (end - start) * i / 7 for i in range(8)]
+    if chg3_pct is not None:
+        closes[4] = end / (1 + chg3_pct / 100)
+    return [{"c": c} for c in closes]
+
+class TestRegime(BaseTest):
+    def regime(self, btc, eth):
+        data = {"BTC": btc, "ETH": eth}
+        with mock.patch.object(m, "fetch_candles", lambda coin, iv, n, **k: data[coin]):
+            return m.get_market_regime()[0]
+
+    def test_bear_sur_la_moyenne(self):
+        # Cas réel du 2026-10-14 : BTC -2.8 %, ETH -7.4 % → moyenne -5.1 % → BEAR
+        self.assertEqual(self.regime(_daily(-2.8), _daily(-7.4)), "BEAR")
+
+    def test_ranging(self):
+        self.assertEqual(self.regime(_daily(-2.0), _daily(-5.9)), "RANGING")
+
+    def test_bull(self):
+        self.assertEqual(self.regime(_daily(6), _daily(7)), "BULL")
+
+    def test_bull_en_pullback_3j_devient_ranging(self):
+        self.assertEqual(self.regime(_daily(6, -3), _daily(7, -3)), "RANGING")
+
+    def test_diverging(self):
+        self.assertEqual(self.regime(_daily(4), _daily(-4)), "DIVERGING")
+
+    def test_erreur_api_ranging_par_defaut(self):
+        def boom(*a, **k): raise RuntimeError("api down")
+        with mock.patch.object(m, "fetch_candles", boom):
+            self.assertEqual(m.get_market_regime()[0], "RANGING")
+
+
+# ── Signaux : diagnostic des rejets ──────────────────────────────────────────
+def _candles(n, vol_last, vol=100.0, px=100.0):
+    cs = [{"ts": i, "o": px, "h": px * 1.001, "l": px * 0.999, "c": px, "v": vol} for i in range(n)]
+    cs[-1]["v"] = vol_last
+    return cs
+
+class TestSignalDiagnostic(BaseTest):
+    def test_volume_bas_compte_comme_rejet_volume_m5(self):
+        m._reject_stats.clear()
+        def fc(coin, iv, n, **k): return _candles(n, vol_last=10.0)
+        with mock.patch.object(m, "fetch_candles", fc):
+            self.assertIsNone(m.get_signal("ETH"))
+        self.assertEqual(m._reject_stats.get("volume M5"), 1)
+
+
+# ── Utilitaires ──────────────────────────────────────────────────────────────
+class TestUtils(BaseTest):
+    def test_round_px(self):
+        self.assertEqual(m.round_px(2012.345), 2012.3)
+        self.assertEqual(m.round_px(0.08201357), 0.082014)
+
+    def test_size_mult(self):
+        self.assertEqual(m._size_mult(1.6), 1.15)
+        self.assertEqual(m._size_mult(1.0), 1.0)
+        self.assertEqual(m._size_mult(0.5), 0.85)
+
+    def test_rsi_bornes(self):
+        self.assertEqual(m._rsi([float(i) for i in range(30)], 14), 100.0)
+        self.assertLess(m._rsi([float(30 - i) for i in range(30)], 14), 1.0)
+
+    def test_bb_plat(self):
+        self.assertEqual(m._bb([100.0] * 25)[3], 0.5)
+
+
+if __name__ == "__main__":
+    unittest.main()
