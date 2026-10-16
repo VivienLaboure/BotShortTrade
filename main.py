@@ -128,6 +128,7 @@ COL_HEADERS = [
     "SL", "TP", "ATR M5", "Notionnel $", "P&L TP $", "P&L SL $",
     "Prix actuel", "Statut", "P&L final $",
     "Mode", "Régime", "Score",   # ajoutés en fin pour garder les index existants (analyze_weekly)
+    "Fermé (UTC)",               # date de fermeture → P&L du jour (col. 19)
 ]
 
 _FILLS = {
@@ -235,6 +236,7 @@ def update_order_status(wb: Workbook, order_id, status: str, pnl: float | None =
     ws.cell(r, 14).value = status
     if pnl is not None:
         ws.cell(r, 15).value = round(pnl, 2)
+        ws.cell(r, 19).value = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
     fill = _FILLS["tp"] if "TP" in status else (_FILLS["sl"] if "SL" in status else _FILLS["open"])
     for c in range(1, len(COL_HEADERS) + 1):
         ws.cell(r, c).fill = fill
@@ -1083,13 +1085,61 @@ def trail_sl(position: dict, current_price: float):
     tag   = "TRAIL" if profit_atr >= TRAIL_TRIGGER else "BKEVEN"
     print(f"  {C.BCYN}[{tag} {arrow}]{C.RST} {coin} SL={new_sl:.6g} ({phase_label})")
 
+# ── Surveillance des stop-loss ───────────────────────────────────────────────
+def ensure_sl_orders(open_positions: list) -> int:
+    """Vérifie que chaque position suivie a bien un ordre stop-loss actif sur Hyperliquid
+    (reprise en « état partiel », SL annulé à la main, échec silencieux…). Repose le SL
+    manquant au niveau position['sl'] et resynchronise sl_oid. Retourne le nb de SL reposés."""
+    if not open_positions:
+        return 0
+    try:
+        orders = info.frontend_open_orders(WALLET_ADDRESS)
+    except Exception as e:
+        log_error(f"ensure_sl_orders: {e}")
+        return 0
+    replaced = 0
+    for pos in open_positions:
+        coin   = pos["symbol"]
+        is_buy = pos["side"] == "BUY"
+        stops  = [o for o in orders if o.get("coin") == coin and o.get("isTrigger")
+                  and o.get("reduceOnly") and str(o.get("orderType", "")).startswith("Stop")]
+        if stops:
+            if not any(o.get("oid") == pos.get("sl_oid") for o in stops):
+                pos["sl_oid"] = stops[0]["oid"]   # resynchroniser (ex. reprise état partiel)
+            continue
+        sl     = round_px(pos["sl"])
+        sl_lim = round_px(sl * 0.90) if is_buy else round_px(sl * 1.10)
+        try:
+            r = exchange.order(coin, not is_buy, pos["qty"], limit_px=sl_lim,
+                               order_type={"trigger": {"triggerPx": float(sl), "isMarket": True, "tpsl": "sl"}},
+                               reduce_only=True)
+            st = (r.get("response") or {}).get("data", {}).get("statuses", [{}])
+            if r.get("status") != "ok" or "error" in st[0]:
+                raise RuntimeError(r)
+            pos["sl_oid"] = (st[0].get("resting") or st[0].get("filled") or {}).get("oid")
+            replaced += 1
+            print(f"  {C.BYLW}[SL MANQUANT]{C.RST} {coin} SL reposé à ${sl:.6g}")
+            send_discord_alert(f"🛡️ SL manquant reposé — {coin}",
+                               f"Aucun stop-loss actif trouvé sur Hyperliquid ; SL reposé à **${sl:.6g}**.",
+                               color=0xf39c12)
+        except Exception as e:
+            log_error(f"SL manquant {coin} non reposé : {e}")
+            send_discord_alert(f"🚨 {coin} SANS STOP-LOSS",
+                               f"SL absent sur Hyperliquid et impossible à reposer. **Intervention manuelle requise.**\n"
+                               f"Erreur : `{str(e)[:300]}`", color=0xff0000)
+    return replaced
+
 # ── Fermeture forcée (zombie) ─────────────────────────────────────────────────
 def _closing_pnl(position: dict, fills: list) -> tuple[float, float, float] | None:
     """(gross, open_fee, close_fee) de la fermeture la plus récente de la position, ou None.
     Un ordre de fermeture (SL/TP/market) est souvent exécuté en plusieurs fills partiels :
     on somme tous les fills de cet ordre (même oid), pas seulement le dernier."""
     coin    = position["symbol"]
-    closing = [f for f in fills if f["coin"] == coin and "Close" in f.get("dir", "")]
+    since   = (position.get("opened_at") or 0) * 1000 - 5000   # marge horloge 5 s
+    # Uniquement les fermetures postérieures à l'ouverture : sinon la fermeture d'un trade
+    # précédent sur le même coin pouvait être attribuée à celui-ci
+    closing = [f for f in fills if f["coin"] == coin and "Close" in f.get("dir", "")
+               and f.get("time", 0) >= since]
     if not closing:
         return None
     last_oid  = max(closing, key=lambda f: f["time"]).get("oid")
@@ -1102,30 +1152,35 @@ def _closing_pnl(position: dict, fills: list) -> tuple[float, float, float] | No
                 else position.get("open_fee") or close_fee)   # estimé = frais de sortie (même taux taker)
     return gross, open_fee, close_fee
 
-def force_close_zombie(wb: Workbook, position: dict) -> float:
-    """Ferme de force une position zombie (>6h en drawdown) via market_close.
-    Annule le SL existant, place un IOC reduce-only, enregistre le P&L."""
+def force_close_zombie(wb: Workbook, position: dict) -> float | None:
+    """Ferme de force une position zombie (>6h en drawdown) via market_close, PUIS annule
+    le SL (avant : SL annulé d'abord → si la fermeture échouait, position sans stop et
+    plus suivie). Retourne le P&L, ou None si la fermeture a échoué (SL conservé)."""
     coin   = position["symbol"]
-    is_buy = position["side"] == "BUY"
     sl_oid = position.get("sl_oid")
 
-    # Annuler le SL sur l'exchange
+    # Fermeture au marché (SDK Hyperliquid). None = plus de position (déjà fermée par SL/TP)
+    try:
+        r = exchange.market_close(coin, slippage=0.05)
+        if r is not None and r.get("status") != "ok":
+            raise RuntimeError(r)
+        st = ((r or {}).get("response") or {}).get("data", {}).get("statuses", [{}])
+        if st and "error" in st[0]:
+            raise RuntimeError(st[0]["error"])
+        print(f"  {C.BRED}[ZOMBIE]{C.RST} {C.BOLD}{coin}{C.RST} order envoyé")
+    except Exception as e:
+        log_error(f"zombie market_close {coin}: {e}")
+        send_discord_alert(f"⚠️ Zombie {coin} : fermeture échouée",
+                           f"La position reste ouverte avec son SL. Nouvel essai au prochain cycle.\n"
+                           f"Erreur : `{str(e)[:300]}`", color=0xf39c12)
+        return None
+
+    # Position fermée : le SL (reduce-only) n'a plus d'objet
     if sl_oid:
         try:
             exchange.cancel(coin, int(sl_oid))
         except Exception as e:
             print(f"  {C.BYLW}[ZOMBIE]{C.RST} annulation SL : {e}")
-
-    # Fermeture au marché (SDK Hyperliquid)
-    try:
-        r = exchange.market_close(coin, slippage=0.05)
-        if r.get("status") != "ok":
-            log_error(f"zombie market_close {coin}: {r}")
-            return 0.0
-        print(f"  {C.BRED}[ZOMBIE]{C.RST} {C.BOLD}{coin}{C.RST} order envoyé")
-    except Exception as e:
-        log_error(f"zombie market_close {coin}: {e}")
-        return 0.0
 
     # Récupérer le P&L depuis les fills (courte pause pour la propagation)
     time.sleep(1)
@@ -1176,6 +1231,7 @@ def check_position(wb: Workbook, position: dict,
         )
 
         if pos:
+            position.pop("_missing", None)
             mids  = cached_mids if cached_mids is not None else info.all_mids()
             price = float(mids.get(coin, position["entry"]))
             pnl   = float(pos.get("unrealizedPnl", 0))
@@ -1188,11 +1244,19 @@ def check_position(wb: Workbook, position: dict,
             trail_sl(position, price)
             return None
 
-        # Position fermée — chercher le P&L dans les fills
-        pnl, result = 0.0, "Fermé"
+        # Position absente — chercher la fermeture dans les fills
+        pnl, result = 0.0, "Fermé (inconnu)"
         try:
             fills   = info.user_fills(WALLET_ADDRESS)
             res     = _closing_pnl(position, fills)
+            if not res:
+                # Aucun fill de fermeture : fills pas encore propagés, ou position absente
+                # par erreur API passagère → on attend jusqu'à 3 cycles avant de conclure
+                position["_missing"] = position.get("_missing", 0) + 1
+                if position["_missing"] < 3:
+                    print(f"  {C.BYLW}[SUIVI]{C.RST} {coin} absente sans fill de fermeture "
+                          f"({position['_missing']}/3) — vérification au prochain cycle")
+                    return None
             if res:
                 gross, open_fee, close_fee = res
                 pnl = round(gross - open_fee - close_fee, 2)
@@ -1306,7 +1370,9 @@ def reconcile_zombie_orders(wb: Workbook, open_positions: list) -> None:
 # ── Affichage scan ────────────────────────────────────────────────────────────
 # ── P&L portefeuille ──────────────────────────────────────────────────────────
 def calc_daily_pnl(wb: Workbook) -> float:
-    """P&L des trades fermés aujourd'hui (minuit UTC)."""
+    """P&L des trades fermés aujourd'hui (minuit UTC), selon la date de FERMETURE
+    (avant : date d'ouverture → un trade ouvert la veille et fermé aujourd'hui échappait
+    à la limite de perte du jour). Anciennes lignes sans date de fermeture : date d'ouverture."""
     ws = wb["Trades"]
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     daily = 0.0
@@ -1314,7 +1380,8 @@ def calc_daily_pnl(wb: Workbook) -> float:
         pnl = row[14]
         if pnl is None or pnl == "":
             continue
-        date_str = str(row[1] or "")
+        closed = row[18] if len(row) > 18 else None
+        date_str = str(closed or row[1] or "")
         if date_str.startswith(today):
             try:
                 daily += float(pnl)
@@ -1851,6 +1918,8 @@ def run():
     open_positions, capital_in_use = recover_open_positions()
     if open_positions:
         reconcile_zombie_orders(wb, open_positions)
+        ensure_sl_orders(open_positions)
+        save_positions_state(open_positions)
         print(f"  {C.BCYN}Positions reprises : {len(open_positions)}{C.RST}")
     else:
         print(f"  {C.DIM}Aucune position ouverte à la reprise{C.RST}")
@@ -1921,6 +1990,11 @@ def run():
         for pos in closed_this_loop:
             open_positions.remove(pos)
             capital_in_use = max(0.0, capital_in_use - CAPITAL_PER_TRADE)
+
+        # Surveillance des SL toutes les 5 min (1 appel API) — position sans stop = risque max
+        if open_positions and now_min % 5 == 0:
+            if ensure_sl_orders(open_positions):
+                save_positions_state(open_positions)
 
         # Mode fantôme : résolution des signaux virtuels ouverts
         try:
@@ -2153,7 +2227,13 @@ def run():
                             open_positions.remove(pos)
                             capital_in_use = max(0.0, capital_in_use - CAPITAL_PER_TRADE)
                         save_positions_state(open_positions)
-                        force_close_zombie(wb, pos)
+                        if force_close_zombie(wb, pos) is None:
+                            # Échec : la position reste ouverte (SL intact) → on la remet en suivi
+                            # et on réessaiera au prochain cycle (alert_key non posé)
+                            open_positions.append(pos)
+                            capital_in_use += CAPITAL_PER_TRADE
+                            save_positions_state(open_positions)
+                            continue
                     else:
                         # En profit → alerter seulement, laisser le trailing gérer
                         msg = (f"**{pos['symbol']}** ouverte depuis **{age_h:.1f}h** — en profit ${_zpnl:.2f}\n"

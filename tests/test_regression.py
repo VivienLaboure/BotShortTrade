@@ -273,6 +273,124 @@ class TestFees(BaseTest):
         self.assertAlmostEqual(close_fee, 0.035987, places=6)
 
 
+# ── Revue 2026-10-16 : zombie, attribution des fermetures, surveillance SL ───
+class OrdersInfo(FakeInfo):
+    def __init__(self, orders=None, **k):
+        super().__init__(**k); self.orders = orders or []
+    def frontend_open_orders(self, addr): return self.orders
+
+class LogExchange(FakeExchange):
+    def __init__(self, close_resp=None, **k):
+        super().__init__(**k); self.log, self.close_resp = [], close_resp
+    def market_close(self, coin, slippage=0.05):
+        self.log.append("close"); return self.close_resp
+    def cancel(self, coin, oid):
+        self.log.append(("cancel", oid)); return {"status": "ok"}
+    def order(self, *a, **k):
+        self.log.append("order"); return super().order(*a, **k)
+
+class TestZombie(BaseTest):
+    POS = {"id": "1", "symbol": "ETH", "side": "BUY", "entry": 2000, "qty": 0.04,
+           "sl_oid": 11, "open_fee": 0.0, "conditions": {}}
+
+    def close(self, resp):
+        ex = LogExchange(close_resp=resp)
+        with mock.patch.object(m, "exchange", ex), mock.patch.object(m, "info", FakeInfo()), \
+             mock.patch.object(m, "update_order_status", lambda *a, **k: None), \
+             mock.patch.object(m, "record_lesson", lambda *a, **k: None):
+            return m.force_close_zombie(None, dict(self.POS)), ex
+
+    def test_fermeture_puis_annulation_sl(self):
+        pnl, ex = self.close({"status": "ok", "response": {"data": {"statuses": [{"filled": {}}]}}})
+        self.assertIsNotNone(pnl)
+        self.assertEqual(ex.log, ["close", ("cancel", 11)])
+
+    def test_fermeture_echouee_sl_conserve(self):
+        pnl, ex = self.close({"status": "err", "response": "insufficient liquidity"})
+        self.assertIsNone(pnl)
+        self.assertEqual(ex.log, ["close"])                  # SL jamais annulé
+        self.assertTrue(any("fermeture échouée" in t for t in self.titles()))
+
+    def test_fermeture_statut_erreur_sl_conserve(self):
+        pnl, ex = self.close({"status": "ok", "response": {"data": {"statuses": [{"error": "x"}]}}})
+        self.assertIsNone(pnl)
+        self.assertEqual(ex.log, ["close"])
+
+
+class TestClosingAttribution(BaseTest):
+    def test_fermeture_anterieure_a_l_ouverture_ignoree(self):
+        fills = [{"coin": "DOGE", "dir": "Close Short", "time": 1_000_000, "oid": 9,
+                  "closedPnl": "5.0", "fee": "0.02"}]
+        pos = {"id": "1", "symbol": "DOGE", "opened_at": 2_000.0}   # ouvert après ce fill
+        self.assertIsNone(m._closing_pnl(pos, fills))
+
+    def test_position_absente_sans_fill_attend_3_cycles(self):
+        pos = {"id": "1", "symbol": "DOGE", "side": "BUY", "entry": 0.08, "qty": 1000,
+               "opened_at": 2_000_000_000.0, "conditions": {}}
+        rec = {}
+        with mock.patch.object(m, "info", FakeInfo(fills=[])), \
+             mock.patch.object(m, "update_order_status",
+                               lambda wb, oid, status, pnl=None: rec.update(status=status)), \
+             mock.patch.object(m, "record_lesson", lambda *a, **k: None):
+            r1 = m.check_position(None, pos, cached_state={"assetPositions": []})
+            r2 = m.check_position(None, pos, cached_state={"assetPositions": []})
+            r3 = m.check_position(None, pos, cached_state={"assetPositions": []})
+        self.assertEqual((r1, r2), (None, None))
+        self.assertEqual(r3, "Fermé (inconnu)")
+        self.assertEqual(rec["status"], "Fermé (inconnu)")
+
+
+class TestSLWatchdog(BaseTest):
+    POS = {"id": "1", "symbol": "ETH", "side": "BUY", "entry": 2000.0, "qty": 0.04,
+           "sl": 1992.5, "sl_oid": None}
+    STOP = {"coin": "ETH", "isTrigger": True, "reduceOnly": True, "orderType": "Stop Market", "oid": 55}
+    TP   = {"coin": "ETH", "isTrigger": True, "reduceOnly": True, "orderType": "Take Profit Market", "oid": 56}
+
+    def watch(self, orders, ex=None):
+        pos, ex = dict(self.POS), ex or LogExchange()
+        with mock.patch.object(m, "info", OrdersInfo(orders=orders)), mock.patch.object(m, "exchange", ex):
+            n = m.ensure_sl_orders([pos])
+        return n, pos, ex
+
+    def test_sl_present_resynchronise_oid(self):
+        n, pos, ex = self.watch([self.STOP, self.TP])
+        self.assertEqual(n, 0)
+        self.assertEqual(pos["sl_oid"], 55)
+        self.assertEqual(ex.log, [])
+
+    def test_sl_absent_repose(self):
+        n, pos, ex = self.watch([self.TP])                 # seul le TP existe
+        self.assertEqual(n, 1)
+        self.assertEqual(ex.orders[0]["triggerPx"], 1992.5)
+        self.assertEqual(ex.orders[0]["tpsl"], "sl")
+        self.assertEqual(pos["sl_oid"], 11)
+        self.assertTrue(any("SL manquant" in t for t in self.titles()))
+
+    def test_sl_absent_et_refuse_alerte_critique(self):
+        n, pos, ex = self.watch([], LogExchange(sl=[_err()]))
+        self.assertEqual(n, 0)
+        self.assertTrue(any("SANS STOP-LOSS" in t for t in self.titles()))
+
+
+class TestDailyPnl(BaseTest):
+    def test_pnl_du_jour_par_date_de_fermeture(self):
+        wb = m.init_excel(); ws = wb["Trades"]
+        today = m.datetime.now(m.timezone.utc).strftime("%Y-%m-%d")
+        base = ["x"] * 13
+        ws.append(["1", "2000-01-01 23:50"] + base[:11] + ["SL touché", -1.0, "MR", "RANGING", 0.8, f"{today} 00:10"])
+        ws.append(["2", f"{today} 08:00"] + base[:11] + ["TP touché", 0.5])          # ancienne ligne sans date
+        ws.append(["3", f"{today} 09:00"] + base[:11] + ["SL touché", -0.3, "MR", "RANGING", 0.8, "2000-01-02 00:00"])
+        self.assertAlmostEqual(m.calc_daily_pnl(wb), -0.5)
+
+    def test_date_fermeture_ecrite(self):
+        with mock.patch.object(m, "exchange", FakeExchange()), mock.patch.object(m, "info", FakeInfo()):
+            wb = m.init_excel(); m.place_order(dict(SIG), wb)
+        oid = wb["Trades"].cell(2, 1).value
+        m.update_order_status(wb, oid, "TP touché", 0.7)
+        self.assertTrue(str(wb["Trades"].cell(2, 19).value).startswith(
+            m.datetime.now(m.timezone.utc).strftime("%Y-%m-%d")))
+
+
 # ── Trailing stop ────────────────────────────────────────────────────────────
 class TrailExchange(FakeExchange):
     def __init__(self, resp):
