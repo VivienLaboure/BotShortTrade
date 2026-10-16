@@ -273,6 +273,75 @@ class TestFees(BaseTest):
         self.assertAlmostEqual(close_fee, 0.035987, places=6)
 
 
+# ── Trailing stop ────────────────────────────────────────────────────────────
+class TrailExchange(FakeExchange):
+    def __init__(self, resp):
+        super().__init__(); self.resp, self.log = resp, []
+    def order(self, *a, **k):
+        self.log.append("order"); return self.resp
+    def cancel(self, coin, oid):
+        self.log.append(("cancel", oid)); return {"status": "ok"}
+
+class TestTrailing(BaseTest):
+    POS = {"symbol": "ETH", "side": "BUY", "entry": 2000.0, "qty": 0.04,
+           "sl": 1992.5, "sl_oid": 11, "atr": 5.0}
+
+    def trail(self, resp, price=2010.0):   # +2×ATR → phase trailing
+        pos, ex = dict(self.POS), TrailExchange(resp)
+        with mock.patch.object(m, "exchange", ex):
+            m.trail_sl(pos, price)
+        return pos, ex
+
+    def test_nouveau_sl_pose_avant_annulation_ancien(self):
+        pos, ex = self.trail(_ok(77))
+        self.assertEqual(ex.log, ["order", ("cancel", 11)])
+        self.assertEqual(pos["sl_oid"], 77)
+        self.assertAlmostEqual(pos["sl"], 2010.0 - m.TRAIL_DIST * 5.0)
+        self.assertTrue(pos["trailed"])
+
+    def test_nouveau_sl_refuse_ancien_conserve(self):
+        pos, ex = self.trail(_err())
+        self.assertEqual(ex.log, ["order"])            # ancien SL jamais annulé
+        self.assertEqual(pos["sl_oid"], 11)
+        self.assertEqual(pos["sl"], 1992.5)
+        self.assertNotIn("trailed", pos)
+
+    def test_nouveau_sl_status_erreur_ancien_conserve(self):
+        pos, ex = self.trail({"status": "err", "response": "rate limited"})
+        self.assertEqual(ex.log, ["order"])
+        self.assertEqual(pos["sl_oid"], 11)
+
+    def test_pas_de_trail_sous_1_atr(self):
+        pos, ex = self.trail(_ok(77), price=2003.0)
+        self.assertEqual(ex.log, [])
+
+
+# ── Apprentissage ────────────────────────────────────────────────────────────
+class TestLessons(BaseTest):
+    POS = {"symbol": "DOGE", "side": "BUY",
+           "conditions": {"rsi": 52.9, "bbp": 0.346, "regime": "RANGING", "mode": "MR"}}
+
+    def setUp(self):
+        super().setUp()
+        m._lessons_cache.clear(); m._lessons_cache_ts = 0.0
+
+    def test_trail_ferme_a_perte_compte_comme_perte(self):
+        m.record_lesson(self.POS, "TRAIL touché", -0.05)
+        b = m._load_lessons()["buckets"]["coin_DOGE|buy"]
+        self.assertEqual((b["w"], b["l"]), (0, 1))
+
+    def test_trail_ferme_en_gain_compte_comme_gain(self):
+        m.record_lesson(self.POS, "TRAIL touché", 0.40)
+        b = m._load_lessons()["buckets"]["coin_DOGE|buy"]
+        self.assertEqual((b["w"], b["l"]), (1, 0))
+
+    def test_penalite_apres_5_pertes(self):
+        for _ in range(5):
+            m.record_lesson(self.POS, "SL touché", -0.37)
+        pen = m.get_penalty("DOGE", "BUY", 52.9, 0.346, "RANGING", "MR")
+        self.assertAlmostEqual(pen, 0.25)   # 4 buckets à 0 % WR → plafond
+
+
 # ── Régime de marché ─────────────────────────────────────────────────────────
 def _daily(chg_pct, chg3_pct=None):
     """8 bougies D1 : variation totale chg_pct, et variation 3j chg3_pct."""

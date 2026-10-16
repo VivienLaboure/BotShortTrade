@@ -285,7 +285,7 @@ def record_lesson(position: dict, outcome: str, pnl: float):
         cond.get("rsi", 50.0), cond.get("bbp", 0.5),
         cond.get("regime", "RANGING"), cond.get("mode", "MR")
     )
-    win = "TP" in outcome or "TRAIL" in outcome
+    win = pnl > 0   # P&L net : un TRAIL/breakeven fermé à perte (frais) n'est pas une victoire
     for k in keys:
         b = buckets.setdefault(k, {"w": 0, "l": 0, "pnl": 0.0})
         if win: b["w"] += 1
@@ -970,14 +970,8 @@ def trail_sl(position: dict, current_price: float):
     if (is_buy and new_sl <= sl) or (not is_buy and new_sl >= sl):
         return
 
-    # Annuler l'ancien SL
-    if sl_oid:
-        try:
-            exchange.cancel(coin, int(sl_oid))
-        except Exception as e:
-            print(f"  {C.BYLW}[TRAIL]{C.RST} annulation SL : {e}")
-
-    # Placer le nouveau SL
+    # Placer le nouveau SL AVANT d'annuler l'ancien : si le nouveau est refusé,
+    # l'ancien reste actif (sinon la position se retrouvait sans aucun stop)
     # Slippage max 2% pour le trailing/breakeven SL (protège un profit, pas une perte).
     # Contrairement au SL initial (10%), on ne veut pas remplir à n'importe quel prix :
     # un BUY trail à $103 avec limite à $92.70 (10%) ne remplit pas si crash à $93 → perte.
@@ -990,18 +984,25 @@ def trail_sl(position: dict, current_price: float):
             order_type={"trigger": {"triggerPx": float(new_sl), "isMarket": True, "tpsl": "sl"}},
             reduce_only=True,
         )
-        if r.get("status") == "ok":
-            st = r["response"]["data"]["statuses"]
-            position["sl_oid"]  = (st[0].get("resting") or {}).get("oid")
-            position["sl"]      = new_sl
-            position["trailed"] = True   # flag pour classifier "TRAIL touché" à la fermeture
-            arrow = "↑" if is_buy else "↓"
-            tag   = "TRAIL" if profit_atr >= TRAIL_TRIGGER else "BKEVEN"
-            print(f"  {C.BCYN}[{tag} {arrow}]{C.RST} {coin} SL={new_sl:.6g} ({phase_label})")
-        else:
-            print(f"  {C.BYLW}[TRAIL]{C.RST} rejeté : {r}")
+        st = (r.get("response") or {}).get("data", {}).get("statuses", [{}])
+        if r.get("status") != "ok" or "error" in st[0]:
+            print(f"  {C.BYLW}[TRAIL]{C.RST} rejeté (ancien SL conservé) : {r}")
+            return
     except Exception as e:
-        print(f"  {C.BYLW}[TRAIL]{C.RST} erreur : {e}")
+        print(f"  {C.BYLW}[TRAIL]{C.RST} erreur (ancien SL conservé) : {e}")
+        return
+
+    if sl_oid:
+        try:
+            exchange.cancel(coin, int(sl_oid))
+        except Exception as e:
+            print(f"  {C.BYLW}[TRAIL]{C.RST} annulation ancien SL : {e}")
+    position["sl_oid"]  = (st[0].get("resting") or st[0].get("filled") or {}).get("oid")
+    position["sl"]      = new_sl
+    position["trailed"] = True   # flag pour classifier "TRAIL touché" à la fermeture
+    arrow = "↑" if is_buy else "↓"
+    tag   = "TRAIL" if profit_atr >= TRAIL_TRIGGER else "BKEVEN"
+    print(f"  {C.BCYN}[{tag} {arrow}]{C.RST} {coin} SL={new_sl:.6g} ({phase_label})")
 
 # ── Fermeture forcée (zombie) ─────────────────────────────────────────────────
 def _closing_pnl(position: dict, fills: list) -> tuple[float, float, float] | None:
@@ -1116,8 +1117,8 @@ def check_position(wb: Workbook, position: dict,
             if res:
                 gross, open_fee, close_fee = res
                 pnl = round(gross - open_fee - close_fee, 2)
-                # Trailing stop activé et pertes ≤ frais : c'est une protection réussie, pas un SL
-                if position.get("trailed") and pnl >= -0.20:
+                # Trailing stop activé et perte ≤ frais : c'est une protection réussie, pas un SL
+                if position.get("trailed") and pnl >= -(open_fee + close_fee) - 0.01:
                     result = "TRAIL touché"
                 elif pnl >= 0:
                     result = "TP touché"
