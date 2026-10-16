@@ -236,6 +236,43 @@ class TestFees(BaseTest):
         self.assertAlmostEqual(pnl, 1.00 - 0.04 - 0.04, places=2)
 
 
+    # Fills réels du trade DOGE du 2026-10-16 : SL exécuté en 3 fills partiels.
+    # Avant correctif : seul le dernier fill était compté → P&L −0.08 au lieu de −0.37.
+    DOGE_FILLS = [
+        {"coin": "DOGE", "dir": "Open Long",  "time": 1792136736618, "oid": 576377349716,
+         "sz": "1016.0", "closedPnl": "0.0", "fee": "0.036116"},
+        {"coin": "DOGE", "dir": "Close Long", "time": 1792138739787, "oid": 576377359631,
+         "sz": "222.0", "closedPnl": "-0.0666", "fee": "0.007862"},
+        {"coin": "DOGE", "dir": "Close Long", "time": 1792138739787, "oid": 576377359631,
+         "sz": "677.0", "closedPnl": "-0.195653", "fee": "0.023981"},
+        {"coin": "DOGE", "dir": "Close Long", "time": 1792138739787, "oid": 576377359631,
+         "sz": "117.0", "closedPnl": "-0.033579", "fee": "0.004144"},
+        # Ancien trade DOGE fermé plus tôt (autre oid) : ne doit PAS être additionné
+        {"coin": "DOGE", "dir": "Close Short", "time": 1792000000000, "oid": 111,
+         "sz": "500.0", "closedPnl": "5.0", "fee": "0.02"},
+    ]
+    DOGE_POS = {"id": "576377349716", "symbol": "DOGE", "side": "BUY", "entry": 0.082287,
+                "qty": 1016.0, "sl": 0.082014, "tp": 0.083016, "sl_oid": 576377359631,
+                "atr": 0.000182, "open_fee": 0.0, "conditions": {"mode": "MR"}}
+
+    def test_sl_en_fills_partiels_tous_additionnes(self):
+        rec = {}
+        with mock.patch.object(m, "info", FakeInfo(fills=self.DOGE_FILLS)), \
+             mock.patch.object(m, "update_order_status",
+                               lambda wb, oid, status, pnl=None: rec.update(status=status, pnl=pnl)), \
+             mock.patch.object(m, "record_lesson", lambda *a, **k: None):
+            result = m.check_position(None, dict(self.DOGE_POS), cached_state={"assetPositions": []})
+        self.assertEqual(result, "SL touché")
+        # gross −0.295832 − frais ouverture réels 0.036116 − frais sortie 0.035987
+        self.assertAlmostEqual(rec["pnl"], -0.37, places=2)
+
+    def test_closing_pnl_frais_ouverture_reels(self):
+        gross, open_fee, close_fee = m._closing_pnl(self.DOGE_POS, self.DOGE_FILLS)
+        self.assertAlmostEqual(gross, -0.295832, places=6)
+        self.assertAlmostEqual(open_fee, 0.036116, places=6)
+        self.assertAlmostEqual(close_fee, 0.035987, places=6)
+
+
 # ── Régime de marché ─────────────────────────────────────────────────────────
 def _daily(chg_pct, chg3_pct=None):
     """8 bougies D1 : variation totale chg_pct, et variation 3j chg3_pct."""

@@ -1004,6 +1004,24 @@ def trail_sl(position: dict, current_price: float):
         print(f"  {C.BYLW}[TRAIL]{C.RST} erreur : {e}")
 
 # ── Fermeture forcée (zombie) ─────────────────────────────────────────────────
+def _closing_pnl(position: dict, fills: list) -> tuple[float, float, float] | None:
+    """(gross, open_fee, close_fee) de la fermeture la plus récente de la position, ou None.
+    Un ordre de fermeture (SL/TP/market) est souvent exécuté en plusieurs fills partiels :
+    on somme tous les fills de cet ordre (même oid), pas seulement le dernier."""
+    coin    = position["symbol"]
+    closing = [f for f in fills if f["coin"] == coin and "Close" in f.get("dir", "")]
+    if not closing:
+        return None
+    last_oid  = max(closing, key=lambda f: f["time"]).get("oid")
+    order     = [f for f in closing if f.get("oid") == last_oid]
+    gross     = sum(float(f.get("closedPnl", 0)) for f in order)
+    close_fee = sum(float(f.get("fee", 0)) for f in order)
+    # Frais d'ouverture réels via les fills de l'ordre d'entrée (absents de la réponse d'ordre)
+    opening  = [f for f in fills if str(f.get("oid")) == str(position.get("id"))]
+    open_fee = (sum(float(f.get("fee", 0)) for f in opening) if opening
+                else position.get("open_fee") or close_fee)   # estimé = frais de sortie (même taux taker)
+    return gross, open_fee, close_fee
+
 def force_close_zombie(wb: Workbook, position: dict) -> float:
     """Ferme de force une position zombie (>6h en drawdown) via market_close.
     Annule le SL existant, place un IOC reduce-only, enregistre le P&L."""
@@ -1034,13 +1052,10 @@ def force_close_zombie(wb: Workbook, position: dict) -> float:
     pnl = 0.0
     try:
         fills   = info.user_fills(WALLET_ADDRESS)
-        closing = [f for f in fills if f["coin"] == coin and "Close" in f.get("dir", "")]
-        if closing:
-            recent    = max(closing, key=lambda f: f["time"])
-            close_fee = float(recent.get("fee", 0))
-            open_fee  = position.get("open_fee") or close_fee   # fee absent de la réponse d'ordre → estimé = frais de sortie (même taux taker)
-            gross     = float(recent.get("closedPnl", 0))
-            pnl       = round(gross - open_fee - close_fee, 2)
+        res     = _closing_pnl(position, fills)
+        if res:
+            gross, open_fee, close_fee = res
+            pnl = round(gross - open_fee - close_fee, 2)
     except Exception:
         pass
 
@@ -1097,14 +1112,10 @@ def check_position(wb: Workbook, position: dict,
         pnl, result = 0.0, "Fermé"
         try:
             fills   = info.user_fills(WALLET_ADDRESS)
-            closing = [f for f in fills
-                       if f["coin"] == coin and "Close" in f.get("dir", "")]
-            if closing:
-                recent = max(closing, key=lambda f: f["time"])
-                close_fee = float(recent.get("fee", 0))
-                open_fee  = position.get("open_fee") or close_fee   # fee absent de la réponse d'ordre → estimé = frais de sortie (même taux taker)
-                gross     = float(recent.get("closedPnl", 0))
-                pnl       = round(gross - open_fee - close_fee, 2)
+            res     = _closing_pnl(position, fills)
+            if res:
+                gross, open_fee, close_fee = res
+                pnl = round(gross - open_fee - close_fee, 2)
                 # Trailing stop activé et pertes ≤ frais : c'est une protection réussie, pas un SL
                 if position.get("trailed") and pnl >= -0.20:
                     result = "TRAIL touché"
