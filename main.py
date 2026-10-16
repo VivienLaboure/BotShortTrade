@@ -611,28 +611,25 @@ def get_signal(coin: str) -> dict | None:
 def get_equity(cached_state: dict | None = None) -> float:
     user_state = cached_state if cached_state is not None else info.user_state(WALLET_ADDRESS)
     cross        = user_state.get("crossMarginSummary") or user_state.get("marginSummary") or {}
-    withdrawable = float(user_state.get("withdrawable") or 0)
     margin_used  = float(cross.get("totalMarginUsed") or 0)
-    perp_total   = withdrawable + margin_used   # solde perp (libre + engagé)
+    acv          = float(cross.get("accountValue") or 0)   # perp : marge engagée + P&L latent (+ libre)
 
-    # Mode Unified Hyperliquid : le USDC Spot sert aussi de marge perp.
-    # Il n'est PAS dans withdrawable — on l'ajoute séparément.
-    spot_usdc = 0.0
+    # Mode Unified Hyperliquid : le USDC Spot sert aussi de marge perp et son "hold"
+    # contient déjà la marge des positions (comptée aussi dans accountValue) → on retire
+    # ce recouvrement pour ne pas la compter deux fois. Compte classique : hold ≈ 0.
+    spot_usdc = spot_hold = 0.0
     try:
         spot_state = info.spot_user_state(WALLET_ADDRESS)
         for b in spot_state.get("balances", []):
             if b["coin"] == "USDC":
                 spot_usdc = float(b.get("total") or 0)
+                spot_hold = float(b.get("hold") or 0)
                 break
     except Exception:
         pass
 
-    total = perp_total + spot_usdc
-    if total > 0:
-        return total
-    # Fallback pour comptes non-Unified : accountValue seul
-    acv = float(cross.get("accountValue") or 0)
-    return acv if acv > 0 else 0.0
+    total = acv + spot_usdc - min(spot_hold, margin_used)
+    return total if total > 0 else 0.0
 
 def get_unrealized_pnl(cached_state: dict | None = None) -> float:
     try:
@@ -1041,7 +1038,7 @@ def force_close_zombie(wb: Workbook, position: dict) -> float:
         if closing:
             recent    = max(closing, key=lambda f: f["time"])
             close_fee = float(recent.get("fee", 0))
-            open_fee  = position.get("open_fee", close_fee)
+            open_fee  = position.get("open_fee") or close_fee   # fee absent de la réponse d'ordre → estimé = frais de sortie (même taux taker)
             gross     = float(recent.get("closedPnl", 0))
             pnl       = round(gross - open_fee - close_fee, 2)
     except Exception:
@@ -1105,7 +1102,7 @@ def check_position(wb: Workbook, position: dict,
             if closing:
                 recent = max(closing, key=lambda f: f["time"])
                 close_fee = float(recent.get("fee", 0))
-                open_fee  = position.get("open_fee", close_fee)
+                open_fee  = position.get("open_fee") or close_fee   # fee absent de la réponse d'ordre → estimé = frais de sortie (même taux taker)
                 gross     = float(recent.get("closedPnl", 0))
                 pnl       = round(gross - open_fee - close_fee, 2)
                 # Trailing stop activé et pertes ≤ frais : c'est une protection réussie, pas un SL
