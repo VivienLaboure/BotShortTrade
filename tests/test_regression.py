@@ -311,6 +311,16 @@ class TestTrailing(BaseTest):
         self.assertEqual(ex.log, ["order"])
         self.assertEqual(pos["sl_oid"], 11)
 
+    def test_breakeven_couvre_les_frais(self):
+        pos, ex = self.trail(_ok(77), price=2006.0)   # +1.2×ATR → phase breakeven
+        self.assertAlmostEqual(pos["sl"], 2000.0 * (1 + m.BE_BUFFER_PCT / 100))
+
+    def test_breakeven_short(self):
+        pos = dict(self.POS, side="SELL", sl=2007.5)
+        with mock.patch.object(m, "exchange", TrailExchange(_ok(78))):
+            m.trail_sl(pos, 1994.0)
+        self.assertAlmostEqual(pos["sl"], 2000.0 * (1 - m.BE_BUFFER_PCT / 100))
+
     def test_pas_de_trail_sous_1_atr(self):
         pos, ex = self.trail(_ok(77), price=2003.0)
         self.assertEqual(ex.log, [])
@@ -335,11 +345,198 @@ class TestLessons(BaseTest):
         b = m._load_lessons()["buckets"]["coin_DOGE|buy"]
         self.assertEqual((b["w"], b["l"]), (1, 0))
 
-    def test_penalite_apres_5_pertes(self):
+    def pen(self):
+        return m.get_penalty("DOGE", "BUY", 52.9, 0.346, "RANGING", "MR")
+
+    def test_penalite_apres_6_pertes_avec_oubli(self):
         for _ in range(5):
             m.record_lesson(self.POS, "SL touché", -0.37)
-        pen = m.get_penalty("DOGE", "BUY", 52.9, 0.346, "RANGING", "MR")
-        self.assertAlmostEqual(pen, 0.25)   # 4 buckets à 0 % WR → plafond
+        self.assertEqual(self.pen(), 0.0)   # oubli : 5 pertes ≈ 4.71 effectives < 5
+        m.record_lesson(self.POS, "SL touché", -0.37)
+        self.assertAlmostEqual(self.pen(), 0.25)   # 4 buckets à 0 % WR → plafond
+
+    def test_bonus_si_historique_gagnant(self):
+        for _ in range(8):
+            m.record_lesson(self.POS, "TP touché", 0.70)
+        self.assertAlmostEqual(self.pen(), -0.15)  # bonus plafonné à 0.15
+
+    def test_oubli_progressif(self):
+        m.record_lesson(self.POS, "SL touché", -0.37)
+        m.record_lesson(self.POS, "TP touché", 0.70)
+        b = m._load_lessons()["buckets"]["coin_DOGE|buy"]
+        self.assertAlmostEqual(b["l"], 0.97)
+        self.assertAlmostEqual(b["w"], 1.0)
+
+    def test_fantomes_comptent_a_moitie(self):
+        for _ in range(10):
+            m.record_lesson(self.POS, "SL", -0.5, ghost=True)
+        self.assertEqual(self.pen(), 0.0)          # 10 fantômes ≈ 4.3 effectifs
+        for _ in range(2):
+            m.record_lesson(self.POS, "SL", -0.5, ghost=True)
+        self.assertGreater(self.pen(), 0.0)
+        b = m._load_lessons()["buckets"]["coin_DOGE|buy"]
+        self.assertEqual((b["w"], b["l"]), (0, 0))  # compteurs réels intacts
+        self.assertAlmostEqual(b["gpnl_pct"], -6.0)
+
+
+# ── Mode fantôme ─────────────────────────────────────────────────────────────
+def _m1(ts, o, h, l, c):
+    return {"ts": ts, "o": o, "h": h, "l": l, "c": c, "v": 1.0}
+
+class TestGhosts(BaseTest):
+    def setUp(self):
+        super().setUp()
+        if os.path.exists(m.GHOST_FILE):
+            os.remove(m.GHOST_FILE)
+        m._ghosts = None
+        m._lessons_cache.clear(); m._lessons_cache_ts = 0.0
+        self.wb = m.init_excel()
+
+    def g(self, side="buy"):
+        return {"side": side, "entry": 100.0, "sl": 99.0 if side == "buy" else 101.0,
+                "tp": 102.0 if side == "buy" else 98.0, "checked_ts": 0, "opened_at": 1000.0}
+
+    def test_tp_touche(self):
+        g = self.g()
+        self.assertEqual(m._ghost_resolve(g, [_m1(1, 100, 101, 99.5, 101), _m1(2, 101, 102.1, 100.5, 102)], 1100),
+                         ("TP", 102.0))
+        self.assertEqual(g["checked_ts"], 2)
+
+    def test_sl_et_tp_meme_bougie_compte_sl(self):
+        self.assertEqual(m._ghost_resolve(self.g(), [_m1(1, 100, 102.5, 98.5, 100)], 1100), ("SL", 99.0))
+
+    def test_short(self):
+        self.assertEqual(m._ghost_resolve(self.g("sell"), [_m1(1, 100, 100.2, 97.9, 98)], 1100), ("TP", 98.0))
+        self.assertEqual(m._ghost_resolve(self.g("sell"), [_m1(1, 100, 101.2, 99.9, 101)], 1100), ("SL", 101.0))
+
+    def test_bougies_deja_vues_ignorees(self):
+        g = dict(self.g(), checked_ts=5)
+        self.assertIsNone(m._ghost_resolve(g, [_m1(5, 100, 103, 98, 100)], 1100))
+
+    def test_delai_depasse(self):
+        g = self.g()
+        res = m._ghost_resolve(g, [_m1(1, 100, 100.5, 99.5, 100.4)], 1000 + m.GHOST_MAX_HOURS * 3600)
+        self.assertEqual(res, ("Délai", 100.4))
+
+    def test_pnl_pct_net_de_frais(self):
+        self.assertAlmostEqual(m._ghost_pnl_pct(self.g(), 102.0), 2.0 - m.GHOST_FEE_PCT)
+        self.assertAlmostEqual(m._ghost_pnl_pct(self.g("sell"), 101.0), -1.0 - m.GHOST_FEE_PCT)
+
+    def test_ouverture_dedoublonnee_et_excel(self):
+        sig = dict(SIG, price=100.0, atr_m5=1.0)
+        self.assertIsNotNone(m.ghost_open(self.wb, sig, "score<0.75"))
+        self.assertIsNone(m.ghost_open(self.wb, sig, "score<0.75"))   # même coin/côté/mode
+        ws = self.wb["Fantômes"]
+        self.assertEqual(ws.max_row, 2)
+        self.assertEqual(ws.cell(2, 8).value, "score<0.75")
+        self.assertTrue(os.path.exists(m.GHOST_FILE))
+
+    def test_cycle_complet_tp_alimente_apprentissage(self):
+        sig = dict(SIG, price=100.0, atr_m5=1.0)   # SL 98.5 / TP 104
+        g = m.ghost_open(self.wb, sig, "régime BEAR")
+        later = g["checked_ts"] + 60000
+        with mock.patch.object(m, "fetch_candles",
+                               lambda coin, iv, n, **k: [_m1(later, 100, 104.2, 99.8, 104)]):
+            closed = m.ghost_update(self.wb)
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(m._load_ghosts(), [])
+        ws = self.wb["Fantômes"]
+        self.assertEqual(ws.cell(2, 12).value, "TP")
+        self.assertAlmostEqual(ws.cell(2, 14).value, 4.0 - m.GHOST_FEE_PCT)
+        b = m._load_lessons()["buckets"]["regime_RANGING|buy|MR"]
+        self.assertEqual(b["gw"], 1)
+        self.assertNotIn("gl", b)
+
+    def test_persistance_redemarrage(self):
+        m.ghost_open(self.wb, dict(SIG, price=100.0, atr_m5=1.0), "x")
+        m._ghosts = None   # simule un redémarrage
+        self.assertEqual(len(m._load_ghosts()), 1)
+
+
+def _declin(n, last_vol=300.0):
+    """Bougies en baisse régulière (chaque bougie rouge), volume fort sur la dernière."""
+    cs = []
+    for i in range(n):
+        px = 120.0 - 0.1 * i
+        cs.append({"ts": i, "o": px + 0.05, "h": px + 0.06, "l": px - 0.01, "c": px, "v": 100.0})
+    cs[-1]["v"] = last_vol
+    return cs
+
+class TestGhostCandidates(BaseTest):
+    def scan(self, regime):
+        m._ghost_candidates.clear(); m._reject_stats.clear()
+        m._lessons_cache.clear(); m._lessons_cache_ts = 0.0
+        with mock.patch.object(m, "fetch_candles", lambda coin, iv, n, **k: _declin(n)), \
+             mock.patch.object(m, "_current_regime", regime):
+            return m.get_signal("ETH")
+
+    def test_mom_bloque_en_ranging_devient_candidat_fantome(self):
+        self.assertIsNone(self.scan("RANGING"))
+        self.assertEqual(len(m._ghost_candidates), 1)
+        c = m._ghost_candidates[0]
+        self.assertEqual((c["signal"], c["conditions"]["mode"]), ("sell", "MOM"))
+        self.assertEqual(c["ghost_reason"], "MOM bloqué RANGING")
+        self.assertEqual(m._reject_stats.get("MOM bloqué RANGING"), 1)
+
+    def test_mom_en_bear_est_un_vrai_signal(self):
+        sig = self.scan("BEAR")
+        self.assertEqual((sig["signal"], sig["conditions"]["mode"]), ("sell", "MOM"))
+        self.assertEqual(m._ghost_candidates, [])
+
+
+# ── Boucle principale (smoke test) ───────────────────────────────────────────
+class _StopLoop(Exception):
+    pass
+
+class LoopInfo(FakeInfo):
+    def meta(self): return {"universe": []}
+
+class TestRunLoop(BaseTest):
+    def run_loop(self, daily_chg):
+        if os.path.exists(m.GHOST_FILE):
+            os.remove(m.GHOST_FILE)
+        m._ghosts = None
+        m._lessons_cache.clear(); m._lessons_cache_ts = 0.0
+        if hasattr(m.run, "_regime_cache"):
+            del m.run._regime_cache
+        info = LoopInfo(
+            mids={c: "100" for c in m.WATCHLIST},
+            perp={"assetPositions": [], "crossMarginSummary": {"accountValue": "0", "totalMarginUsed": "0"}},
+            spot={"balances": [{"coin": "USDC", "total": "111.18", "hold": "0"}]})
+        ex = FakeExchange()
+        cycles = []
+        def fake_sleep(sec):
+            if sec >= 5:                       # attente de fin de cycle
+                cycles.append(sec)
+                if len(cycles) >= 2:
+                    raise _StopLoop()
+        def fc(coin, iv, n, **k):
+            return _daily(daily_chg) if iv == m.INTERVAL_D1 else _declin(n)
+        with mock.patch.object(m, "info", info), mock.patch.object(m, "exchange", ex), \
+             mock.patch.object(m, "fetch_candles", fc), \
+             mock.patch.object(m.time, "sleep", fake_sleep), \
+             mock.patch.object(m, "HEARTBEAT_HOURS", 1e-9):
+            with self.assertRaises(_StopLoop):
+                m.run()
+        return ex, m._load_ghosts()
+
+    def test_bear_scan_fantome_et_heartbeat(self):
+        """2 cycles complets de run() en BEAR : aucun ordre réel, SELL MOM suivi en fantôme,
+        heartbeat Discord avec la ligne Fantômes."""
+        ex, ghosts = self.run_loop(-10)
+        self.assertEqual(ex.orders, [])                     # aucun ordre réel en BEAR
+        self.assertTrue(ghosts)
+        self.assertTrue(all(g["reason"] == "régime BEAR" for g in ghosts))
+        self.assertTrue(any(g["mode"] == "MOM" and g["side"] == "sell" for g in ghosts))
+        self.assertEqual(len(ghosts), len({(g["symbol"], g["side"], g["mode"]) for g in ghosts}))  # dédoublonné
+        hb = [d for t, d in self.alerts if "résumé" in t]
+        self.assertTrue(hb and "Fantômes :" in hb[0])
+
+    def test_ranging_mom_bloque_suivi_en_fantome(self):
+        ex, ghosts = self.run_loop(-2)
+        self.assertEqual(ex.orders, [])
+        self.assertTrue(ghosts)
+        self.assertTrue(all(g["reason"] == "MOM bloqué RANGING" for g in ghosts))
 
 
 # ── Régime de marché ─────────────────────────────────────────────────────────

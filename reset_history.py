@@ -4,7 +4,7 @@ reset_history.py — Efface l'historique de trading sans perturber les positions
 
 Ce script :
   1. Archive puis supprime trades.xlsx  (historique Excel)
-  2. Archive puis supprime lessons.json (patterns appris)
+  2. Archive puis supprime lessons.json (patterns appris) et ghosts.json (fantômes)
   3. Réécrit bot_state.json en conservant open_positions
      mais en supprimant initial_balance → le bot recalibrera sa
      référence P&L sur le solde réel au prochain démarrage.
@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 STATE_FILE     = "bot_state.json"
 EXCEL_FILE     = "trades.xlsx"
 LESSONS_FILE   = "lessons.json"
+GHOST_FILE     = "ghosts.json"
 DASHBOARD_FILE = "dashboard.html"
 
 now_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -55,6 +56,15 @@ if os.path.exists(LESSONS_FILE):
     print(f"✓ lessons.json   → archivé : {archive_l}")
 else:
     print("  lessons.json     introuvable — ignoré")
+
+# ── 3b. Archiver et supprimer ghosts.json (fantômes en cours) ─
+if os.path.exists(GHOST_FILE):
+    archive_g = f"ghosts_archive_{now_str}.json"
+    shutil.copy(GHOST_FILE, archive_g)
+    os.remove(GHOST_FILE)
+    print(f"✓ ghosts.json    → archivé : {archive_g}")
+else:
+    print("  ghosts.json      introuvable — ignoré")
 
 # ── 4. Préserver open_positions, effacer initial_balance ──────
 open_positions = []

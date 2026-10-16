@@ -64,6 +64,14 @@ ATR_SL_MULT   = 1.5
 ATR_TP_MULT   = 4.0   # R:R ~2.7:1 (TP = 4×ATR, SL = 1.5×ATR)
 TRAIL_TRIGGER = 1.5   # activer trailing quand profit ≥ 1.5×ATR
 TRAIL_DIST    = 1.0   # trailing SL à 1×ATR du prix courant
+BE_BUFFER_PCT = 0.10  # breakeven = entrée ± 0.10 % (couvre les frais aller-retour ≈ 0.09 %)
+
+# Mode fantôme : suivi virtuel des signaux NON tradés (filtrés, bloqués par régime, sans slot)
+GHOST_FILE      = "ghosts.json"
+GHOST_MAX_HOURS = 6.0    # un fantôme non résolu est clos au prix courant après 6h (cf. zombie)
+GHOST_FEE_PCT   = 0.09   # frais taker aller-retour estimés, déduits du P&L virtuel
+GHOST_WEIGHT    = 0.5    # poids d'un résultat fantôme vs un vrai trade dans l'apprentissage
+LESSON_DECAY    = 0.97   # oubli progressif : chaque nouveau résultat × 0.97 sur l'ancien (demi-vie ≈ 23)
 
 # ── Connexion Hyperliquid ──────────────────────────────────────────────────────
 _account       = Account.from_key(HL_PRIVATE_KEY)
@@ -131,6 +139,27 @@ _FILLS = {
     "open":   PatternFill("solid", fgColor="FFF2CC"),
 }
 
+GHOST_HEADERS = [
+    "ID", "Ouvert (UTC)", "Symbole", "Côté", "Mode", "Régime", "Score", "Raison",
+    "Entrée", "SL", "TP", "Statut", "Sortie", "P&L %", "Fermé (UTC)",
+]
+
+def _ensure_ghost_sheet(wb: Workbook) -> bool:
+    """Crée la feuille 'Fantômes' si absente. Retourne True si créée."""
+    if "Fantômes" in wb.sheetnames:
+        return False
+    ws = wb.create_sheet("Fantômes")
+    ws.append(GHOST_HEADERS)
+    for c in range(1, len(GHOST_HEADERS) + 1):
+        cell = ws.cell(1, c)
+        cell.fill = _FILLS["header"]
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.alignment = Alignment(horizontal="center")
+        ws.column_dimensions[get_column_letter(c)].width = 14
+    ws.column_dimensions["A"].width = 24
+    ws.column_dimensions["H"].width = 22
+    return True
+
 def _safe_save(wb: Workbook):
     tmp = EXCEL_FILE + ".tmp"
     wb.save(tmp)
@@ -142,6 +171,7 @@ def init_excel() -> Workbook:
             wb = openpyxl.load_workbook(EXCEL_FILE)
             ws = wb["Trades"]
             # Migration : ajoute les en-têtes manquants d'un fichier créé avec moins de colonnes
+            created = _ensure_ghost_sheet(wb)
             if ws.max_column < len(COL_HEADERS):
                 for c in range(ws.max_column + 1, len(COL_HEADERS) + 1):
                     cell = ws.cell(1, c, COL_HEADERS[c - 1])
@@ -149,6 +179,8 @@ def init_excel() -> Workbook:
                     cell.font = Font(bold=True, color="FFFFFF")
                     cell.alignment = Alignment(horizontal="center")
                     ws.column_dimensions[get_column_letter(c)].width = 14
+                created = True
+            if created:
                 _safe_save(wb)
             return wb
         except Exception:
@@ -166,6 +198,7 @@ def init_excel() -> Workbook:
     ws.column_dimensions["B"].width = 18
     for i in range(3, len(COL_HEADERS) + 1):
         ws.column_dimensions[get_column_letter(i)].width = 14
+    _ensure_ghost_sheet(wb)
     _safe_save(wb)
     return wb
 
@@ -211,6 +244,7 @@ def update_order_status(wb: Workbook, order_id, status: str, pnl: float | None =
 _scan_log:  list[dict] = []
 _last_scan: list[dict] = []   # snapshot du dernier scan complet (pour le dashboard)
 _reject_stats: dict[str, int] = {}   # 1er filtre bloquant par symbole scanné sans signal (heartbeat)
+_ghost_candidates: list[dict] = []   # signaux bloqués dans get_signal (MOM/BBO hors régime) → mode fantôme
 
 # ── Apprentissage des erreurs ──────────────────────────────────────────────────
 LESSONS_FILE    = "lessons.json"
@@ -273,8 +307,16 @@ def _lesson_buckets(coin: str, side: str, rsi: float, bbp: float,
         f"coin_{coin}|{s}",            # ex: "coin_AVAX|buy"
     ]
 
-def record_lesson(position: dict, outcome: str, pnl: float):
-    """Enregistre le résultat d'un trade dans les buckets statistiques."""
+def _bucket_stats(b: dict) -> tuple[float, float]:
+    """(nb effectif de trades, win rate) d'un bucket — fantômes pondérés par GHOST_WEIGHT."""
+    w = b.get("w", 0) + GHOST_WEIGHT * b.get("gw", 0)
+    n = w + b.get("l", 0) + GHOST_WEIGHT * b.get("gl", 0)
+    return n, (w / n if n else 0.5)
+
+def record_lesson(position: dict, outcome: str, pnl: float, ghost: bool = False):
+    """Enregistre le résultat d'un trade (réel : pnl en $, fantôme : pnl en %) dans les buckets.
+    Oubli progressif : les compteurs existants sont multipliés par LESSON_DECAY à chaque
+    nouveau résultat → les trades récents pèsent plus que les anciens."""
     cond = position.get("conditions")
     if not cond:
         return
@@ -288,23 +330,31 @@ def record_lesson(position: dict, outcome: str, pnl: float):
     win = pnl > 0   # P&L net : un TRAIL/breakeven fermé à perte (frais) n'est pas une victoire
     for k in keys:
         b = buckets.setdefault(k, {"w": 0, "l": 0, "pnl": 0.0})
-        if win: b["w"] += 1
-        else:   b["l"] += 1
-        b["pnl"] = round(b["pnl"] + pnl, 2)
+        for f in ("w", "l", "gw", "gl"):
+            if f in b:
+                b[f] = round(b[f] * LESSON_DECAY, 4)
+        if ghost:
+            f = "gw" if win else "gl"
+            b[f] = round(b.get(f, 0) + 1, 4)
+            b["gpnl_pct"] = round(b.get("gpnl_pct", 0.0) + pnl, 3)
+        else:
+            f = "w" if win else "l"
+            b[f] = round(b[f] + 1, 4)
+            b["pnl"] = round(b["pnl"] + pnl, 2)
     _save_lessons(data)
     # Afficher une alerte si un bucket devient clairement mauvais (même seuil MIN_SAMPLES que la pénalité)
     if not win:
         for k in keys:
-            b = buckets[k]
-            total = b["w"] + b["l"]
-            if total >= 5 and b["w"] / total < 0.35:
+            n, wr = _bucket_stats(buckets[k])
+            if n >= 5 and wr < 0.35:
                 print(f"  {C.BYLW}[LEÇON]{C.RST} Pattern risqué détecté : {C.BOLD}{k}{C.RST} "
-                      f"WR={b['w']/total*100:.0f}% ({b['w']}W/{b['l']}L)")
+                      f"WR={wr*100:.0f}% (n={n:.1f})")
 
 def get_penalty(coin: str, side: str, rsi: float, bbp: float,
                 regime: str, mode: str) -> float:
-    """Pénalité de score à soustraire si les conditions matchent un historique mauvais."""
-    MIN_SAMPLES = 5   # ne pénaliser qu'avec au moins 5 trades dans le bucket
+    """Ajustement de score appris : > 0 = pénalité (historique mauvais), < 0 = bonus (bon).
+    Réels + fantômes (pondérés), avec oubli progressif (cf. record_lesson)."""
+    MIN_SAMPLES = 5   # n effectif minimum dans le bucket
     data    = _load_lessons()
     buckets = data.get("buckets", {})
     keys    = _lesson_buckets(coin, side, rsi, bbp, regime, mode)
@@ -313,30 +363,32 @@ def get_penalty(coin: str, side: str, rsi: float, bbp: float,
         b = buckets.get(k)
         if not b:
             continue
-        total = b["w"] + b["l"]
-        if total < MIN_SAMPLES:
+        n, wr = _bucket_stats(b)
+        if n < MIN_SAMPLES:
             continue
-        wr = b["w"] / total
         if wr < 0.40:
             penalty += (0.40 - wr) * 0.5   # win_rate=20% → +0.10 | 30% → +0.05
-    return round(min(penalty, 0.25), 3)     # plafond : 0.25 max
+        elif wr > 0.60:
+            penalty -= (wr - 0.60) * 0.5   # win_rate=80% → bonus 0.10
+    return round(max(-0.15, min(penalty, 0.25)), 3)   # bonus max 0.15, pénalité max 0.25
 
 def print_lessons_summary():
     """Affiche les patterns actuellement pénalisés (si assez de données)."""
     data    = _load_lessons()
     buckets = data.get("buckets", {})
     MIN_SAMPLES = 5
-    bad = [(k, v) for k, v in buckets.items()
-           if v["w"] + v["l"] >= MIN_SAMPLES and v["w"] / (v["w"] + v["l"]) < 0.40]
-    if not bad:
+    active = [(k, v, *_bucket_stats(v)) for k, v in buckets.items()]
+    active = [a for a in active if a[2] >= MIN_SAMPLES and (a[3] < 0.40 or a[3] > 0.60)]
+    if not active:
         return
-    print(f"\n  {C.BYLW}── Leçons actives ({len(bad)} patterns pénalisés) ──{C.RST}")
-    for k, v in sorted(bad, key=lambda x: x[1]["w"] / max(1, x[1]["w"] + x[1]["l"])):
-        total = v["w"] + v["l"]
-        wr    = v["w"] / total
-        pen   = round(min((0.40 - wr) * 0.5, 0.25), 3)
-        print(f"    {C.BRED}▸ {k}{C.RST}  WR={wr*100:.0f}% ({v['w']}W/{v['l']}L)  "
-              f"P&L={_cp(v['pnl'])}${v['pnl']:+.2f}{C.RST}  pénalité=−{pen}")
+    print(f"\n  {C.BYLW}── Leçons actives ({len(active)} patterns pénalisés/favorisés) ──{C.RST}")
+    for k, v, n, wr in sorted(active, key=lambda a: a[3]):
+        if wr < 0.40:
+            tag = f"{C.BRED}▸ {k}{C.RST}  pénalité=−{min((0.40 - wr) * 0.5, 0.25):.3f}"
+        else:
+            tag = f"{C.BGRN}▸ {k}{C.RST}  bonus=+{min((wr - 0.60) * 0.5, 0.15):.3f}"
+        print(f"    {tag}  WR={wr*100:.0f}% (n={n:.1f}, dont fantômes {v.get('gw', 0) + v.get('gl', 0):.1f})  "
+              f"P&L réel={_cp(v.get('pnl', 0))}${v.get('pnl', 0):+.2f}{C.RST}")
 
 def log_error(msg: str):
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
@@ -521,6 +573,12 @@ def get_signal(coin: str) -> dict | None:
         base_mr_sht  = vol_ok and move_ok and vol1_ok and bars2_bear   # SELL MR : 2 bougies
         base_mom_sht = vol_ok and move_ok and vol1_ok and bars3_bear   # SELL MOM: 3 bougies
 
+        # Conditions MOM / BBO hors filtre de régime : si le régime les bloque,
+        # le signal est quand même suivi en fantôme (pour savoir s'il aurait gagné)
+        mom_cond = bias_dn and confirm_short and base_mom_sht and rsi1 <= 35 and bbp5 <= 0.35
+        bbo_cond = (bias_up and confirm_long and vol_ok and move_ok and 45 <= rsi5 <= 85
+                    and bbp5 >= 0.75)
+
         # ── BUY mean-reversion : RSI en zone neutre, prix bas de la bande ──────
         # bb_long_ok = bbp5 <= 0.35 (tiers inférieur strict — plus oversold que 0.40)
         if bias_up and confirm_long_mr and base_mr_long and 30 <= rsi1 <= 70 and bb_long_ok:
@@ -542,8 +600,7 @@ def get_signal(coin: str) -> dict | None:
         # ── SELL momentum : crash/tendance forte — prix sous la bande basse ─────
         # RSI extrême (<= 35) + prix cassant sous la BB + toute la structure baissière
         # Bloqué en RANGING : 40% WR, −$10.42 historique (rebonds fréquents en range)
-        elif (bias_dn and confirm_short and base_mom_sht and rsi1 <= 35 and bbp5 <= 0.35
-              and _current_regime != "RANGING"):
+        elif mom_cond and _current_regime != "RANGING":
             signal    = "sell"
             mode      = "MOM"
             rsi_score = max(0.0, (35 - rsi1) / 35)   # plus RSI bas = momentum fort
@@ -555,8 +612,7 @@ def get_signal(coin: str) -> dict | None:
         # RANGING bloqué  : 44% WR, −$11.62 (les cassures en range échouent trop souvent)
         # Utilise rsi5 (M5, 14 périodes) — stable pendant les pompes, contrairement à rsi1
         # qui monte à 90+ en quelques minutes M1 et bloque tous les signaux de breakout.
-        elif (bias_up and confirm_long and vol_ok and move_ok and 45 <= rsi5 <= 85
-              and _current_regime == "BULL" and bbp5 >= 0.75):
+        elif bbo_cond and _current_regime == "BULL":
             signal    = "buy"
             mode      = "BBO"
             rsi_score = max(0.0, (85 - rsi5) / 40)      # rsi5=45 → 1.0 | rsi5=85 → 0.0
@@ -569,13 +625,31 @@ def get_signal(coin: str) -> dict | None:
                    f"RSI={rsi1:.1f} BBP={bbp5:.2f} vol={c5[-1]['v']:.2f}/{avg_vol5:.2f} {bars3_str}"
                    + (f" [{mode}]" if mode else ""))
 
+        # Signal bloqué par le régime → candidat fantôme (jamais tradé)
+        if not signal and (mom_cond or bbo_cond):
+            if mom_cond:
+                g_side, g_mode = "sell", "MOM"
+                g_score = round(vol_ratio_capped * 0.5 + max(0.0, (35 - rsi1) / 35) * 0.25
+                                + max(0.0, (0.35 - bbp5) / 0.35) * 0.25, 3)
+            else:
+                g_side, g_mode = "buy", "BBO"
+                g_score = round(vol_ratio_capped * 0.50 + max(0.0, (85 - rsi5) / 40) * 0.30
+                                + min(1.0, (bbp5 - 0.75) / 0.50) * 0.20, 3)
+            _ghost_candidates.append({
+                "symbol": coin, "signal": g_side, "score": g_score, "atr_m5": atr5, "price": last5,
+                "conditions": {"rsi": round(rsi1, 1), "bbp": round(bbp5, 3),
+                               "vol_ratio": round(vol_ratio, 2),
+                               "regime": _current_regime, "mode": g_mode},
+                "ghost_reason": f"{g_mode} bloqué {_current_regime}",
+            })
+
         if signal:
-            # Appliquer les pénalités apprises des trades perdants
+            # Appliquer l'ajustement appris (pénalité si historique mauvais, bonus s'il est bon)
             penalty = get_penalty(coin, signal, rsi1, bbp5, _current_regime, mode)
-            if penalty > 0:
+            if penalty:
                 old_score = score
                 score = max(0.0, round(score - penalty, 3))
-                details += f" ⚠pén−{penalty}"
+                details += f" ⚠pén−{penalty}" if penalty > 0 else f" ✓bonus+{-penalty}"
                 log_scan(coin, "M15/M5/M1", signal, score,
                          details + f" [score {old_score:.3f}→{score:.3f} après leçon]")
             else:
@@ -591,12 +665,12 @@ def get_signal(coin: str) -> dict | None:
             }
 
         # Diagnostic : premier filtre qui a empêché un signal (agrégé dans le heartbeat)
-        mom_ok = bias_dn and confirm_short and base_mom_sht and rsi1 <= 35 and bbp5 <= 0.35
         _why = ("volume M5"   if not vol_ok else
                 "mouvement"   if not move_ok else
                 "volume M1"   if not vol1_ok else
                 "bougies M5"  if not (bars2_bull or bars2_bear) else
-                f"MOM bloqué {_current_regime}" if mom_ok else
+                f"MOM bloqué {_current_regime}" if mom_cond else
+                f"BBO bloqué {_current_regime}" if bbo_cond else
                 "biais/RSI/BBP")
         _reject_stats[_why] = _reject_stats.get(_why, 0) + 1
 
@@ -938,7 +1012,7 @@ def place_order(sig: dict, wb: Workbook) -> dict:
 def trail_sl(position: dict, current_price: float):
     """
     Deux phases de protection automatique :
-      Phase 0 — Breakeven   : dès 1×ATR de profit → SL au prix d'entrée (aucune perte possible)
+      Phase 0 — Breakeven   : dès 1×ATR de profit → SL à entrée ± 0.10 % (frais couverts)
       Phase 1 — Trailing    : dès 1.5×ATR de profit → SL suit le prix à 1×ATR (TRAIL_DIST)
     """
     coin   = position["symbol"]
@@ -960,8 +1034,13 @@ def trail_sl(position: dict, current_price: float):
                  else round_px(current_price + TRAIL_DIST * atr)
         phase_label = f"TRAIL (profit={profit_atr:.1f}×ATR)"
     elif profit_atr >= 1.0:
-        # Phase breakeven : SL au prix d'entrée
-        new_sl = round_px(entry)
+        # Phase breakeven : SL juste au-delà de l'entrée pour couvrir les frais aller-retour
+        # (au prix d'entrée exact, une sortie au SL perdait quand même ≈ 0.09 % de frais).
+        # Plafonné à 0.5×ATR sous/au-dessus du prix courant pour ne pas déclencher immédiatement.
+        if is_buy:
+            new_sl = round_px(min(entry * (1 + BE_BUFFER_PCT / 100), current_price - 0.5 * atr))
+        else:
+            new_sl = round_px(max(entry * (1 - BE_BUFFER_PCT / 100), current_price + 0.5 * atr))
         phase_label = f"BREAKEVEN (profit={profit_atr:.1f}×ATR)"
     else:
         return  # Pas encore assez en profit
@@ -1602,6 +1681,141 @@ def write_dashboard(wb: Workbook, open_positions: list, balance: float,
 
 
 # ── Boucle principale ─────────────────────────────────────────────────────────
+# ── Mode fantôme ─────────────────────────────────────────────────────────────
+# Chaque signal NON tradé (score trop bas, filtré/bloqué par le régime, pas de slot)
+# est suivi virtuellement avec le même SL/TP qu'un vrai trade. Son résultat alimente
+# l'apprentissage (poids GHOST_WEIGHT) et la feuille Excel « Fantômes ».
+_ghosts: list[dict] | None = None   # chargé à la demande depuis GHOST_FILE
+
+def _load_ghosts() -> list[dict]:
+    global _ghosts
+    if _ghosts is None:
+        try:
+            with open(GHOST_FILE, encoding="utf-8") as f:
+                _ghosts = json.load(f).get("open", [])
+        except Exception:
+            _ghosts = []
+    return _ghosts
+
+def _save_ghosts():
+    tmp = GHOST_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"open": _load_ghosts()}, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, GHOST_FILE)
+
+def ghost_open(wb: Workbook, sig: dict, reason: str) -> dict | None:
+    """Ouvre un fantôme pour un signal non tradé. Un seul fantôme ouvert par
+    (symbole, côté, mode) : un signal qui persiste plusieurs minutes ne compte qu'une fois."""
+    ghosts = _load_ghosts()
+    coin   = sig["symbol"]
+    mode   = sig.get("conditions", {}).get("mode", "?")
+    if any(g["symbol"] == coin and g["side"] == sig["signal"] and g["mode"] == mode for g in ghosts):
+        return None
+    entry, atr = float(sig["price"]), float(sig["atr_m5"])
+    if entry <= 0 or atr <= 0:
+        return None
+    is_buy = sig["signal"] == "buy"
+    now    = time.time()
+    g = {
+        "id": f"G{int(now * 1000)}-{coin}", "symbol": coin, "side": sig["signal"], "mode": mode,
+        "regime": sig.get("conditions", {}).get("regime", _current_regime),
+        "score": sig.get("score", 0.0), "reason": reason, "entry": entry,
+        "sl": entry - ATR_SL_MULT * atr if is_buy else entry + ATR_SL_MULT * atr,
+        "tp": entry + ATR_TP_MULT * atr if is_buy else entry - ATR_TP_MULT * atr,
+        "conditions": sig.get("conditions", {}),
+        "opened_at": now,
+        # Bougies M1 déjà examinées : on part de la minute en cours
+        "checked_ts": int(now // 60) * 60 * 1000 - 1,
+    }
+    ghosts.append(g)
+    _save_ghosts()
+    try:
+        ws = wb["Fantômes"]
+        ws.append([g["id"], datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                   SYM_LABEL.get(coin, coin), g["side"].upper(), mode, g["regime"], g["score"],
+                   reason, round(entry, 6), round(g["sl"], 6), round(g["tp"], 6), "Ouvert", None, None, None])
+        _safe_save(wb)
+    except Exception as e:
+        log_error(f"ghost excel {coin}: {e}")
+    return g
+
+def _ghost_resolve(g: dict, candles: list[dict], now: float | None = None) -> tuple[str, float] | None:
+    """Parcourt les bougies M1 postérieures à g['checked_ts'].
+    Retourne (statut, prix de sortie) si SL/TP touché ou délai dépassé, sinon None.
+    SL et TP dans la même bougie → SL (hypothèse prudente)."""
+    is_buy = g["side"] == "buy"
+    for c in candles:
+        if c["ts"] <= g["checked_ts"]:
+            continue
+        g["checked_ts"] = c["ts"]
+        if is_buy:
+            if c["l"] <= g["sl"]: return "SL", g["sl"]
+            if c["h"] >= g["tp"]: return "TP", g["tp"]
+        else:
+            if c["h"] >= g["sl"]: return "SL", g["sl"]
+            if c["l"] <= g["tp"]: return "TP", g["tp"]
+    now = now if now is not None else time.time()
+    if now - g["opened_at"] >= GHOST_MAX_HOURS * 3600 and candles:
+        return "Délai", candles[-1]["c"]
+    return None
+
+def _ghost_pnl_pct(g: dict, exit_px: float) -> float:
+    move = (exit_px - g["entry"]) / g["entry"] * 100
+    return round((move if g["side"] == "buy" else -move) - GHOST_FEE_PCT, 3)
+
+def ghost_update(wb: Workbook) -> list[dict]:
+    """Résout les fantômes ouverts (1 fetch M1 par symbole). Retourne les fantômes clos."""
+    ghosts = _load_ghosts()
+    if not ghosts:
+        return []
+    closed = []
+    now = time.time()
+    for coin in {g["symbol"] for g in ghosts}:
+        group = [g for g in ghosts if g["symbol"] == coin]
+        since = min(g["checked_ts"] for g in group)
+        n = int(min(200, max(3, (now * 1000 - since) / 60000 + 2)))
+        try:
+            candles = fetch_candles(coin, INTERVAL_M1, n)
+        except Exception as e:
+            log_error(f"ghost candles {coin}: {e}")
+            continue
+        for g in group:
+            res = _ghost_resolve(g, candles, now)
+            if not res:
+                continue
+            status, exit_px = res
+            g.update(status=status, exit=exit_px, pnl_pct=_ghost_pnl_pct(g, exit_px), closed_at=now)
+            closed.append(g)
+    if closed:
+        for g in closed:
+            ghosts.remove(g)
+            record_lesson({"symbol": g["symbol"], "side": g["side"].upper(),
+                           "conditions": g["conditions"]}, g["status"], g["pnl_pct"], ghost=True)
+            try:
+                ws = wb["Fantômes"]
+                for row in ws.iter_rows(min_row=2):
+                    if row[0].value == g["id"]:
+                        row[11].value = g["status"]
+                        row[12].value = round(g["exit"], 6)
+                        row[13].value = g["pnl_pct"]
+                        row[14].value = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d %H:%M")
+                        fill = _FILLS["tp"] if g["pnl_pct"] > 0 else _FILLS["sl"]
+                        for cell in row:
+                            cell.fill = fill
+                        break
+            except Exception as e:
+                log_error(f"ghost excel close {g['symbol']}: {e}")
+            print(f"  {C.DIM}[FANTÔME {g['status']}] {g['symbol']} {g['side'].upper()} [{g['mode']}] "
+                  f"{g['reason']} → {g['pnl_pct']:+.2f}%{C.RST}")
+        _save_ghosts()
+        try:
+            _safe_save(wb)
+        except Exception as e:
+            log_error(f"ghost excel save: {e}")
+    else:
+        _save_ghosts()   # checked_ts avancé
+    return closed
+
 def run():
     print(f"\n{C.BCYN}{'═' * 60}{C.RST}")
     print(f"  {C.BOLD}BotShortTrade  –  Hyperliquid DEX{C.RST}")
@@ -1662,6 +1876,19 @@ def run():
     hb_closed  = 0   # trades fermés
     hb_best    = None  # meilleur signal brut vu sur la période
     hb_blocked: dict[str, int] = {}   # raison → nb de cycles sans scan
+    hb_g_opened = 0                   # fantômes ouverts sur la période
+    hb_g_closed: list[dict] = []      # fantômes clos sur la période
+
+    def _ghost_all(sigs: list[dict], reason_of) -> int:
+        """Ouvre un fantôme pour chaque signal (raison calculée par reason_of(sig))
+        + les candidats bloqués collectés par get_signal. Retourne le nb ouvert."""
+        n = 0
+        for sg in sigs:
+            n += ghost_open(wb, sg, reason_of(sg)) is not None
+        while _ghost_candidates:
+            c = _ghost_candidates.pop()
+            n += ghost_open(wb, c, c["ghost_reason"]) is not None
+        return n
 
     while True:
         loop_start = time.time()
@@ -1694,6 +1921,12 @@ def run():
         for pos in closed_this_loop:
             open_positions.remove(pos)
             capital_in_use = max(0.0, capital_in_use - CAPITAL_PER_TRADE)
+
+        # Mode fantôme : résolution des signaux virtuels ouverts
+        try:
+            hb_g_closed += ghost_update(wb)
+        except Exception as e:
+            log_error(f"ghost_update: {e}")
 
         # Persister l'état après chaque cycle de vérification :
         # - positions fermées : évident
@@ -1785,7 +2018,9 @@ def run():
         # Chercher un nouveau signal
         if slots_left > 0 and avail_capital >= CAPITAL_PER_TRADE and in_session and not daily_loss_hit and not regime_blocked:
             open_coins = {p["symbol"] for p in open_positions}
+            _ghost_candidates.clear()
             signals    = scan_all(open_coins)
+            raw_signals = list(signals)   # pour le mode fantôme (signaux non tradés)
             _print_scan_summary()
             hb_scans += 1
             hb_raw   += len(signals)
@@ -1798,8 +2033,9 @@ def run():
             #            SELL MOM bloqué (ne pas shorter un crash en plein BULL)
             # RANGING  → exige score ≥ 0.75 (marché sans direction claire)
             min_score = 0.75 if regime == "RANGING" else 0.45  # BULL : filtre les signaux trop faibles
+            bull_ok = signals
             if regime == "BULL":
-                signals = [s for s in signals if
+                signals = bull_ok = [s for s in signals if
                            s["signal"] == "buy" or
                            (s["signal"] == "sell" and
                             s.get("conditions", {}).get("mode") == "MR" and
@@ -1809,6 +2045,7 @@ def run():
 
             # Ouvrir jusqu'à slots_left positions si plusieurs bons signaux disponibles
             opened_this_cycle = 0
+            traded: list[dict] = []
             while signals and slots_left > 0 and avail_capital >= CAPITAL_PER_TRADE:
                 sig = best_signal(signals)
                 if not sig:
@@ -1818,6 +2055,7 @@ def run():
                 print(f"\n  {_ss}[SIGNAL] {sig['symbol']} {sig['signal'].upper()}{C.RST}  score={sig['score']:.3f}  régime={regime}")
                 try:
                     pos = place_order(sig, wb)
+                    traded.append(sig)
                     open_positions.append(pos)
                     capital_in_use += CAPITAL_PER_TRADE
                     avail_capital  -= CAPITAL_PER_TRADE
@@ -1832,14 +2070,32 @@ def run():
             hb_opened += opened_this_cycle
             if opened_this_cycle == 0:
                 print(f"  {C.DIM}Pas de signal retenu ce cycle{C.RST}")
-        elif slots_left <= 0:
-            print(f"  {C.DIM}Toutes les positions sont ouvertes — scan ignoré{C.RST}")
-            _scan_log.clear()
-        elif avail_capital < CAPITAL_PER_TRADE:
-            print(f"  {C.DIM}Capital insuffisant (${avail_capital:.2f} < ${CAPITAL_PER_TRADE:.2f}) — scan ignoré{C.RST}")
-            _scan_log.clear()
+
+            # Fantômes : tous les signaux détectés mais non tradés
+            hb_g_opened += _ghost_all(
+                [sg for sg in raw_signals if not any(sg is t for t in traded)],
+                lambda sg: ("filtre BULL" if not any(sg is b for b in bull_ok) else
+                            f"score<{min_score}" if sg["score"] < min_score else
+                            "non pris (slot/capital)"))
         else:
+            if slots_left <= 0:
+                print(f"  {C.DIM}Toutes les positions sont ouvertes — scan réel ignoré{C.RST}")
+            elif avail_capital < CAPITAL_PER_TRADE:
+                print(f"  {C.DIM}Capital insuffisant (${avail_capital:.2f} < ${CAPITAL_PER_TRADE:.2f}) — scan réel ignoré{C.RST}")
             _scan_log.clear()
+            # Scan fantôme : aucun trade possible (régime, slots, capital, perte du jour),
+            # mais on suit virtuellement les signaux pour apprendre (ex. SELL MOM en BEAR)
+            if in_session:
+                _gwhy = ("positions max" if slots_left <= 0 else
+                         "capital insuffisant" if avail_capital < CAPITAL_PER_TRADE else
+                         "perte du jour" if daily_loss_hit else f"régime {regime}")
+                _ghost_candidates.clear()
+                try:
+                    gsigs = scan_all({p["symbol"] for p in open_positions})
+                    _scan_log.clear()
+                    hb_g_opened += _ghost_all(gsigs, lambda sg: _gwhy)
+                except Exception as e:
+                    log_error(f"scan fantôme: {e}")
 
         # Afficher le résumé des leçons toutes les 10 min
         if now_min % 10 == 0:
@@ -1920,6 +2176,10 @@ def run():
                      f"[{hb_best.get('conditions', {}).get('mode', '?')}] score {hb_best['score']:.3f}"
                      if hb_best else "aucun")
             _blk = (" · ".join(f"{k} ×{v}" for k, v in hb_blocked.items())) or "—"
+            _gw  = sum(1 for g in hb_g_closed if g["pnl_pct"] > 0)
+            _gavg = (sum(g["pnl_pct"] for g in hb_g_closed) / len(hb_g_closed)) if hb_g_closed else 0.0
+            _gtxt = (f"{len(_load_ghosts())} en cours · {hb_g_opened} ouverts · {len(hb_g_closed)} clos"
+                     + (f" (✓{_gw} ✗{len(hb_g_closed) - _gw}, moy {_gavg:+.2f}%)" if hb_g_closed else ""))
             _rej = (" · ".join(f"{k} ×{v}" for k, v in
                                sorted(_reject_stats.items(), key=lambda kv: -kv[1]))) or "—"
             send_discord_alert(
@@ -1932,13 +2192,16 @@ def run():
                 f"Trades : {hb_opened} ouverts · {hb_closed} fermés\n"
                 f"Meilleur signal vu : {_best}\n"
                 f"Scans bloqués : {_blk}\n"
-                f"Rejets (1er filtre) : {_rej}",
+                f"Rejets (1er filtre) : {_rej}\n"
+                f"Fantômes : {_gtxt}",
                 color=0x2ecc71 if hb_opened else 0x95a5a6)
             hb_last = time.time()
             hb_cycles = hb_scans = hb_raw = hb_kept = hb_opened = hb_closed = 0
             hb_best = None
             hb_blocked = {}
             _reject_stats.clear()
+            hb_g_opened = 0
+            hb_g_closed = []
 
         # Régénérer le dashboard HTML à chaque cycle
         write_dashboard(wb, open_positions, balance, initial_balance,
