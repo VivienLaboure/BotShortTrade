@@ -602,6 +602,76 @@ class TestGhostCandidates(BaseTest):
         self.assertEqual(m._ghost_candidates, [])
 
 
+def _mr_sell(iv, n, last_vol5):
+    """SELL MR : M15 baissier, M5 en haut de bande avec 2 bougies rouges, M1 neutre."""
+    cs = []
+    if iv == m.INTERVAL_M15:
+        for i in range(n):
+            px = 130.0 - 0.2 * i
+            cs.append({"ts": i, "o": px + 0.05, "h": px + 0.1, "l": px - 0.1, "c": px, "v": 100.0})
+    elif iv == m.INTERVAL_M5:
+        for i in range(n - 2):
+            px = 100.0 + 0.1 * i
+            cs.append({"ts": i, "o": px - 0.05, "h": px + 0.02, "l": px - 0.07, "c": px, "v": 100.0})
+        top = cs[-1]["c"]
+        cs.append({"ts": n - 2, "o": top + 0.02, "h": top + 0.03, "l": top - 0.03, "c": top - 0.02, "v": 100.0})
+        cs.append({"ts": n - 1, "o": top - 0.02, "h": top - 0.01, "l": top - 0.06, "c": top - 0.05,
+                   "v": last_vol5})
+    else:
+        for i in range(n):
+            px = 100.0 + (0.05 if i % 2 else -0.05)
+            cs.append({"ts": i, "o": 100.0, "h": px + 0.01, "l": px - 0.01, "c": px, "v": 100.0})
+    return cs
+
+class TestGhostVolume(BaseTest):
+    def scan(self, last_vol5):
+        m._ghost_candidates.clear(); m._reject_stats.clear()
+        m._lessons_cache.clear(); m._lessons_cache_ts = 0.0
+        with mock.patch.object(m, "fetch_candles", lambda coin, iv, n, **k: _mr_sell(iv, n, last_vol5)), \
+             mock.patch.object(m, "_current_regime", "RANGING"), \
+             mock.patch.object(m, "VOL_MULTIPLIER", 1.2):
+            return m.get_signal("ETH")
+
+    def test_mr_rejete_de_justesse_par_volume_devient_fantome_mrv(self):
+        self.assertIsNone(self.scan(100.0))   # ratio 1.0 < 1.2
+        self.assertEqual(len(m._ghost_candidates), 1)
+        c = m._ghost_candidates[0]
+        self.assertEqual((c["signal"], c["conditions"]["mode"]), ("sell", "MRv"))
+        self.assertEqual(c["ghost_reason"], "MR volume ×1.00<1.2")
+        self.assertEqual(m._reject_stats, {"volume M5": 1})
+
+    def test_volume_trop_faible_pas_de_fantome(self):
+        self.assertIsNone(self.scan(70.0))    # ratio < GHOST_VOL_MIN
+        self.assertEqual(m._ghost_candidates, [])
+
+    def test_volume_suffisant_vrai_signal_mr(self):
+        sig = self.scan(300.0)
+        self.assertEqual((sig["signal"], sig["conditions"]["mode"]), ("sell", "MR"))
+        self.assertEqual(m._ghost_candidates, [])
+
+    def test_fantome_mrv_clos_sans_toucher_apprentissage(self):
+        if os.path.exists(m.GHOST_FILE):
+            os.remove(m.GHOST_FILE)
+        m._ghosts = None
+        wb = m.init_excel()
+        self.scan(100.0)
+        g = m.ghost_open(wb, m._ghost_candidates[0], m._ghost_candidates[0]["ghost_reason"])
+        later = g["checked_ts"] + 60000
+        with mock.patch.object(m, "fetch_candles",
+                               lambda coin, iv, n, **k: [_m1(later, g["entry"], g["sl"] + 1, g["entry"] - 0.01, g["entry"])]):
+            closed = m.ghost_update(wb)
+        self.assertEqual([x["status"] for x in closed], ["SL"])
+        self.assertEqual(m._load_lessons().get("buckets", {}), {})
+        self.assertEqual(wb["Fantômes"].cell(2, 5).value, "MRv")
+
+    def test_heartbeat_par_type(self):
+        closed = [{"side": "sell", "mode": "MOM", "pnl_pct": 1.0},
+                  {"side": "sell", "mode": "MOM", "pnl_pct": -0.5},
+                  {"side": "buy", "mode": "MRv", "pnl_pct": -0.3}]
+        self.assertEqual(m._ghost_by_type(closed),
+                         "BUY MRv ✓0/1 moy -0.30% · SELL MOM ✓1/2 moy +0.25%")
+
+
 # ── Boucle principale (smoke test) ───────────────────────────────────────────
 class _StopLoop(Exception):
     pass

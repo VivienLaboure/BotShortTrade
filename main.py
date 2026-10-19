@@ -71,6 +71,8 @@ GHOST_FILE      = "ghosts.json"
 GHOST_MAX_HOURS = 6.0    # un fantôme non résolu est clos au prix courant après 6h (cf. zombie)
 GHOST_FEE_PCT   = 0.09   # frais taker aller-retour estimés, déduits du P&L virtuel
 GHOST_WEIGHT    = 0.5    # poids d'un résultat fantôme vs un vrai trade dans l'apprentissage
+GHOST_VOL_MIN   = 0.8    # MR rejeté par le seul volume M5 avec ratio ≥ 0.8 → fantôme "MRv"
+                         # (mesure ce que rapporterait un VOL_MULTIPLIER plus bas ; jamais appris)
 LESSON_DECAY    = 0.97   # oubli progressif : chaque nouveau résultat × 0.97 sur l'ancien (demi-vie ≈ 23)
 
 # ── Connexion Hyperliquid ──────────────────────────────────────────────────────
@@ -643,6 +645,30 @@ def get_signal(coin: str) -> dict | None:
                                "vol_ratio": round(vol_ratio, 2),
                                "regime": _current_regime, "mode": g_mode},
                 "ghost_reason": f"{g_mode} bloqué {_current_regime}",
+            })
+
+        # MR rejeté uniquement par le volume M5 (de justesse) → fantôme "MRv" (observation seule)
+        mr_buy_nv  = (bias_up and confirm_long_mr and move_ok and vol1_ok and bars2_bull
+                      and 30 <= rsi1 <= 70 and bb_long_ok)
+        mr_sell_nv = (bias_dn and move_ok and vol1_ok and bars2_bear
+                      and 35 <= rsi1 <= 65 and bb_short_ok)
+        if (not signal and not vol_ok and vol_ratio >= GHOST_VOL_MIN
+                and (mr_buy_nv or mr_sell_nv)):
+            if mr_buy_nv:
+                g_side  = "buy"
+                g_score = ((70 - rsi1) / 40 * 0.25 + vol_ratio_capped * 0.4
+                           + (0.35 - bbp5) / 0.35 * 0.15 + 0.2)
+            else:
+                g_side  = "sell"
+                g_score = ((rsi1 - 35) / 30 * 0.25 + vol_ratio_capped * 0.4
+                           + (bbp5 - 0.65) / 0.35 * 0.15 + 0.2)
+            _ghost_candidates.append({
+                "symbol": coin, "signal": g_side, "score": round(g_score, 3), "atr_m5": atr5,
+                "price": last5,
+                "conditions": {"rsi": round(rsi1, 1), "bbp": round(bbp5, 3),
+                               "vol_ratio": round(vol_ratio, 2),
+                               "regime": _current_regime, "mode": "MRv"},
+                "ghost_reason": f"MR volume ×{vol_ratio:.2f}<{VOL_MULTIPLIER:g}",
             })
 
         if signal:
@@ -1830,6 +1856,14 @@ def _ghost_pnl_pct(g: dict, exit_px: float) -> float:
     move = (exit_px - g["entry"]) / g["entry"] * 100
     return round((move if g["side"] == "buy" else -move) - GHOST_FEE_PCT, 3)
 
+def _ghost_by_type(closed: list[dict]) -> str:
+    """Résumé heartbeat des fantômes clos par côté/mode : "SELL MOM ✓2/5 moy -0.10%"."""
+    by: dict[str, list[float]] = {}
+    for g in closed:
+        by.setdefault(f"{g['side'].upper()} {g['mode']}", []).append(g["pnl_pct"])
+    return " · ".join(f"{k} ✓{sum(p > 0 for p in v)}/{len(v)} moy {sum(v) / len(v):+.2f}%"
+                      for k, v in sorted(by.items()))
+
 def ghost_update(wb: Workbook) -> list[dict]:
     """Résout les fantômes ouverts (1 fetch M1 par symbole). Retourne les fantômes clos."""
     ghosts = _load_ghosts()
@@ -1856,8 +1890,9 @@ def ghost_update(wb: Workbook) -> list[dict]:
     if closed:
         for g in closed:
             ghosts.remove(g)
-            record_lesson({"symbol": g["symbol"], "side": g["side"].upper(),
-                           "conditions": g["conditions"]}, g["status"], g["pnl_pct"], ghost=True)
+            if g["mode"] != "MRv":   # MRv = étude du filtre volume, ne doit pas biaiser le vrai MR
+                record_lesson({"symbol": g["symbol"], "side": g["side"].upper(),
+                               "conditions": g["conditions"]}, g["status"], g["pnl_pct"], ghost=True)
             try:
                 ws = wb["Fantômes"]
                 for row in ws.iter_rows(min_row=2):
@@ -2260,6 +2295,8 @@ def run():
             _gavg = (sum(g["pnl_pct"] for g in hb_g_closed) / len(hb_g_closed)) if hb_g_closed else 0.0
             _gtxt = (f"{len(_load_ghosts())} en cours · {hb_g_opened} ouverts · {len(hb_g_closed)} clos"
                      + (f" (✓{_gw} ✗{len(hb_g_closed) - _gw}, moy {_gavg:+.2f}%)" if hb_g_closed else ""))
+            if hb_g_closed:
+                _gtxt += "\nFantômes par type : " + _ghost_by_type(hb_g_closed)
             _rej = (" · ".join(f"{k} ×{v}" for k, v in
                                sorted(_reject_stats.items(), key=lambda kv: -kv[1]))) or "—"
             send_discord_alert(
