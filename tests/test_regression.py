@@ -221,6 +221,18 @@ class TestEquity(BaseTest):
         spot = {"balances": [{"coin": "USDC", "total": "50", "hold": "0"}]}
         self.assertAlmostEqual(self.eq(perp, spot), 150.0)
 
+    def test_spot_indisponible_leve_au_lieu_de_zero(self):
+        """25/10 : 504 sur spot_user_state → équité lue $0.00 → faux flash crash -100 %."""
+        info = FakeInfo(spot={})
+        info.spot_user_state = mock.Mock(side_effect=Exception("(504, 'Gateway Timeout')"))
+        perp = {"crossMarginSummary": {"accountValue": "0.0", "totalMarginUsed": "0.0"}}
+        with mock.patch.object(m, "info", info), self.assertRaises(Exception):
+            m.get_equity(perp)
+
+    def test_user_state_vide_leve(self):
+        with mock.patch.object(m, "info", FakeInfo(spot={"balances": []})), self.assertRaises(ValueError):
+            m.get_equity({})
+
 
 # ── P&L : frais d'ouverture ──────────────────────────────────────────────────
 class TestFees(BaseTest):

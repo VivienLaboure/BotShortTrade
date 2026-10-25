@@ -711,8 +711,12 @@ def get_signal(coin: str) -> dict | None:
 
 # ── Balance (affichage uniquement) ───────────────────────────────────────────
 def get_equity(cached_state: dict | None = None) -> float:
+    """Lève une exception si l'API ne répond pas (502/504…) : l'appelant garde alors le
+    solde précédent. Ne jamais remplacer une partie manquante par 0 (faux "-100 %")."""
     user_state = cached_state if cached_state is not None else info.user_state(WALLET_ADDRESS)
-    cross        = user_state.get("crossMarginSummary") or user_state.get("marginSummary") or {}
+    cross        = user_state.get("crossMarginSummary") or user_state.get("marginSummary")
+    if not cross:
+        raise ValueError("user_state sans marginSummary")
     margin_used  = float(cross.get("totalMarginUsed") or 0)
     acv          = float(cross.get("accountValue") or 0)   # perp : marge engagée + P&L latent (+ libre)
 
@@ -720,15 +724,12 @@ def get_equity(cached_state: dict | None = None) -> float:
     # contient déjà la marge des positions (comptée aussi dans accountValue) → on retire
     # ce recouvrement pour ne pas la compter deux fois. Compte classique : hold ≈ 0.
     spot_usdc = spot_hold = 0.0
-    try:
-        spot_state = info.spot_user_state(WALLET_ADDRESS)
-        for b in spot_state.get("balances", []):
-            if b["coin"] == "USDC":
-                spot_usdc = float(b.get("total") or 0)
-                spot_hold = float(b.get("hold") or 0)
-                break
-    except Exception:
-        pass
+    spot_state = info.spot_user_state(WALLET_ADDRESS)   # en échec → exception propagée
+    for b in spot_state.get("balances", []):
+        if b["coin"] == "USDC":
+            spot_usdc = float(b.get("total") or 0)
+            spot_hold = float(b.get("hold") or 0)
+            break
 
     total = acv + spot_usdc - min(spot_hold, margin_used)
     return total if total > 0 else 0.0
@@ -2046,8 +2047,8 @@ def run():
         # Balance : si des positions ont fermé ce cycle, user_state est stale → refetch
         try:
             balance = get_equity(None if closed_this_loop else _user_state)
-        except Exception:
-            pass
+        except Exception as e:
+            log_error(f"équité (solde précédent conservé) : {e}")
 
         # ── Auto-recalibrage du capital ───────────────────────────────────────────
         # Recalibrer si le solde réel s'écarte significativement de MAX_LIQUIDITY
