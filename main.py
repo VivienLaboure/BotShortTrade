@@ -734,10 +734,18 @@ def get_equity(cached_state: dict | None = None) -> float:
     total = acv + spot_usdc - min(spot_hold, margin_used)
     return total if total > 0 else 0.0
 
-def get_unrealized_pnl(cached_state: dict | None = None) -> float:
+def account_coins(user_state: dict | None) -> set[str]:
+    """Coins ayant une position ouverte sur le compte (nos trades ET ceux de BotCopyTrade,
+    qui partage le wallet)."""
+    return {ap["position"]["coin"] for ap in (user_state or {}).get("assetPositions", [])
+            if abs(float(ap["position"].get("szi") or 0)) > 0}
+
+def get_unrealized_pnl(cached_state: dict | None = None, coins: set[str] | None = None) -> float:
+    """P&L latent ; coins = nos positions seulement (exclut celles de BotCopyTrade)."""
     try:
         state = cached_state if cached_state is not None else info.user_state(WALLET_ADDRESS)
-        return sum(float(p["position"]["unrealizedPnl"]) for p in state.get("assetPositions", []))
+        return sum(float(p["position"]["unrealizedPnl"]) for p in state.get("assetPositions", [])
+                   if coins is None or p["position"]["coin"] in coins)
     except Exception:
         return 0.0
 
@@ -1351,6 +1359,18 @@ def recover_open_positions() -> tuple[list, float]:
         # Tenter d'enrichir avec l'état sauvegardé (sl_oid, atr réel, sl/tp précis)
         saved = saved_state.get(coin, {})
         enriched = saved and saved.get("side") == side
+        if not enriched:
+            # Wallet partagé avec BotCopyTrade : une position absente de notre état
+            # n'est pas à nous → ne pas l'adopter (sinon SL posé / fermeture zombie sur la copie)
+            print(f"  {C.BYLW}[REPRISE]{C.RST} {coin} {side} @ ${entry:.6g} inconnue de "
+                  f"{STATE_FILE} → ignorée (BotCopyTrade ?)")
+            send_discord_alert(
+                "⚠️ Position non reprise",
+                f"{coin} {side} @ {entry:.6g} est ouverte sur le compte mais absente de "
+                f"{STATE_FILE} : laissée à BotCopyTrade. Si elle appartient à BotShortTrade, "
+                f"elle n'est plus suivie (son SL/TP sur Hyperliquid reste actif).",
+                color=0xf39c12)
+            continue
         if enriched:
             sl       = saved.get("sl",       (entry - ATR_SL_MULT * entry * 0.002) if side == "BUY" else (entry + ATR_SL_MULT * entry * 0.002))
             tp       = saved.get("tp",       (entry + ATR_TP_MULT * entry * 0.002) if side == "BUY" else (entry - ATR_TP_MULT * entry * 0.002))
@@ -2082,7 +2102,7 @@ def run():
 
         pnl_total, pnl_week = calc_portfolio_pnl(wb)
         pnl_today  = calc_daily_pnl(wb)   # P&L du jour calculé ici → réutilisé pour le filtre
-        unrealized = get_unrealized_pnl(_user_state)
+        unrealized = get_unrealized_pnl(_user_state, {p["symbol"] for p in open_positions})
         net_pnl = pnl_total + unrealized
         net_pct = (net_pnl / initial_balance * 100) if initial_balance > 0 else 0.0
         _dispo_c = C.BRED if avail_capital <= 0 else (C.BYLW if avail_capital < CAPITAL_PER_TRADE * 2 else C.WHT)
@@ -2127,7 +2147,10 @@ def run():
 
         # Chercher un nouveau signal
         if slots_left > 0 and avail_capital >= CAPITAL_PER_TRADE and in_session and not daily_loss_hit and not regime_blocked:
-            open_coins = {p["symbol"] for p in open_positions}
+            # + coins tenus par BotCopyTrade : 2 positions sur un coin fusionneraient
+            #   (user_state illisible → coins inconnus → aucun scan réel ce cycle)
+            open_coins = {p["symbol"] for p in open_positions} | (
+                account_coins(_user_state) if _user_state is not None else set(WATCHLIST))
             _ghost_candidates.clear()
             signals    = scan_all(open_coins)
             raw_signals = list(signals)   # pour le mode fantôme (signaux non tradés)

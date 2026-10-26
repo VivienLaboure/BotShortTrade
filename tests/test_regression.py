@@ -235,6 +235,31 @@ class TestEquity(BaseTest):
 
 
 # ── P&L : frais d'ouverture ──────────────────────────────────────────────────
+class TestSharedWallet(BaseTest):
+    POS = [{"position": {"coin": "ETH", "szi": "0.01", "entryPx": "2000", "unrealizedPnl": "1.5"}},
+           {"position": {"coin": "SOL", "szi": "-0.5", "entryPx": "100", "unrealizedPnl": "-3"}},
+           {"position": {"coin": "XRP", "szi": "0", "entryPx": "1", "unrealizedPnl": "0"}}]
+
+    def test_account_coins(self):
+        self.assertEqual(m.account_coins({"assetPositions": self.POS}), {"ETH", "SOL"})
+        self.assertEqual(m.account_coins(None), set())
+
+    def test_pnl_latent_limite_a_nos_positions(self):
+        st = {"assetPositions": self.POS}
+        self.assertAlmostEqual(m.get_unrealized_pnl(st, {"ETH"}), 1.5)
+        self.assertAlmostEqual(m.get_unrealized_pnl(st), -1.5)
+
+    def test_reprise_n_adopte_que_nos_positions(self):
+        m.save_positions_state([{"id": "o1", "symbol": "ETH", "side": "BUY", "entry": 2000,
+                                 "qty": 0.01, "sl": 1990, "tp": 2030, "sl_oid": 7, "atr": 5,
+                                 "open_fee": 0.01, "opened_at": 1.0, "conditions": {}}])
+        with mock.patch.object(m, "info", FakeInfo(perp={"assetPositions": self.POS})):
+            rec, _ = m.recover_open_positions()
+        self.assertEqual([p["symbol"] for p in rec], ["ETH"])
+        self.assertEqual(rec[0]["sl_oid"], 7)
+        self.assertEqual(self.titles(), ["⚠️ Position non reprise"])
+
+
 class TestFees(BaseTest):
     def test_zombie_pnl_deduit_frais_ouverture_estimes(self):
         fills = [{"coin": "ETH", "dir": "Close Long", "time": 1, "fee": "0.04", "closedPnl": "1.00"}]
@@ -692,7 +717,7 @@ class LoopInfo(FakeInfo):
     def meta(self): return {"universe": []}
 
 class TestRunLoop(BaseTest):
-    def run_loop(self, daily_chg):
+    def run_loop(self, daily_chg, asset_positions=None, get_signal=None):
         if os.path.exists(m.GHOST_FILE):
             os.remove(m.GHOST_FILE)
         m._ghosts = None
@@ -701,7 +726,8 @@ class TestRunLoop(BaseTest):
             del m.run._regime_cache
         info = LoopInfo(
             mids={c: "100" for c in m.WATCHLIST},
-            perp={"assetPositions": [], "crossMarginSummary": {"accountValue": "0", "totalMarginUsed": "0"}},
+            perp={"assetPositions": asset_positions or [],
+                  "crossMarginSummary": {"accountValue": "0", "totalMarginUsed": "0"}},
             spot={"balances": [{"coin": "USDC", "total": "111.18", "hold": "0"}]})
         ex = FakeExchange()
         cycles = []
@@ -715,10 +741,26 @@ class TestRunLoop(BaseTest):
         with mock.patch.object(m, "info", info), mock.patch.object(m, "exchange", ex), \
              mock.patch.object(m, "fetch_candles", fc), \
              mock.patch.object(m.time, "sleep", fake_sleep), \
-             mock.patch.object(m, "HEARTBEAT_HOURS", 1e-9):
+             mock.patch.object(m, "HEARTBEAT_HOURS", 1e-9), \
+             mock.patch.object(m, "get_signal", get_signal or m.get_signal):
             with self.assertRaises(_StopLoop):
                 m.run()
         return ex, m._load_ghosts()
+
+    def test_wallet_partage_position_copytrade_ni_adoptee_ni_rescannee(self):
+        """SOL ouvert par BotCopyTrade (absent de bot_state.json) : pas repris au démarrage
+        (aucun SL posé, pas de fermeture zombie) et SOL exclu du scan réel."""
+        scanned = []
+        def gs(coin):
+            scanned.append(coin)
+            return None
+        sol = {"position": {"coin": "SOL", "szi": "-0.5", "entryPx": "100", "unrealizedPnl": "-3"}}
+        ex, _ = self.run_loop(-2, asset_positions=[sol], get_signal=gs)
+        self.assertEqual(ex.orders, [])
+        self.assertIn("⚠️ Position non reprise", self.titles())
+        self.assertTrue(scanned)
+        self.assertNotIn("SOL", scanned)
+        self.assertIn("ETH", scanned)
 
     def test_bear_scan_fantome_et_heartbeat(self):
         """2 cycles complets de run() en BEAR : aucun ordre réel, SELL MOM suivi en fantôme,
