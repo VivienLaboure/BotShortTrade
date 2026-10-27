@@ -89,6 +89,8 @@ exchange       = Exchange(_account, API_URL)
 print(f"  {C.DIM}Wallet : {WALLET_ADDRESS}{C.RST}")
 _net_color = C.BYLW if HL_TESTNET else C.BRED
 print(f"  Réseau : {_net_color}{'TESTNET' if HL_TESTNET else 'MAINNET'}{C.RST}")
+if GHOST_ONLY:
+    print(f"  Mode   : {C.BYLW}FANTÔME SEUL — aucun ordre réel (GHOST_ONLY=1){C.RST}")
 
 # ── Symboles ───────────────────────────────────────────────────────────────────
 WATCHLIST = ["ETH", "LTC", "DOGE", "XRP", "SOL"]   # BTC retiré : 0W/15L −$12.83 historique
