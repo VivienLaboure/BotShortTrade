@@ -49,6 +49,10 @@ CAPITAL_PCT       = float(os.getenv("CAPITAL_PCT", 0.10))
 LEVERAGE          = int(os.getenv("LEVERAGE", 5))
 MIN_MOVE_PCT      = float(os.getenv("MIN_MOVE_PCT", 0.0002))
 VOL_MULTIPLIER    = float(os.getenv("VOL_MULTIPLIER", 1.0))
+# Mode fantôme seul : aucun ordre réel, les signaux qui auraient été tradés sont suivis en
+# fantôme (backtest d'octobre 2026 : aucun avantage mesurable sur le hasard après frais).
+# Les positions déjà ouvertes restent gérées (SL, trailing, zombie).
+GHOST_ONLY        = os.getenv("GHOST_ONLY", "0") == "1"
 MAX_TRADES        = int(os.getenv("MAX_TRADES", 0))
 MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", 3.0))   # % du capital
 SESSION_START_UTC  = int(os.getenv("SESSION_START_UTC", 0))         # heure UTC (0 = minuit)
@@ -1985,7 +1989,8 @@ def run():
 
     send_discord_alert(
         "🚀 Bot démarré",
-        f"Réseau : **{'TESTNET' if HL_TESTNET else 'MAINNET'}**\n"
+        f"Réseau : **{'TESTNET' if HL_TESTNET else 'MAINNET'}**"
+        + (" · **mode fantôme seul (aucun ordre réel)**" if GHOST_ONLY else "") + "\n"
         f"Équité : **${balance:.2f}** · par trade ${CAPITAL_PER_TRADE:.2f} (levier ×{LEVERAGE})\n"
         f"Positions reprises : {len(open_positions)}\n"
         f"Watchlist : {', '.join(WATCHLIST)}",
@@ -2175,6 +2180,9 @@ def run():
                             s["score"] >= 0.75)]
             signals = [s for s in signals if s["score"] >= min_score]
             hb_kept += len(signals)
+            would_trade: list[dict] = []
+            if GHOST_ONLY:   # aucun ordre réel : les signaux retenus deviennent des fantômes
+                would_trade, signals = signals, []
 
             # Ouvrir jusqu'à slots_left positions si plusieurs bons signaux disponibles
             opened_this_cycle = 0
@@ -2207,7 +2215,8 @@ def run():
             # Fantômes : tous les signaux détectés mais non tradés
             hb_g_opened += _ghost_all(
                 [sg for sg in raw_signals if not any(sg is t for t in traded)],
-                lambda sg: ("filtre BULL" if not any(sg is b for b in bull_ok) else
+                lambda sg: ("fantôme seul (aurait été tradé)" if any(sg is w for w in would_trade) else
+                            "filtre BULL" if not any(sg is b for b in bull_ok) else
                             f"score<{min_score}" if sg["score"] < min_score else
                             "non pris (slot/capital)"))
         else:
@@ -2325,7 +2334,8 @@ def run():
                                sorted(_reject_stats.items(), key=lambda kv: -kv[1]))) or "—"
             send_discord_alert(
                 f"💓 Bot actif — résumé {HEARTBEAT_HOURS:g}h",
-                f"Régime : **{regime}** (BTC {btc_chg:+.1f}% · ETH {eth_chg:+.1f}% 7j)\n"
+                ("Mode : **fantôme seul** (aucun ordre réel)\n" if GHOST_ONLY else "")
+                + f"Régime : **{regime}** (BTC {btc_chg:+.1f}% · ETH {eth_chg:+.1f}% 7j)\n"
                 f"Équité : **${balance:.2f}** · positions ouvertes : {len(open_positions)}\n"
                 f"P&L aujourd'hui : ${pnl_today:+.2f}\n"
                 f"Cycles : {hb_cycles} · scans : {hb_scans}\n"

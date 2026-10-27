@@ -747,6 +747,32 @@ class TestRunLoop(BaseTest):
                 m.run()
         return ex, m._load_ghosts()
 
+    def _signal_eth(self):
+        """get_signal factice : BUY MR score 0.9 sur ETH (passe tous les filtres en RANGING)."""
+        def gs(coin):
+            if coin != "ETH":
+                return None
+            return {"symbol": "ETH", "signal": "buy", "score": 0.9, "atr_m5": 5.0, "price": 100.0,
+                    "conditions": {"mode": "MR", "regime": "RANGING", "rsi": 50, "bbp": 0.3,
+                                   "vol_ratio": 1.5}}
+        return gs
+
+    def test_signal_retenu_ouvre_un_ordre_en_mode_normal(self):
+        """Témoin du test suivant : sans GHOST_ONLY le même signal passe un ordre (SL + TP)."""
+        with mock.patch.object(m, "GHOST_ONLY", False):
+            ex, _ = self.run_loop(-2, get_signal=self._signal_eth())
+        self.assertTrue(ex.orders)
+
+    def test_mode_fantome_seul_aucun_ordre(self):
+        with mock.patch.object(m, "GHOST_ONLY", True):
+            ex, ghosts = self.run_loop(-2, get_signal=self._signal_eth())
+        self.assertEqual(ex.orders, [])
+        self.assertEqual([(g["symbol"], g["reason"]) for g in ghosts],
+                         [("ETH", "fantôme seul (aurait été tradé)")])
+        self.assertIn("fantôme seul", dict(self.alerts)["🚀 Bot démarré"])
+        hb = [d for t, d in self.alerts if "résumé" in t]
+        self.assertTrue(hb and hb[0].startswith("Mode : **fantôme seul**"))
+
     def test_wallet_partage_position_copytrade_ni_adoptee_ni_rescannee(self):
         """SOL ouvert par BotCopyTrade (absent de bot_state.json) : pas repris au démarrage
         (aucun SL posé, pas de fermeture zombie) et SOL exclu du scan réel."""
