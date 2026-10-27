@@ -92,4 +92,19 @@ def m15_pullback(coin, fetch):
 m15_pullback.STEP_MIN = 15
 
 
-STRATEGIES = {"h1_trend": h1_trend, "h1_meanrev": h1_meanrev, "m15_pullback": m15_pullback}
+def regime_follow(coin, fetch, regime):
+    """Suit le régime 7 j du bot (BTC/ETH) : achat en BULL, vente en BEAR, toutes les 4 h.
+    Teste si le régime prédit la direction des jours suivants (momentum)."""
+    if regime not in ("BULL", "BEAR"):
+        return None
+    cs = fetch(coin, "1h", 30)
+    if len(cs) < 15:
+        return None
+    return {"signal": "buy" if regime == "BULL" else "sell", "mode": "REG", "score": 1.0,
+            "atr": _atr(cs)}
+regime_follow.STEP_MIN = 240
+regime_follow.NEEDS_REGIME = True
+
+
+STRATEGIES = {"h1_trend": h1_trend, "h1_meanrev": h1_meanrev, "m15_pullback": m15_pullback,
+              "regime_follow": regime_follow}

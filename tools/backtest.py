@@ -2,8 +2,9 @@
 """
 Backtest — BotShortTrade
 ========================
-Rejoue une stratégie minute par minute sur l'historique Bybit (données publiques)
-et simule les trades sur les bougies M1, frais compris.
+Rejoue une stratégie sur l'historique Bybit (données publiques) et simule les trades
+sur les bougies de base (M1 par défaut, M5 avec --base 5m pour les longues périodes),
+frais compris.
 
 Par défaut la stratégie est la VRAIE fonction main.get_signal (mêmes indicateurs,
 mêmes seuils) : un résultat ici = ce que le bot aurait fait, hors filtre de régime
@@ -13,6 +14,7 @@ Usage :
     python3 tools/backtest.py --days 90                       # télécharge (cache) + rapport
     python3 tools/backtest.py --days 30 --sl 4 --tp 4 --fee 0.0576
     python3 tools/backtest.py --strategy h1_trend --max-hours 72
+    python3 tools/backtest.py --base 5m --days 730 --strategy regime_follow --sl 3 --tp 6 --max-hours 72
     python3 tools/backtest.py --list                          # stratégies disponibles
 
 Sécurité : main.py est importé comme dans tests/ (SDK Hyperliquid remplacé par des
@@ -20,11 +22,13 @@ stubs, clé factice, .env jamais lu, dossier temporaire) → aucun ordre, aucun 
 Seul réseau : téléchargement des bougies publiques Bybit (mis en cache dans backtest_data/).
 
 Limites (à garder en tête avant de conclure) :
-  - entrée à l'ouverture de la bougie M1 suivant le signal, sans slippage ;
-  - SL prioritaire si SL et TP sont touchés dans la même bougie M1 (prudent) ;
+  - entrée à l'ouverture de la bougie de base suivant le signal, sans slippage ;
+  - SL prioritaire si SL et TP sont touchés dans la même bougie de base (prudent) ;
+  - --base 5m : stratégies sans M1 seulement (pas "bot"), SL/TP résolus sur M5 ;
   - une position par coin à la fois, pas de limite globale MAX_TRADES ;
   - break-even / trailing simplifiés (déclenchement à 1.5×ATR, trailing à 1×ATR) ;
-  - un résultat n'est crédible que si t ≥ 2 ET s'il bat le témoin « entrées au hasard ».
+  - un résultat n'est crédible que si t ≥ 2 ET s'il bat les témoins : « hasard » (entrées
+    tirées au hasard dans le même régime) et « inversé » (mêmes entrées, sens opposé).
 """
 from __future__ import annotations
 
@@ -87,14 +91,14 @@ def _get(url: str) -> dict:
         time.sleep(1 + attempt)
     raise RuntimeError(f"Bybit injoignable : {url}")
 
-def download(days: int, refresh: bool = False, cache_dir: str = CACHE_DIR) -> None:
-    """Bougies M1 des COINS + BTC (régime), et D1 BTC/ETH. Cache réutilisé s'il couvre
-    la période et date de moins de 6 h (sauf refresh)."""
+def download(days: int, refresh: bool = False, cache_dir: str = CACHE_DIR, base: str = "1m") -> None:
+    """Bougies de base (1m ou 5m) des COINS, et D1 BTC/ETH (régime). Cache réutilisé
+    s'il couvre la période et date de moins de 6 h (sauf refresh)."""
     os.makedirs(cache_dir, exist_ok=True)
     end   = int(time.time() // 60 * 60_000)
     start = end - days * 86_400_000
-    for coin in COINS + ["BTC"]:
-        path = os.path.join(cache_dir, f"{coin}_1m.json")
+    for coin in COINS:
+        path = os.path.join(cache_dir, f"{coin}_{base}.json")
         if not refresh and os.path.exists(path) and time.time() - os.path.getmtime(path) < 6 * 3600:
             with open(path) as f:
                 first = json.load(f)[0][0]
@@ -102,7 +106,7 @@ def download(days: int, refresh: bool = False, cache_dir: str = CACHE_DIR) -> No
                 continue
         rows, cur = {}, end
         while cur > start:
-            d = _get(f"{BYBIT}?category=linear&symbol={coin}USDT&interval=1&limit=1000&end={cur}")
+            d = _get(f"{BYBIT}?category=linear&symbol={coin}USDT&interval={base[:-1]}&limit=1000&end={cur}")
             lst = d["result"]["list"]
             if not lst:
                 break
@@ -112,15 +116,15 @@ def download(days: int, refresh: bool = False, cache_dir: str = CACHE_DIR) -> No
             time.sleep(0.12)
         with open(path, "w") as f:
             json.dump([[k] + rows[k] for k in sorted(rows) if k >= start], f)
-        print(f"  {coin} : {len(rows)} bougies M1", file=sys.stderr)
+        print(f"  {coin} : {len(rows)} bougies {base}", file=sys.stderr)
     for coin in ("BTC", "ETH"):
         d = _get(f"{BYBIT}?category=linear&symbol={coin}USDT&interval=D&limit={min(1000, days + 30)}")
         with open(os.path.join(cache_dir, f"{coin}_1d.json"), "w") as f:
             json.dump(sorted([int(r[0]), float(r[4])] for r in d["result"]["list"]), f)
 
-def agg(m1: list[dict], minutes: int) -> list[dict]:
-    """Agrège des bougies M1 en bougies de `minutes` (seules les bougies complètes)."""
-    out, ms, cur = [], minutes * 60_000, None
+def agg(m1: list[dict], minutes: int, base_min: int = 1) -> list[dict]:
+    """Agrège des bougies de `base_min` minutes en bougies de `minutes` (complètes seulement)."""
+    out, ms, cur, need = [], minutes * 60_000, None, minutes // base_min
     for x in m1:
         b = x["ts"] // ms * ms
         if cur is None or cur["ts"] != b:
@@ -132,24 +136,34 @@ def agg(m1: list[dict], minutes: int) -> list[dict]:
             cur["c"] = x["c"]; cur["v"] += x["v"]; cur["_n"] += 1
     if cur:
         out.append(cur)
-    return [c for c in out if c["_n"] == minutes]
+    return [c for c in out if c["_n"] == need]
 
-def load(days: int | None = None, cache_dir: str = CACHE_DIR) -> tuple[dict, dict]:
+def make_series(candles: list[dict], base: str = "1m") -> dict:
+    """{intervalle: bougies} à partir des bougies de base ; "base" = série de simulation."""
+    bm = SPAN_MS[base] // 60_000
+    d = {base: candles}
+    for iv in ("5m", "15m", "1h"):
+        if SPAN_MS[iv] > SPAN_MS[base]:
+            d[iv] = agg(candles, SPAN_MS[iv] // 60_000, bm)
+    for iv in list(d):
+        d[iv + "_ts"] = [x["ts"] for x in d[iv]]
+    d["base"], d["base_ts"], d["base_iv"] = d[base], d[base + "_ts"], base
+    return d
+
+def load(days: int | None = None, cache_dir: str = CACHE_DIR, base: str = "1m") -> tuple[dict, dict]:
     data = {}
     for coin in COINS:
-        with open(os.path.join(cache_dir, f"{coin}_1m.json")) as f:
+        with open(os.path.join(cache_dir, f"{coin}_{base}.json")) as f:
             raw = json.load(f)
         if days:
             raw = [r for r in raw if r[0] >= raw[-1][0] - days * 86_400_000]
-        m1 = [{"ts": r[0], "o": r[1], "h": r[2], "l": r[3], "c": r[4], "v": r[5]} for r in raw]
-        d = {"1m": m1, "5m": agg(m1, 5), "15m": agg(m1, 15), "1h": agg(m1, 60)}
-        for iv in list(d):
-            d[iv + "_ts"] = [x["ts"] for x in d[iv]]
-        data[coin] = d
+        data[coin] = make_series([{"ts": r[0], "o": r[1], "h": r[2], "l": r[3], "c": r[4], "v": r[5]}
+                                  for r in raw], base)
     daily = {}
     for coin in ("BTC", "ETH"):
         with open(os.path.join(cache_dir, f"{coin}_1d.json")) as f:
             daily[coin] = [tuple(x) for x in json.load(f)]
+        daily[coin + "_ts"] = [ts for ts, _ in daily[coin]]
     return data, daily
 
 def window(data: dict, coin: str, iv: str, T: int, n: int) -> list[dict]:
@@ -162,7 +176,9 @@ def regime_at(daily: dict, T: int) -> str:
     """Même règle que main.get_market_regime, sur les bougies D1 closes avant T."""
     closes, chg = {}, {}
     for c in ("BTC", "ETH"):
-        d = [px for ts, px in daily[c] if ts + 86_400_000 <= T][-8:]
+        tss = daily.get(c + "_ts") or [ts for ts, _ in daily[c]]
+        i = bisect.bisect_right(tss, T - 86_400_000)          # bougies D1 closes avant T
+        d = [px for _, px in daily[c][max(0, i - 8):i]]
         if len(d) < 8:
             return "RANGING"
         closes[c], chg[c] = d, (d[-1] - d[0]) / d[0] * 100
@@ -182,6 +198,7 @@ def regime_at(daily: dict, T: int) -> str:
 #   {"signal": "buy"|"sell", "mode": str, "score": float, "atr": unité de stop}
 # fetch(coin, interval, n) renvoie les n dernières bougies closes ("1m","5m","15m","1h").
 # Attribut STEP_MIN : fréquence d'évaluation en minutes.
+# Attribut NEEDS_REGIME : la fonction reçoit un 3e argument, le régime courant du bot.
 def bot_strategy(bot):
     """La vraie stratégie du bot (main.get_signal), MOM et BBO autorisés quel que soit le régime."""
     def fn(coin, fetch):
@@ -210,9 +227,10 @@ def _strategies(bot) -> dict:
 def scan(data: dict, daily: dict, strategy, bot=None) -> list[dict]:
     """Évalue la stratégie à chaque pas de temps. Retourne les signaux bruts."""
     step = getattr(strategy, "STEP_MIN", 1)
-    t0 = data[COINS[0]]["1m"][0]["ts"] + 17 * 3_600_000   # chauffe : 50 bougies M15 + marge
+    needs_reg = getattr(strategy, "NEEDS_REGIME", False)
+    t0 = data[COINS[0]]["base"][0]["ts"] + 60 * 3_600_000   # chauffe : 230 M15 / 80 H1
     t0 -= t0 % (step * 60_000)
-    t1 = data[COINS[0]]["1m"][-1]["ts"]
+    t1 = data[COINS[0]]["base"][-1]["ts"]
     sigs, cur = [], {}
     fetch = lambda c, iv, n: window(data, c, iv, cur["T"], n)
     patches = []
@@ -226,9 +244,9 @@ def scan(data: dict, daily: dict, strategy, bot=None) -> list[dict]:
         T = t0
         while T < t1:
             cur["T"] = T
-            reg = None
+            reg = regime_at(daily, T) if needs_reg else None
             for c in COINS:
-                s = strategy(c, fetch)
+                s = strategy(c, fetch, reg) if needs_reg else strategy(c, fetch)
                 if s:
                     reg = reg or regime_at(daily, T)
                     sigs.append({**s, "symbol": c, "T": T, "regime": reg})
@@ -245,7 +263,7 @@ def simulate(data: dict, sigs: list[dict], sl_mult=1.5, tp_mult=4.0, fee_pct=FEE
         c = s["symbol"]
         if busy.get(c, 0) > s["T"]:
             continue
-        m1, ts = data[c]["1m"], data[c]["1m_ts"]
+        m1, ts = data[c]["base"], data[c]["base_ts"]
         i = bisect.bisect_left(ts, s["T"])
         if i >= len(m1) or s["atr"] <= 0:
             continue
@@ -270,7 +288,7 @@ def simulate(data: dict, sigs: list[dict], sl_mult=1.5, tp_mult=4.0, fee_pct=FEE
                     sl = sgn * max(sgn * sl, sgn * entry * (1 + sgn * 0.001)); protected = True
         if out is None:
             out = m1[-1]["c"]
-        busy[c] = m1[j]["ts"] + 60_000
+        busy[c] = m1[j]["ts"] + SPAN_MS[data[c]["base_iv"]]
         trades.append({"symbol": c, "signal": s["signal"], "mode": s.get("mode", "?"),
                        "regime": s.get("regime", "?"), "score": s.get("score", 0.0), "T": s["T"],
                        "pnl": sgn * (out - entry) / entry * 100 - fee_pct, "how": how,
@@ -278,22 +296,42 @@ def simulate(data: dict, sigs: list[dict], sl_mult=1.5, tp_mult=4.0, fee_pct=FEE
                        "dur_min": (m1[j]["ts"] - s["T"]) / 60_000})
     return trades
 
-def random_control(data: dict, sigs: list[dict], seed: int = 1, **sim) -> list[dict]:
-    """Témoin : mêmes côtés et même unité de stop relative, mais coin et instant tirés au
-    hasard. Si la stratégie ne le bat pas, son résultat vient du marché, pas du signal."""
+def _hours_by_regime(data: dict, daily: dict) -> dict[str, list[int]]:
+    base = data[COINS[0]]["base"]
+    t0 = base[min(len(base) - 1, len(base) // 50)]["ts"] // 3_600_000 * 3_600_000
+    t1 = base[max(0, len(base) - len(base) // 100 - 1)]["ts"]
+    out: dict[str, list[int]] = {}
+    for T in range(t0, t1, 3_600_000):
+        out.setdefault(regime_at(daily, T) if daily else "?", []).append(T)
+    return out
+
+def random_control(data: dict, sigs: list[dict], seed: int = 1, daily: dict | None = None,
+                   **sim) -> list[dict]:
+    """Témoin « hasard » : mêmes côtés et même unité de stop relative, mais coin et instant
+    tirés au hasard — dans des heures du MÊME régime que le signal si daily est fourni.
+    Si la stratégie ne le bat pas, son résultat vient du marché, pas du signal."""
     rnd = random.Random(seed)
-    m1 = data[COINS[0]]["1m"]
-    t0, t1 = m1[min(len(m1) - 1, 1500)]["ts"], m1[max(0, len(m1) - 500)]["ts"]
+    hours = _hours_by_regime(data, daily)
+    every = [T for v in hours.values() for T in v]
+    iv = data[COINS[0]]["base_iv"]; span = SPAN_MS[iv]
     out = []
     for s in sigs:
         c = rnd.choice(COINS)
-        T = rnd.randrange(t0, t1) // 60_000 * 60_000
-        px_s = window(data, s["symbol"], "1m", s["T"] + 60_000, 1)
-        px_c = window(data, c, "1m", T + 60_000, 1)
+        pool = hours.get(s.get("regime"), every) if daily else every
+        T = rnd.choice(pool or every) + rnd.randrange(60) * 60_000
+        T -= T % span
+        px_s = window(data, s["symbol"], iv, s["T"] + span, 1)
+        px_c = window(data, c, iv, T + span, 1)
         if not px_s or not px_c:
             continue
         out.append({**s, "symbol": c, "T": T, "atr": s["atr"] / px_s[0]["c"] * px_c[0]["c"]})
     return simulate(data, out, **sim)
+
+def inverse_control(data: dict, sigs: list[dict], **sim) -> list[dict]:
+    """Témoin « inversé » : mêmes entrées, sens opposé. Une stratégie qui devine vraiment
+    la direction doit faire nettement mieux que son inverse."""
+    flip = {"buy": "sell", "sell": "buy"}
+    return simulate(data, [{**s, "signal": flip[s["signal"]]} for s in sigs], **sim)
 
 def summary(trades: list[dict]) -> dict:
     p = [t["pnl"] for t in trades]
@@ -307,9 +345,9 @@ def _fmt(s: dict) -> str:
     return (f"n={s['n']:4}  WR={s['wr']:3.0f}%  moy={s['mean']:+.3f}%  t={s['t']:+.1f}"
             if s["n"] else "n=   0")
 
-def report(data: dict, sigs: list[dict], **sim) -> str:
-    """Rapport par mode/côté : 30 j complets, chaque moitié, et témoin aléatoire."""
-    m1 = data[COINS[0]]["1m"]
+def report(data: dict, sigs: list[dict], daily: dict | None = None, **sim) -> str:
+    """Rapport par mode/côté : période complète, chaque moitié, par régime, et témoins."""
+    m1 = data[COINS[0]]["base"]
     mid = (m1[0]["ts"] + m1[-1]["ts"]) // 2
     lines = [f"Paramètres : {sim}", ""]
     groups: dict[tuple, list] = {}
@@ -317,7 +355,8 @@ def report(data: dict, sigs: list[dict], **sim) -> str:
         groups.setdefault((s["signal"].upper(), s.get("mode", "?")), []).append(s)
     for (side, mode), ss in sorted(groups.items()):
         tr = simulate(data, ss, **sim)
-        ctrl = random_control(data, ss, **sim)
+        ctrl = random_control(data, ss, daily=daily, **sim)
+        inv = inverse_control(data, ss, **sim)
         a = summary([t for t in tr if t["T"] < mid]); b = summary([t for t in tr if t["T"] >= mid])
         regimes = {}
         for t in tr:
@@ -328,7 +367,8 @@ def report(data: dict, sigs: list[dict], **sim) -> str:
         lines.append(f"  2e moitié  {_fmt(b)}")
         for r, rt in sorted(regimes.items()):
             lines.append(f"  {r:10} {_fmt(summary(rt))}")
-        lines.append(f"  témoin     {_fmt(summary(ctrl))}  (entrées au hasard)")
+        lines.append(f"  hasard     {_fmt(summary(ctrl))}  (entrées au hasard, même régime)")
+        lines.append(f"  inversé    {_fmt(summary(inv))}  (mêmes entrées, sens opposé)")
         lines.append("")
     return "\n".join(lines)
 
@@ -337,6 +377,8 @@ def main_cli(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--days", type=int, default=30)
     ap.add_argument("--strategy", default="bot")
+    ap.add_argument("--base", choices=("1m", "5m"), default="1m",
+                    help="bougies de simulation ; 5m pour les longues périodes (pas pour 'bot')")
     ap.add_argument("--sl", type=float, default=1.5, help="SL en multiples de l'unité de stop (ATR)")
     ap.add_argument("--tp", type=float, default=4.0, help="TP en multiples de l'unité de stop (ATR)")
     ap.add_argument("--fee", type=float, default=FEE_TAKER, help="frais aller-retour en %%")
@@ -356,11 +398,13 @@ def main_cli(argv=None):
         return
     if a.strategy not in strategies:
         sys.exit(f"Stratégie inconnue : {a.strategy} (voir --list)")
+    if a.strategy == "bot" and a.base != "1m":
+        sys.exit("La stratégie 'bot' lit des bougies M1 : utiliser --base 1m")
     if not a.no_download:
-        download(a.days, a.refresh)
-    data, daily = load(a.days)
+        download(a.days, a.refresh, base=a.base)
+    data, daily = load(a.days, base=a.base)
 
-    cache = os.path.join(CACHE_DIR, f"sigs_{a.strategy}_{a.days}d_{data[COINS[0]]['1m'][-1]['ts']}"
+    cache = os.path.join(CACHE_DIR, f"sigs_{a.strategy}_{a.base}_{a.days}d_{data[COINS[0]]['base'][-1]['ts']}"
                                     f"_vm{os.environ.get('VOL_MULTIPLIER')}.pkl")
     if os.path.exists(cache):
         with open(cache, "rb") as f:
@@ -371,7 +415,7 @@ def main_cli(argv=None):
         with open(cache, "wb") as f:
             pickle.dump(sigs, f)
         print(f"  scan : {len(sigs)} signaux en {time.time() - t:.0f}s", file=sys.stderr)
-    print(report(data, sigs, sl_mult=a.sl, tp_mult=a.tp, fee_pct=a.fee,
+    print(report(data, sigs, daily, sl_mult=a.sl, tp_mult=a.tp, fee_pct=a.fee,
                  max_hours=a.max_hours, be=a.be, trail=a.trail))
 
 

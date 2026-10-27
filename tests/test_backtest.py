@@ -17,14 +17,8 @@ def _m1(n, start=0, px=100.0, step=0.0, vol=10.0):
     return [{"ts": start + i * 60_000, "o": px + step * i, "h": px + step * i + 0.05,
              "l": px + step * i - 0.05, "c": px + step * (i + 1), "v": vol} for i in range(n)]
 
-def _data(m1_by_coin):
-    data = {}
-    for c, m1 in m1_by_coin.items():
-        d = {"1m": m1, "5m": B.agg(m1, 5), "15m": B.agg(m1, 15), "1h": B.agg(m1, 60)}
-        for iv in list(d):
-            d[iv + "_ts"] = [x["ts"] for x in d[iv]]
-        data[c] = d
-    return data
+def _data(m1_by_coin, base="1m"):
+    return {c: B.make_series(m1, base) for c, m1 in m1_by_coin.items()}
 
 def _sig(T, side="buy", atr=1.0, coin="ETH"):
     return {"symbol": coin, "signal": side, "mode": "X", "score": 1.0, "atr": atr, "T": T, "regime": "RANGING"}
@@ -40,12 +34,27 @@ class TestData(unittest.TestCase):
         self.assertEqual(c5[0]["h"], max(x["h"] for x in m1[:5]))
         self.assertEqual(c5[0]["v"], 50.0)
 
+    def test_base_m5(self):
+        c5 = [{"ts": i * 300_000, "o": 100, "h": 101, "l": 99, "c": 100, "v": 1} for i in range(30)]
+        d = B.make_series(c5, "5m")
+        self.assertNotIn("1m", d)
+        self.assertEqual(d["base_iv"], "5m")
+        self.assertEqual(len(d["15m"]), 10)
+        self.assertEqual(len(d["1h"]), 2)
+        self.assertEqual(d["1h"][0]["v"], 12)
+
     def test_window_exclut_la_bougie_en_cours(self):
         data = _data({"ETH": _m1(30)})
         w = B.window(data, "ETH", "5m", 12 * 60_000, 10)   # à 00:12, la M5 de 00:10 est en cours
         self.assertEqual([c["ts"] for c in w], [0, 300_000])
         w1 = B.window(data, "ETH", "1m", 12 * 60_000, 2)
         self.assertEqual(w1[-1]["ts"], 11 * 60_000)
+
+    def test_regime_ignore_la_bougie_d1_en_cours(self):
+        daily = {c: [(i * 86_400_000, 100.0 + (30 if i == 8 else 0)) for i in range(9)]
+                 for c in ("BTC", "ETH")}
+        self.assertEqual(B.regime_at(daily, 8 * 86_400_000 + 3_600_000), "RANGING")   # D1 n°8 en cours
+        self.assertEqual(B.regime_at(daily, 9 * 86_400_000), "BULL")
 
     def test_regime_identique_au_bot(self):
         for btc, eth in ((10, 8), (-10, -9), (1, -2), (6, -6), (12, 10)):
@@ -98,6 +107,28 @@ class TestSimulate(unittest.TestCase):
         tr = B.simulate(data, [_sig(0, atr=10.0), _sig(60_000, atr=10.0)], max_hours=1.0)
         self.assertEqual(len(tr), 1)
 
+    def test_simulation_sur_base_m5(self):
+        c5 = [{"ts": i * 300_000, "o": 100, "h": 100.2, "l": 99.8, "c": 100, "v": 1} for i in range(5)]
+        c5.append({"ts": 1_500_000, "o": 100, "h": 104.5, "l": 99.9, "c": 104, "v": 1})
+        tr = B.simulate(_data({"ETH": c5}, "5m"), [_sig(1_500_000)], fee_pct=0.0)
+        self.assertEqual(tr[0]["how"], "TP")
+
+    def test_temoin_inverse(self):
+        cs = _m1(10) + [{"ts": 600_000, "o": 100, "h": 104.5, "l": 99.9, "c": 104, "v": 1}]
+        inv = B.inverse_control(_data({"ETH": cs}), [_sig(600_000)], fee_pct=0.0)
+        self.assertEqual((inv[0]["signal"], inv[0]["how"]), ("sell", "SL"))
+
+    def test_temoin_hasard_meme_regime(self):
+        n = 3 * 24 * 60
+        data = _data({c: _m1(n) for c in B.COINS})
+        # régime BULL seulement à partir du 3e jour (D1 n°1 en forte hausse)
+        daily = {c: [(-7 * 86_400_000 + i * 86_400_000, 100.0 + (20 if i >= 8 else 0)) for i in range(10)]
+                 for c in ("BTC", "ETH")}
+        sig = dict(_sig(2 * 86_400_000 + 600_000, atr=0.1), regime="BULL")
+        tr = B.random_control(data, [sig] * 20, daily=daily, max_hours=0.1)
+        self.assertTrue(tr)
+        self.assertTrue(all(B.regime_at(daily, t["T"]) == "BULL" for t in tr))
+
     def test_trailing_protege_le_gain(self):
         cs = _m1(5) + [{"ts": 300_000, "o": 100, "h": 102.0, "l": 99.9, "c": 101.9, "v": 1},
                        {"ts": 360_000, "o": 101.9, "h": 101.9, "l": 100.9, "c": 101, "v": 1}]
@@ -116,8 +147,8 @@ class TestStrategies(unittest.TestCase):
         self.assertGreater(s["atr"], 0)
 
     def test_scan_bout_en_bout(self):
-        """Scan sur 20 h de bougies synthétiques avec une stratégie triviale."""
-        data = _data({c: _m1(20 * 60, step=0.01) for c in B.COINS})
+        """Scan sur 80 h de bougies synthétiques (60 h de chauffe) avec une stratégie triviale."""
+        data = _data({c: _m1(80 * 60, step=0.01) for c in B.COINS})
         daily = {c: [(i * 86_400_000, 100.0) for i in range(10)] for c in ("BTC", "ETH")}
         calls = []
         def strat(coin, fetch):
@@ -136,12 +167,20 @@ class TestStrategies(unittest.TestCase):
         s = S.h1_trend("ETH", lambda c, iv, n: B.window(data, c, iv, Tn, n))
         self.assertEqual(s["signal"], "buy")
 
+    def test_regime_follow(self):
+        data = _data({"ETH": _m1(40 * 60)})
+        f = lambda c, iv, n: B.window(data, c, iv, 40 * H, n)
+        self.assertEqual(S.regime_follow("ETH", f, "BULL")["signal"], "buy")
+        self.assertEqual(S.regime_follow("ETH", f, "BEAR")["signal"], "sell")
+        self.assertIsNone(S.regime_follow("ETH", f, "RANGING"))
+
     def test_rapport_contient_temoin(self):
         data = _data({c: _m1(3000) for c in B.COINS})
         sigs = [_sig(600_000 + i * 3_600_000, atr=0.5) for i in range(5)]
         txt = B.report(data, sigs, sl_mult=1.5, tp_mult=4.0, fee_pct=0.0864, max_hours=6.0)
         self.assertIn("BUY X", txt)
-        self.assertIn("témoin", txt)
+        self.assertIn("hasard", txt)
+        self.assertIn("inversé", txt)
 
 
 if __name__ == "__main__":
