@@ -58,6 +58,7 @@ MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", 3.0))   # % du capita
 SESSION_START_UTC  = int(os.getenv("SESSION_START_UTC", 0))         # heure UTC (0 = minuit)
 SESSION_END_UTC    = int(os.getenv("SESSION_END_UTC", 24))          # heure UTC (24 = H24)
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")          # webhook Discord (alertes anomalies)
+EVENTS_FILE = "discord_events.jsonl"   # copie locale de chaque message Discord (relue par tools/status.py)
 HEARTBEAT_HOURS    = float(os.getenv("HEARTBEAT_HOURS", 6))          # résumé Discord périodique (0 = désactivé)
 
 # Initialisées au démarrage dans run() depuis le solde réel
@@ -900,7 +901,15 @@ def set_leverage(coin: str):
 
 # ── Alertes Discord ───────────────────────────────────────────────────────────
 def send_discord_alert(title: str, description: str, color: int = 0xe74c3c):
-    """Envoie une alerte embed sur Discord via webhook. Silencieux si pas configuré."""
+    """Envoie une alerte embed sur Discord via webhook. Silencieux si pas configuré.
+    Chaque message est aussi ajouté à EVENTS_FILE pour pouvoir le relire localement."""
+    try:
+        with open(EVENTS_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"t": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                "title": title, "description": description},
+                               ensure_ascii=False) + "\n")
+    except Exception as e:
+        log_error(f"journal Discord: {e}")
     if not DISCORD_WEBHOOK_URL:
         return
     payload = {

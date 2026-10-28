@@ -28,3 +28,6 @@ env/
 
 # Backtest : bougies téléchargées et cache des scans
 backtest_data/
+
+# Journal local des messages Discord
+*.jsonl

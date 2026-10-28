@@ -10,7 +10,7 @@ Aucun appel réseau, aucun ordre réel, aucun message Discord :
   - requests.get/post lèvent une erreur si un test oublie de les mocker
   - exécution dans un dossier temporaire (trades.xlsx, bot_state.json… factices)
 """
-import os, sys, tempfile, types, unittest
+import json, os, sys, tempfile, types, unittest
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -876,6 +876,30 @@ class TestUtils(BaseTest):
 
     def test_bb_plat(self):
         self.assertEqual(m._bb([100.0] * 25)[3], 0.5)
+
+
+class TestDiscordJournal(unittest.TestCase):
+    """Chaque message Discord est copié dans EVENTS_FILE (relu par tools/status.py), même sans webhook."""
+    def setUp(self):
+        if os.path.exists(m.EVENTS_FILE):
+            os.remove(m.EVENTS_FILE)
+
+    def test_message_journalise_sans_webhook(self):
+        with mock.patch.object(m, "DISCORD_WEBHOOK_URL", ""):
+            m.send_discord_alert("💓 Bot actif", "ligne 1\nligne 2")
+        with open(m.EVENTS_FILE, encoding="utf-8") as f:
+            ev = [json.loads(l) for l in f]
+        self.assertEqual(len(ev), 1)
+        self.assertEqual((ev[0]["title"], ev[0]["description"]), ("💓 Bot actif", "ligne 1\nligne 2"))
+
+    def test_journal_en_erreur_n_empeche_pas_l_envoi(self):
+        sent = []
+        with mock.patch.object(m, "EVENTS_FILE", os.path.join(_TMP, "absent", "x.jsonl")), \
+             mock.patch.object(m, "DISCORD_WEBHOOK_URL", "http://hook"), \
+             mock.patch.object(m.requests, "post", lambda *a, **k: sent.append(k) or mock.Mock()), \
+             mock.patch("sys.stdout", new_callable=io.StringIO):
+            m.send_discord_alert("t", "d")
+        self.assertEqual(len(sent), 1)
 
 
 if __name__ == "__main__":
