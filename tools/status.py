@@ -1,18 +1,16 @@
 """
-État des deux bots en une commande, sans copier-coller Discord :
+État de BotShortTrade en une commande, sans copier-coller Discord :
   python3 tools/status.py [--hours 24] [--since "2026-10-27 17:09"]
 
 Lit uniquement des fichiers locaux et le journal systemd (aucun secret, aucun appel réseau) :
-  - BotShortTrade : service systemd, erreurs du journal, messages Discord (discord_events.jsonl),
-    fantômes clos dans trades.xlsx (onglet Fantômes)
-  - BotCopyTrade  : processus, copies simulées ouvertes, messages Discord, dernier état de bot.log
+  service systemd, erreurs du journal, messages Discord (discord_events.jsonl),
+  fantômes clos dans trades.xlsx (onglet Fantômes)
 """
 from __future__ import annotations
 import argparse, json, os, re, subprocess
 from datetime import datetime, timedelta, timezone
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-COPY_ROOT = os.path.join(os.path.dirname(ROOT), "BotCopyTrade")
 GHOST_ONLY_SINCE = "2026-10-27 16:09"   # UTC — début du mode fantôme seul
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -98,47 +96,6 @@ def ghost_report(since: str):
             print(f"    {k:10s} {stats(v)}")
 
 
-def copy_process_running() -> bool:
-    for pid in filter(str.isdigit, os.listdir("/proc")):
-        try:
-            if os.readlink(f"/proc/{pid}/cwd") == COPY_ROOT and \
-                    b"main.py" in open(f"/proc/{pid}/cmdline", "rb").read():
-                return True
-        except OSError:
-            continue
-    return False
-
-
-def copy_report(since: datetime):
-    print(f"  Processus : {'actif' if copy_process_running() else 'ARRÊTÉ'}")
-    path = os.path.join(COPY_ROOT, "simulation_copies.json")
-    if os.path.exists(path):
-        copies = json.load(open(path, encoding="utf-8"))
-        print(f"  Copies simulées ouvertes : {len(copies)}")
-        for c in copies.values():
-            age = (datetime.now().timestamp() - c["opened_at"]) / 3600
-            print(f"    {c['trader_name']:14s} {c['coin']:6s} {'LONG' if c['is_buy'] else 'SHORT':5s} "
-                  f"entrée {c['entry']:g}  SL {c['sl']:g}  {age:.0f} h")
-    log = os.path.join(COPY_ROOT, "bot.log")
-    if os.path.exists(log):
-        with open(log, "rb") as f:
-            f.seek(max(0, os.path.getsize(log) - 20000))
-            tail = ANSI.sub("", f.read().decode("utf-8", "replace"))
-        total = [l.strip() for l in tail.splitlines() if "Total P&L copies" in l]
-        if total:
-            print(f"  bot.log : {total[-1]}")
-    print("\n  Messages Discord :")
-    events = read_events(os.path.join(COPY_ROOT, "discord_events.jsonl"), since)
-    closes = [e for e in read_events(os.path.join(COPY_ROOT, "discord_events.jsonl"),
-                                     datetime(2000, 1, 1, tzinfo=timezone.utc))
-              if e["title"].startswith("⚪ Fermeture")]
-    print_events(events, "📊")
-    if closes:
-        pnls = [float(e["fields"]["P&L"].replace("$", "")) for e in closes]
-        print(f"\n  Copies fermées (total) : {len(closes)} · gagnantes {sum(p > 0 for p in pnls)} "
-              f"· P&L ${sum(pnls):+.2f}")
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--hours", type=float, default=24, help="fenêtre du journal et des messages (h)")
@@ -163,9 +120,6 @@ def main():
     print_events(read_events(os.path.join(ROOT, "discord_events.jsonl"), since), "💓")
     print()
     ghost_report(a.since)
-
-    print(f"\n═══ BotCopyTrade ═══")
-    copy_report(since)
 
 
 if __name__ == "__main__":
