@@ -26,6 +26,12 @@ class TestTrendBacktest(unittest.TestCase):
         sig = B.signals(_data([10, 12, 11, 9]), 2)["ETH"]
         self.assertEqual(sig, {2 * D: 1, 3 * D: -1})
 
+    def test_vote_majoritaire_des_horizons(self):
+        # j3 : 10 < 11, 10 > 9, 10 < 12 → short à 2 contre 1 ; j4 : 11 > 10, 11 = 11, 11 > 9 → long
+        data = _data([12, 9, 11, 10, 11])
+        self.assertEqual(B.vote(data, (1, 2, 3))["ETH"], {3 * D: -1, 4 * D: 1})
+        self.assertEqual(B.signals(data, 2)["ETH"], {2 * D: -1, 3 * D: 1, 4 * D: -1})  # l'horizon 2 j seul
+
     def test_position_tenue_jusqu_au_bout_frais_d_entree_compris(self):
         data = _data(self.RISE)
         curve = B.simulate(data, B.signals(data, 2), sl_atr=3.0, expo=0.5)
@@ -43,22 +49,25 @@ class TestTrendBacktest(unittest.TestCase):
 
     def test_meme_signal_que_le_bot(self):
         """Le backtest et main.trend_signal décident pareil sur les mêmes bougies."""
-        closes = [100 + 7 * ((i * 37) % 11) - i for i in range(45)]
+        closes = [100 + 7 * ((i * 37) % 11) - i * (i % 3) for i in range(75)]
         y = (int(time.time()) // 86400 - 1) * D
         candles = [{"ts": y - (len(closes) - 1 - i) * D, "o": c, "h": c + 1, "l": c - 1, "c": c, "v": 1}
                    for i, c in enumerate(closes)]
         data = {"ETH": {"days": [c["ts"] for c in candles],
                         "ohlc": {c["ts"]: (c["o"], c["h"], c["l"], c["c"]) for c in candles},
                         "fund": {}, "fund_start": 0}}
-        for end in range(31, 46):                  # 15 jours : les deux décisions coïncident chaque jour
+        sides = []
+        for end in range(59, 76):                  # 17 jours : les deux décisions coïncident chaque jour
             window = candles[:end]
             shift = (len(closes) - end) * D
             w = [dict(c, ts=c["ts"] + shift) for c in window]   # la dernière bougie = hier
             m._trend_sig.clear()
-            with mock.patch.object(m, "fetch_candles", lambda *a, **k: w[-(m.TREND_LOOKBACK_D + 2):]):
+            with mock.patch.object(m, "fetch_candles", lambda *a, **k: w[-(max(m.TREND_LOOKBACKS) + 2):]):
                 bot_side = m.trend_signal("ETH")[0]
-            bt = B.signals(data, m.TREND_LOOKBACK_D)["ETH"][window[-1]["ts"]]
+            bt = B.vote(data, m.TREND_LOOKBACKS)["ETH"][window[-1]["ts"]]
+            sides.append(bot_side)
             self.assertEqual(bot_side, "BUY" if bt == 1 else "SELL")
+        self.assertEqual(set(sides), {"BUY", "SELL"})      # les deux cas sont bien couverts
 
     def test_temoin_decale_garde_les_memes_signaux(self):
         import random

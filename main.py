@@ -79,7 +79,7 @@ REGIME_REFRESH_S = 30 * 60   # recalcul du régime de marché (bougies D1)
 SL_CHECK_S       = 5 * 60    # vérification que chaque position a bien son stop-loss sur Hyperliquid
 
 # Stratégie tendance (cf. section « Stratégie tendance journalière » et tools/trend_backtest.py)
-TREND_LOOKBACK_D   = 28         # LONG si clôture D1 > celle d'il y a 28 jours, SHORT sinon
+TREND_LOOKBACKS    = (14, 28, 56)  # LONG si clôture D1 > celle d'il y a N jours pour 2 horizons sur 3
 TREND_SL_ATR       = 3.0        # SL = 3×ATR14 journalier
 TREND_FEE          = 0.000432   # frais taker par côté (P&L des positions fantômes)
 TREND_MIN_NOTIONAL = 11.0       # $ par position (minimum Hyperliquid : 10 $)
@@ -1975,11 +1975,12 @@ def ghost_update(wb: Workbook) -> list[dict]:
 
 # ── Stratégie tendance journalière ───────────────────────────────────────────
 # Momentum de série temporelle : chaque jour, pour chaque coin, LONG si la clôture D1 est
-# au-dessus de celle d'il y a TREND_LOOKBACK_D jours, SHORT sinon. Position tenue jusqu'à
-# l'inversion du signal ; SL à TREND_SL_ATR×ATR14 D1, puis à plat jusqu'à la clôture
-# journalière suivante. Notionnel = TREND_EXPOSURE × équité / nb de coins.
-# Backtest (tools/trend_backtest.py, 5 coins, 50 % de l'équité) : 2017→2026 +35 %/an, pire
-# baisse −49 % ; 2021→2026 +11 %/an, pire baisse −32 % (avantage nettement affaibli).
+# au-dessus de celle d'il y a 14, 28 et 56 jours pour au moins 2 de ces horizons (vote), SHORT
+# sinon. Position tenue jusqu'à l'inversion du signal ; SL à TREND_SL_ATR×ATR14 D1, puis à plat
+# jusqu'à la clôture journalière suivante. Notionnel = TREND_EXPOSURE × équité / nb de coins.
+# Backtest (tools/trend_backtest.py, 5 coins, 50 % de l'équité) : 2017→2026 +40 %/an, Sharpe
+# 0.94, pire baisse −49 % ; 2e moitié (2021→2026) +15 %/an, pire baisse −41 %. Le vote bat la
+# règle 28 j seule sur chaque moitié (Sharpe +0.08), mais l'écart n'est pas significatif (t=0.9).
 # GHOST_ONLY : positions fantômes au prix moyen, aucun ordre (validation de la mécanique).
 TREND_FILE = "trend_state.json"
 _trend: dict | None = None             # {"positions": {coin: position}, "stopped": {coin: jour UTC}}
@@ -2020,15 +2021,17 @@ def trend_signal(coin: str) -> tuple[str, float, float] | None:
     cached = _trend_sig.get(coin)
     if cached and cached[0] == day:
         return cached[1:]
+    n = max(TREND_LOOKBACKS)
     try:
-        cs = fetch_candles(coin, INTERVAL_D1, TREND_LOOKBACK_D + 2)
+        cs = fetch_candles(coin, INTERVAL_D1, n + 2)
     except Exception as e:
         log_error(f"tendance {coin} : bougies D1 indisponibles ({e})")
         return None
     yesterday = (int(time.time()) // 86400 - 1) * 86_400_000
-    if len(cs) < TREND_LOOKBACK_D + 1 or cs[-1]["ts"] != yesterday:
+    if len(cs) < n + 1 or cs[-1]["ts"] != yesterday:
         return None
-    side = "BUY" if cs[-1]["c"] > cs[-1 - TREND_LOOKBACK_D]["c"] else "SELL"
+    votes = sum(1 if cs[-1]["c"] > cs[-1 - lb]["c"] else -1 for lb in TREND_LOOKBACKS)
+    side = "BUY" if votes > 0 else "SELL"
     _trend_sig[coin] = (day, side, cs[-1]["c"], _atr(cs, 14))
     return _trend_sig[coin][1:]
 
@@ -2328,7 +2331,8 @@ def run():
     print(f"\n  {C.DIM}Démarrage — scan toutes les {LOOP_SECONDS}s{C.RST}\n")
 
     if STRATEGY == "trend":
-        _strat = (f"Stratégie : **tendance journalière** ({TREND_LOOKBACK_D} j, SL {TREND_SL_ATR:g}×ATR D1) · "
+        _strat = (f"Stratégie : **tendance journalière** (vote {'/'.join(map(str, TREND_LOOKBACKS))} j, "
+                  f"SL {TREND_SL_ATR:g}×ATR D1) · "
                   f"exposition {TREND_EXPOSURE:.0%} de l'équité · positions tendance : "
                   f"{len(_load_trend()['positions'])}\n")
     else:

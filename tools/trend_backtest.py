@@ -3,7 +3,8 @@
 Backtest — stratégie tendance journalière de BotShortTrade (main.trend_cycle)
 ============================================================================
 Rejoue la règle du bot, avec ses paramètres (lus dans main.py), sur l'historique journalier :
-  - LONG si la clôture D1 dépasse celle d'il y a TREND_LOOKBACK_D jours, SHORT sinon ;
+  - LONG si la clôture D1 dépasse celle d'il y a N jours pour la majorité des horizons
+    TREND_LOOKBACKS (14, 28, 56), SHORT sinon ;
   - quantité fixée à l'ouverture (TREND_EXPOSURE × équité / nb de coins), tenue jusqu'à l'inversion ;
   - SL à TREND_SL_ATR × ATR14 D1, puis à plat jusqu'à la clôture journalière suivante ;
   - frais taker 0.0432 % par côté ; funding Bybit (avant son historique : longs 15 %/an, shorts 0).
@@ -18,8 +19,14 @@ Témoin « permutation » : le signal de chaque coin est décalé d'un nombre al
 proportion long/short, même rythme d'inversions, mais plus aligné sur les prix). p = part des tirages
 au moins aussi bons que la vraie stratégie ; un signal sans valeur donne p ≈ 0.5.
 
-Résultats du 2026-11-02 (5 coins, exposition 50 %) : 2017→2026 +35 %/an, t=2.7, pire baisse −49 % ;
-2021→2026 +11 %/an, t=1.2, pire baisse −32 % ; dernière année ≈ 0 %. Avantage réel mais affaibli.
+Résultats du 2026-11-02 (5 coins, exposition 50 %) :
+  - 28 j seul (règle initiale) : 2017→2026 +35 %/an, Sharpe 0.86, pire baisse −49 %, permutation p=0.02 ;
+    2021→2026 +12 %/an, pire baisse −32 % ; dernière année ≈ 0 %.
+  - vote 14/28/56 j (adopté) : 2017→2026 +40 %/an, Sharpe 0.94, pire baisse −49 %, p=0.01 ;
+    1re moitié Sharpe 1.18 (vs 1.10), 2e moitié 0.63 (vs 0.54), pire baisse 2e moitié −41 % (vs −32 %).
+    Écart avec la règle 28 j : +3.8 %/an, t=0.9 (non significatif) ; adopté pour la robustesse.
+  - rejetés (même protocole, hypothèses déclarées avant les tests) : long/plat (moins bon partout),
+    10 coins (2e moitié moins bonne), taille ∝ 1/volatilité (1re moitié moins bonne).
 """
 from __future__ import annotations
 
@@ -93,6 +100,12 @@ def signals(data: dict, lookback: int) -> dict[str, dict[int, int]]:
         cl = [d["ohlc"][t][3] for t in d["days"]]
         out[coin] = {d["days"][i]: (1 if cl[i] > cl[i - lookback] else -1) for i in range(lookback, len(cl))}
     return out
+
+def vote(data: dict, lookbacks) -> dict[str, dict[int, int]]:
+    """Vote majoritaire des signaux de chaque horizon (règle du bot : égalité → short)."""
+    ss = [signals(data, lb) for lb in lookbacks]
+    return {c: {t: (1 if sum(s[c][t] for s in ss) > 0 else -1) for t in ss[-1][c] if all(t in s[c] for s in ss)}
+            for c in data}
 
 def shifted(sig: dict[str, dict[int, int]], rnd: random.Random) -> dict[str, dict[int, int]]:
     """Témoin : chaque série de signaux décalée circulairement d'un nombre aléatoire de jours."""
@@ -184,10 +197,11 @@ def main_cli(argv=None):
     if not a.no_download:
         download(coins, a.refresh)
     data = load(coins)
-    sig  = signals(data, bot.TREND_LOOKBACK_D)
+    sig  = vote(data, bot.TREND_LOOKBACKS)
     sim  = lambda s, **k: simulate(data, s, bot.TREND_SL_ATR, expo, **k)
     now  = int(time.time() * 1000)
-    print(f"Tendance {bot.TREND_LOOKBACK_D} j · SL {bot.TREND_SL_ATR:g}×ATR · exposition {expo:.0%} · {', '.join(coins)}\n")
+    print(f"Tendance (vote {'/'.join(map(str, bot.TREND_LOOKBACKS))} j) · SL {bot.TREND_SL_ATR:g}×ATR · "
+          f"exposition {expo:.0%} · {', '.join(coins)}\n")
     full = sim(sig)
     print(_fmt("toute la période", full))
     for label, start in (("5 dernières années", now - 5 * 365 * DAY_MS),

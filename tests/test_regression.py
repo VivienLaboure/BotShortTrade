@@ -764,8 +764,8 @@ class TestRunLoop(BaseTest):
             if iv != m.INTERVAL_D1:
                 self.m1_calls.append(coin)
                 return _declin(n)
-            if n == m.TREND_LOOKBACK_D + 2:      # signal de la stratégie tendance
-                return _d1(trend_closes or [100.0] * 30)
+            if n == max(m.TREND_LOOKBACKS) + 2:  # signal de la stratégie tendance
+                return _d1(trend_closes or [100.0] * 60)
             d1_calls.append(coin)
             if len(d1_calls) <= d1_failures:
                 raise RuntimeError("Bybit kline BTCUSDT: Too many visits")
@@ -1038,8 +1038,8 @@ def _held(coin, szi):
     return {"position": {"coin": coin, "szi": str(szi), "entryPx": "90", "unrealizedPnl": "0"}}
 
 class TestTrend(BaseTest):
-    UP   = [90.0] * 29 + [100.0]     # clôture > celle d'il y a 28 jours → LONG
-    DOWN = [110.0] * 29 + [100.0]    # → SHORT
+    UP   = [90.0] * 57 + [100.0]     # clôture > celles d'il y a 14, 28 et 56 jours → LONG
+    DOWN = [110.0] * 57 + [100.0]    # → SHORT
 
     def setUp(self):
         super().setUp()
@@ -1079,7 +1079,7 @@ class TestTrend(BaseTest):
             self.assertEqual(m.trend_signal("ETH")[0], "BUY")
             self.assertEqual(m.trend_signal("SOL")[0], "SELL")
             side, close, atr = m.trend_signal("ETH")
-        self.assertEqual(self.fetches, [("ETH", "1D", 30), ("SOL", "1D", 30)])
+        self.assertEqual(self.fetches, [("ETH", "1D", 58), ("SOL", "1D", 58)])
         self.assertEqual(close, 100.0)
         self.assertGreater(atr, 2.0)
 
@@ -1091,6 +1091,17 @@ class TestTrend(BaseTest):
             self.assertIsNone(m.trend_signal("ETH"))
             self.assertIsNone(m.trend_signal("ETH"))
         self.assertEqual(len(self.fetches), 2)
+
+    def test_signal_vote_majoritaire_14_28_56_jours(self):
+        """LONG si la clôture dépasse celle d'il y a N jours pour au moins 2 horizons sur 3 :
+        hausse sur 14 et 56 j, baisse sur 28 j → LONG (la règle 28 j seule disait SHORT)."""
+        closes = [100.0] * 58
+        closes[-15], closes[-29], closes[-57] = 90.0, 110.0, 90.0
+        with mock.patch.object(m, "fetch_candles", lambda *a, **k: _d1(closes)):
+            self.assertEqual(m.trend_signal("ETH")[0], "BUY")
+            closes[-57] = 110.0                                  # baisse sur 28 et 56 j → SHORT
+            m._trend_sig.clear()
+            self.assertEqual(m.trend_signal("ETH")[0], "SELL")
 
     def test_quantite_minimum_hyperliquid_et_arrondi(self):
         with mock.patch.dict(m._sym_filters, {"XRP": {"sz_dec": 0, "sz_step": 1}}):
