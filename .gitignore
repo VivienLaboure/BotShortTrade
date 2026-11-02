@@ -31,3 +31,6 @@ backtest_data/
 
 # Journal local des messages Discord
 *.jsonl
+
+# Dashboard régénéré chaque minute par le bot
+dashboard.html
