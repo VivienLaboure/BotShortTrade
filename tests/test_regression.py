@@ -117,6 +117,14 @@ class BaseTest(unittest.TestCase):
         return [t for t, _ in self.alerts]
 
 
+def _hl_px_valide(px: float, sz_dec: int = 0) -> bool:
+    """Règle Hyperliquid (perps) : entier, ou ≤ 5 chiffres significatifs et ≤ 6 − szDecimals décimales."""
+    if px == int(px):
+        return True
+    txt = f"{px:.10f}".rstrip("0")
+    return len(txt.replace(".", "").lstrip("0")) <= 5 and len(txt.split(".")[1]) <= 6 - sz_dec
+
+
 # ── place_order : SL/TP et sécurité stop-loss ────────────────────────────────
 class TestPlaceOrder(BaseTest):
     def run_order(self, ex, sig=SIG):
@@ -136,6 +144,19 @@ class TestPlaceOrder(BaseTest):
         pos, _ = self.run_order(FakeExchange(avg_px=1990.0), sig)
         self.assertAlmostEqual(pos["sl"], 1990.0 + m.ATR_SL_MULT * 5.0)
         self.assertAlmostEqual(pos["tp"], 1990.0 - m.ATR_TP_MULT * 5.0)
+
+    def test_prix_sl_tp_valides_doge_au_dessus_de_10_cents(self):
+        """DOGE à 0.12345 : l'ancien arrondi (6 décimales) donnait 6 chiffres significatifs,
+        refusés par Hyperliquid → SL refusé → fermeture d'urgence de chaque trade."""
+        sig = dict(SIG, symbol="DOGE", atr_m5=0.000123, price=0.12345)
+        ex = FakeExchange(avg_px=0.12345)
+        with mock.patch.object(m, "exchange", ex), \
+             mock.patch.object(m, "info", FakeInfo(mids={"DOGE": "0.12345"})):
+            pos = m.place_order(sig, m.init_excel())
+        self.assertEqual(ex.closed, 0)
+        for o in ex.orders:
+            self.assertTrue(_hl_px_valide(o["triggerPx"]), o)
+        self.assertTrue(_hl_px_valide(pos["sl"]) and _hl_px_valide(pos["tp"]))
 
     def test_sl_refuse_puis_accepte_au_retry(self):
         ex = FakeExchange(sl=[_err(), _ok(33)])
@@ -717,13 +738,14 @@ class LoopInfo(FakeInfo):
     def meta(self): return {"universe": []}
 
 class TestRunLoop(BaseTest):
-    def run_loop(self, daily_chg, asset_positions=None, get_signal=None):
+    def run_loop(self, daily_chg, asset_positions=None, get_signal=None, d1_failures=0,
+                 keep_regime=False):
         if os.path.exists(m.GHOST_FILE):
             os.remove(m.GHOST_FILE)
         m._ghosts = None
         m._lessons_cache.clear(); m._lessons_cache_ts = 0.0
-        if hasattr(m.run, "_regime_cache"):
-            del m.run._regime_cache
+        for attr in ("_sl_check_ts",) + (() if keep_regime else ("_regime_cache", "_regime_ts")):
+            m.run.__dict__.pop(attr, None)
         info = LoopInfo(
             mids={c: "100" for c in m.WATCHLIST},
             perp={"assetPositions": asset_positions or [],
@@ -736,8 +758,14 @@ class TestRunLoop(BaseTest):
                 cycles.append(sec)
                 if len(cycles) >= 2:
                     raise _StopLoop()
+        d1_calls = []
         def fc(coin, iv, n, **k):
-            return _daily(daily_chg) if iv == m.INTERVAL_D1 else _declin(n)
+            if iv != m.INTERVAL_D1:
+                return _declin(n)
+            d1_calls.append(coin)
+            if len(d1_calls) <= d1_failures:
+                raise RuntimeError("Bybit kline BTCUSDT: Too many visits")
+            return _daily(daily_chg)
         with mock.patch.object(m, "info", info), mock.patch.object(m, "exchange", ex), \
              mock.patch.object(m, "fetch_candles", fc), \
              mock.patch.object(m.time, "sleep", fake_sleep), \
@@ -799,6 +827,21 @@ class TestRunLoop(BaseTest):
         self.assertEqual(len(ghosts), len({(g["symbol"], g["side"], g["mode"]) for g in ghosts}))  # dédoublonné
         hb = [d for t, d in self.alerts if "résumé" in t]
         self.assertTrue(hb and "Fantômes :" in hb[0])
+
+    def test_regime_indisponible_reessaye_au_cycle_suivant(self):
+        """Bougies D1 en échec au 1er cycle : le régime est recalculé dès le cycle suivant
+        (avant : RANGING figé jusqu'à la prochaine demi-heure)."""
+        ex, _ = self.run_loop(-10, d1_failures=1)
+        self.assertEqual(ex.orders, [])
+        hb = [d for t, d in self.alerts if "résumé" in t]      # 1 heartbeat par cycle
+        self.assertIn("Régime : **RANGING**", hb[0])          # 1er cycle : défaut prudent
+        self.assertIn("Régime : **BEAR**", hb[-1])            # 2e cycle : recalculé
+
+    def test_regime_precedent_conserve_si_bybit_echoue(self):
+        m.run._regime_cache = ("BEAR", "down", -10.0, -10.0)
+        m.run._regime_ts = 0.0     # recalcul dû…
+        ex, ghosts = self.run_loop(-2, d1_failures=99, keep_regime=True)   # …mais Bybit échoue
+        self.assertTrue(ghosts and all(g["reason"] == "régime BEAR" for g in ghosts))
 
     def test_ranging_mom_bloque_suivi_en_fantome(self):
         ex, ghosts = self.run_loop(-2)
@@ -864,6 +907,49 @@ class TestUtils(BaseTest):
     def test_round_px(self):
         self.assertEqual(m.round_px(2012.345), 2012.3)
         self.assertEqual(m.round_px(0.08201357), 0.082014)
+
+    def test_round_px_regle_hyperliquid(self):
+        self.assertEqual(m.round_px(0.123456), 0.12346)    # DOGE ≥ 0.1 : 5 chiffres significatifs
+        self.assertEqual(m.round_px(0.512345), 0.51235)    # XRP < 1
+        self.assertEqual(m.round_px(9.876543), 9.8765)     # LTC/XRP < 10
+        self.assertEqual(m.round_px(123456.7), 123457)     # entier toujours valide
+        with mock.patch.dict(m._sym_filters, {"X": {"sz_dec": 4, "sz_step": 1e-4}}):
+            self.assertEqual(m.round_px(1.23456, "X"), 1.23)   # au plus 6 − 4 = 2 décimales
+        self.assertEqual(m.round_px(0.080481, "INCONNU"), 0.080481)   # filtres absents : pas de troncature
+
+    def test_bybit_rate_limit_deux_echecs_puis_succes(self):
+        """Bybit répond « Too many visits » quand les 15 requêtes du scan partent ensemble :
+        2 nouvelles tentatives (avant : 1 seule → signal perdu pour le cycle)."""
+        lim = {"retCode": 10006, "retMsg": "Too many visits. Exceeded the API Rate Limit."}
+        ok  = {"retCode": 0, "result": {"list": [[str(i * 60_000), "1", "2", "0.5", "1.5", "10"]
+                                                  for i in (3, 2, 1, 0)]}}
+        calls = []
+        def get(*a, **k):
+            calls.append(1)
+            r = mock.Mock(); r.json.return_value = lim if len(calls) < 3 else ok
+            return r
+        with mock.patch.object(m.requests, "get", get):
+            cs = m.fetch_candles("ETH", m.INTERVAL_M1, 2)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([c["ts"] for c in cs], [60_000, 120_000])   # bougie en cours retirée
+
+    def test_dashboard_lecons_comptent_les_fantomes(self):
+        """Pattern appris uniquement en fantôme (1 gagné / 9 perdus → n=5, WR 10 %) : le bot
+        le pénalise de 0.15 ; le dashboard affichait « 0 (apprentissage…) »."""
+        m._lessons_cache = {"buckets": {"rsi70-75|buy|BBO": {"w": 0, "l": 0, "pnl": 0.0,
+                                                             "gw": 1.0, "gl": 9.0}}}
+        m._lessons_cache_ts = m.time.time()
+        try:
+            self.assertEqual(m.get_penalty("ETH", "buy", 72, 1.1, "RANGING", "BBO"), 0.15)
+            m.write_dashboard(m.init_excel(), [], 100.0, 100.0, 0.0, 0.0, 0.0, 100.0,
+                              "RANGING", 0.0, 0.0)
+            with open("dashboard.html", encoding="utf-8") as f:
+                html = f.read()
+        finally:
+            m._lessons_cache.clear(); m._lessons_cache_ts = 0.0
+        row = html[html.index(">rsi70-75|buy|BBO<"):].split("</tr>")[0]
+        self.assertIn("−0.15", row)
+        self.assertIn("10%", row)
 
     def test_size_mult(self):
         self.assertEqual(m._size_mult(1.6), 1.15)

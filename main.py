@@ -70,6 +70,8 @@ ATR_TP_MULT   = 4.0   # R:R ~2.7:1 (TP = 4×ATR, SL = 1.5×ATR)
 TRAIL_TRIGGER = 1.5   # activer trailing quand profit ≥ 1.5×ATR
 TRAIL_DIST    = 1.0   # trailing SL à 1×ATR du prix courant
 BE_BUFFER_PCT = 0.10  # breakeven = entrée ± 0.10 % (couvre les frais aller-retour ≈ 0.09 %)
+REGIME_REFRESH_S = 30 * 60   # recalcul du régime de marché (bougies D1)
+SL_CHECK_S       = 5 * 60    # vérification que chaque position a bien son stop-loss sur Hyperliquid
 
 # Mode fantôme : suivi virtuel des signaux NON tradés (filtrés, bloqués par régime, sans slot)
 GHOST_FILE      = "ghosts.json"
@@ -415,7 +417,7 @@ def fetch_candles(coin: str, interval: str, count: int, drop_incomplete: bool = 
     symbol   = SYM_BYBIT.get(coin, f"{coin}USDT")   # BTC hors watchlist mais utilisé pour le régime
     iv       = _BYBIT_IV[interval]
     last_err: Exception | None = None
-    for attempt in range(2):   # 1 retry automatique (rate limit Bybit ponctuel)
+    for attempt in range(3):   # 2 retries (rate limit Bybit ponctuel : 15 requêtes simultanées)
         try:
             resp = requests.get(BYBIT_KLINE, params={
                 "category": "linear",
@@ -440,8 +442,8 @@ def fetch_candles(coin: str, interval: str, count: int, drop_incomplete: bool = 
             return candles[-count:]
         except Exception as e:
             last_err = e
-            if attempt == 0:
-                time.sleep(0.5)   # courte pause avant retry
+            if attempt < 2:
+                time.sleep(0.5 + attempt)   # 0.5 s puis 1.5 s avant de réessayer
     raise last_err  # type: ignore[misc]
 
 # ── Indicateurs ───────────────────────────────────────────────────────────────
@@ -521,6 +523,19 @@ def _avg_vol(candles: list[dict], n: int = 20) -> float:
     return sum(vols) / len(vols) if vols else 0.0
 
 # ── Signal multi-timeframe ────────────────────────────────────────────────────
+# Scores par mode (vol = ratio volume M5 plafonné à 3) — partagés par les signaux réels et fantômes
+def _score_mr_buy(rsi1: float, bbp5: float, vol: float) -> float:
+    return round((70 - rsi1) / 40 * 0.25 + vol * 0.4 + (0.35 - bbp5) / 0.35 * 0.15 + 0.2, 3)
+
+def _score_mr_sell(rsi1: float, bbp5: float, vol: float) -> float:
+    return round((rsi1 - 35) / 30 * 0.25 + vol * 0.4 + (bbp5 - 0.65) / 0.35 * 0.15 + 0.2, 3)
+
+def _score_mom(rsi1: float, bbp5: float, vol: float) -> float:
+    return round(vol * 0.5 + max(0.0, (35 - rsi1) / 35) * 0.25 + max(0.0, (0.35 - bbp5) / 0.35) * 0.25, 3)
+
+def _score_bbo(rsi5: float, bbp5: float, vol: float) -> float:
+    return round(vol * 0.50 + max(0.0, (85 - rsi5) / 40) * 0.30 + min(1.0, (bbp5 - 0.75) / 0.50) * 0.20, 3)
+
 def get_signal(coin: str) -> dict | None:
     try:
         c15 = fetch_candles(coin, INTERVAL_M15, 50)
@@ -593,30 +608,21 @@ def get_signal(coin: str) -> dict | None:
         # ── BUY mean-reversion : RSI en zone neutre, prix bas de la bande ──────
         # bb_long_ok = bbp5 <= 0.35 (tiers inférieur strict — plus oversold que 0.40)
         if bias_up and confirm_long_mr and base_mr_long and 30 <= rsi1 <= 70 and bb_long_ok:
-            signal    = "buy"
-            mode      = "MR"
-            rsi_score = (70 - rsi1) / 40
-            bb_score  = (0.35 - bbp5) / 0.35   # calibré sur seuil 0.35 : bbp=0.35→0.0, bbp=0.0→1.0
-            score     = round(rsi_score * 0.25 + vol_ratio_capped * 0.4 + bb_score * 0.15 + 0.2, 3)
+            signal, mode = "buy", "MR"
+            score = _score_mr_buy(rsi1, bbp5, vol_ratio_capped)
 
         # ── SELL mean-reversion : RSI neutre, prix haut de la bande ─────────────
         # confirm_short_mr supprimé — était toujours True (bb_short_ok est déjà requis)
         elif bias_dn and base_mr_sht and 35 <= rsi1 <= 65 and bb_short_ok:
-            signal    = "sell"
-            mode      = "MR"
-            rsi_score = (rsi1 - 35) / 30
-            bb_score  = (bbp5 - 0.65) / 0.35
-            score     = round(rsi_score * 0.25 + vol_ratio_capped * 0.4 + bb_score * 0.15 + 0.2, 3)
+            signal, mode = "sell", "MR"
+            score = _score_mr_sell(rsi1, bbp5, vol_ratio_capped)
 
         # ── SELL momentum : crash/tendance forte — prix sous la bande basse ─────
         # RSI extrême (<= 35) + prix cassant sous la BB + toute la structure baissière
         # Bloqué en RANGING : 40% WR, −$10.42 historique (rebonds fréquents en range)
         elif mom_cond and _current_regime != "RANGING":
-            signal    = "sell"
-            mode      = "MOM"
-            rsi_score = max(0.0, (35 - rsi1) / 35)   # plus RSI bas = momentum fort
-            bb_score  = max(0.0, (0.35 - bbp5) / 0.35)
-            score     = round(vol_ratio_capped * 0.5 + rsi_score * 0.25 + bb_score * 0.25, 3)
+            signal, mode = "sell", "MOM"
+            score = _score_mom(rsi1, bbp5, vol_ratio_capped)   # RSI plus bas = momentum plus fort
 
         # ── BUY breakout : cassure haussière au-dessus de la BB haute ────────────
         # BULL uniquement : 69% WR, +$34.75 historique
@@ -624,11 +630,8 @@ def get_signal(coin: str) -> dict | None:
         # Utilise rsi5 (M5, 14 périodes) — stable pendant les pompes, contrairement à rsi1
         # qui monte à 90+ en quelques minutes M1 et bloque tous les signaux de breakout.
         elif bbo_cond and _current_regime == "BULL":
-            signal    = "buy"
-            mode      = "BBO"
-            rsi_score = max(0.0, (85 - rsi5) / 40)      # rsi5=45 → 1.0 | rsi5=85 → 0.0
-            bb_score  = min(1.0, (bbp5 - 0.75) / 0.50)  # cassure plus forte = mieux
-            score     = round(vol_ratio_capped * 0.50 + rsi_score * 0.30 + bb_score * 0.20, 3)
+            signal, mode = "buy", "BBO"
+            score = _score_bbo(rsi5, bbp5, vol_ratio_capped)   # cassure plus forte = mieux
 
         bars3_str = ("3×↑" if bars3_bull else ("3×↓" if bars3_bear else
                      ("2×↑" if bars2_bull else ("2×↓" if bars2_bear else "✗"))))
@@ -639,13 +642,9 @@ def get_signal(coin: str) -> dict | None:
         # Signal bloqué par le régime → candidat fantôme (jamais tradé)
         if not signal and (mom_cond or bbo_cond):
             if mom_cond:
-                g_side, g_mode = "sell", "MOM"
-                g_score = round(vol_ratio_capped * 0.5 + max(0.0, (35 - rsi1) / 35) * 0.25
-                                + max(0.0, (0.35 - bbp5) / 0.35) * 0.25, 3)
+                g_side, g_mode, g_score = "sell", "MOM", _score_mom(rsi1, bbp5, vol_ratio_capped)
             else:
-                g_side, g_mode = "buy", "BBO"
-                g_score = round(vol_ratio_capped * 0.50 + max(0.0, (85 - rsi5) / 40) * 0.30
-                                + min(1.0, (bbp5 - 0.75) / 0.50) * 0.20, 3)
+                g_side, g_mode, g_score = "buy", "BBO", _score_bbo(rsi5, bbp5, vol_ratio_capped)
             _ghost_candidates.append({
                 "symbol": coin, "signal": g_side, "score": g_score, "atr_m5": atr5, "price": last5,
                 "conditions": {"rsi": round(rsi1, 1), "bbp": round(bbp5, 3),
@@ -662,15 +661,11 @@ def get_signal(coin: str) -> dict | None:
         if (not signal and not vol_ok and vol_ratio >= GHOST_VOL_MIN
                 and (mr_buy_nv or mr_sell_nv)):
             if mr_buy_nv:
-                g_side  = "buy"
-                g_score = ((70 - rsi1) / 40 * 0.25 + vol_ratio_capped * 0.4
-                           + (0.35 - bbp5) / 0.35 * 0.15 + 0.2)
+                g_side, g_score = "buy", _score_mr_buy(rsi1, bbp5, vol_ratio_capped)
             else:
-                g_side  = "sell"
-                g_score = ((rsi1 - 35) / 30 * 0.25 + vol_ratio_capped * 0.4
-                           + (bbp5 - 0.65) / 0.35 * 0.15 + 0.2)
+                g_side, g_score = "sell", _score_mr_sell(rsi1, bbp5, vol_ratio_capped)
             _ghost_candidates.append({
-                "symbol": coin, "signal": g_side, "score": round(g_score, 3), "atr_m5": atr5,
+                "symbol": coin, "signal": g_side, "score": g_score, "atr_m5": atr5,
                 "price": last5,
                 "conditions": {"rsi": round(rsi1, 1), "bbp": round(bbp5, 3),
                                "vol_ratio": round(vol_ratio, 2),
@@ -767,35 +762,39 @@ def get_market_regime() -> tuple[str, str, float, float]:
     Confirmation court-terme (3j) : si BULL sur 7j mais recul > -2% sur 3j → RANGING
     (évite les signaux BBO breakout pendant les pullbacks d'un bull market)
 
-    Retourne (regime, bias, btc_chg_pct, eth_chg_pct)
+    Retourne (regime, bias, btc_chg_pct, eth_chg_pct) ; RANGING si les données sont indisponibles.
     """
     try:
-        btc = fetch_candles("BTC", INTERVAL_D1, 8)
-        eth = fetch_candles("ETH", INTERVAL_D1, 8)
-        btc_chg = (btc[-1]["c"] - btc[0]["c"]) / btc[0]["c"] * 100
-        eth_chg = (eth[-1]["c"] - eth[0]["c"]) / eth[0]["c"] * 100
-
-        # DIVERGING : BTC et ETH se contredisent (>3% d'écart et dans des sens opposés)
-        if btc_chg > 3 and eth_chg < -3:
-            return "DIVERGING", "neutral", btc_chg, eth_chg
-        if btc_chg < -3 and eth_chg > 3:
-            return "DIVERGING", "neutral", btc_chg, eth_chg
-
-        avg_chg = (btc_chg + eth_chg) / 2
-
-        if avg_chg > 5:
-            # Confirmation court-terme : vérifier que le BULL n'est pas en pullback 3j
-            btc_3d = (btc[-1]["c"] - btc[-4]["c"]) / btc[-4]["c"] * 100 if len(btc) >= 4 else 0.0
-            eth_3d = (eth[-1]["c"] - eth[-4]["c"]) / eth[-4]["c"] * 100 if len(eth) >= 4 else 0.0
-            if (btc_3d + eth_3d) / 2 < -2.0:
-                # Pullback court-terme dans un bull market → traiter comme RANGING
-                return "RANGING", "neutral", btc_chg, eth_chg
-            return "BULL",    "up",      btc_chg, eth_chg
-        if avg_chg < -5:
-            return "BEAR",    "down",    btc_chg, eth_chg
-        return "RANGING",     "neutral", btc_chg, eth_chg
+        return _compute_regime()
     except Exception:
         return "RANGING", "neutral", 0.0, 0.0   # safe default
+
+def _compute_regime() -> tuple[str, str, float, float]:
+    """Cf. get_market_regime ; lève une exception si les bougies D1 sont indisponibles."""
+    btc = fetch_candles("BTC", INTERVAL_D1, 8)
+    eth = fetch_candles("ETH", INTERVAL_D1, 8)
+    btc_chg = (btc[-1]["c"] - btc[0]["c"]) / btc[0]["c"] * 100
+    eth_chg = (eth[-1]["c"] - eth[0]["c"]) / eth[0]["c"] * 100
+
+    # DIVERGING : BTC et ETH se contredisent (>3% d'écart et dans des sens opposés)
+    if btc_chg > 3 and eth_chg < -3:
+        return "DIVERGING", "neutral", btc_chg, eth_chg
+    if btc_chg < -3 and eth_chg > 3:
+        return "DIVERGING", "neutral", btc_chg, eth_chg
+
+    avg_chg = (btc_chg + eth_chg) / 2
+
+    if avg_chg > 5:
+        # Confirmation court-terme : vérifier que le BULL n'est pas en pullback 3j
+        btc_3d = (btc[-1]["c"] - btc[-4]["c"]) / btc[-4]["c"] * 100 if len(btc) >= 4 else 0.0
+        eth_3d = (eth[-1]["c"] - eth[-4]["c"]) / eth[-4]["c"] * 100 if len(eth) >= 4 else 0.0
+        if (btc_3d + eth_3d) / 2 < -2.0:
+            # Pullback court-terme dans un bull market → traiter comme RANGING
+            return "RANGING", "neutral", btc_chg, eth_chg
+        return "BULL",    "up",      btc_chg, eth_chg
+    if avg_chg < -5:
+        return "BEAR",    "down",    btc_chg, eth_chg
+    return "RANGING",     "neutral", btc_chg, eth_chg
 
 def load_initial_balance(current_balance: float) -> float:
     if os.path.exists(STATE_FILE):
@@ -883,12 +882,15 @@ def calc_qty(coin: str, price: float, size_mult: float = 1.0) -> float:
     sz = math.floor(sz * factor) / factor
     return max(f["sz_step"], sz)
 
-def round_px(price: float) -> float:
-    if price >= 1000: return round(price, 1)
-    if price >= 100:  return round(price, 2)
-    if price >= 10:   return round(price, 3)
-    if price >= 1:    return round(price, 4)
-    return round(price, 6)
+def round_px(price: float, coin: str | None = None) -> float:
+    """Prix accepté par Hyperliquid (perps) : 5 chiffres significatifs au plus et au plus
+    6 − szDecimals décimales (un prix entier est toujours valide). Avant : décimales fixes
+    par tranche de prix → 0.123456 (DOGE ≥ 0.1, XRP < 1) avait 6 chiffres → SL refusé."""
+    if price <= 0:
+        return price
+    decimals = 4 - math.floor(math.log10(price))          # 5 chiffres significatifs
+    sz_dec   = _sym_filters.get(coin, {}).get("sz_dec", 0) if coin else 0
+    return round(price, max(0, min(decimals, 6 - sz_dec)))
 
 # ── Levier ────────────────────────────────────────────────────────────────────
 def set_leverage(coin: str):
@@ -965,16 +967,16 @@ def place_order(sig: dict, wb: Workbook) -> dict:
     # SL/TP calculés sur le prix réellement exécuté (pas le mid d'avant l'ordre) :
     # le slippage autorisé (2%) dépasse largement la distance SL (1.5×ATR M5 ≈ 0.3-0.5%)
     if is_buy:
-        sl = round_px(entry_px - ATR_SL_MULT * atr)
-        tp = round_px(entry_px + ATR_TP_MULT * atr)
+        sl = round_px(entry_px - ATR_SL_MULT * atr, coin)
+        tp = round_px(entry_px + ATR_TP_MULT * atr, coin)
     else:
-        sl = round_px(entry_px + ATR_SL_MULT * atr)
-        tp = round_px(entry_px - ATR_TP_MULT * atr)
+        sl = round_px(entry_px + ATR_SL_MULT * atr, coin)
+        tp = round_px(entry_px - ATR_TP_MULT * atr, coin)
 
     # Ordres SL / TP (trigger reduce-only)
     close_buy = not is_buy
-    sl_lim = round_px(sl * 0.90) if is_buy else round_px(sl * 1.10)
-    tp_lim = round_px(tp * 1.10) if is_buy else round_px(tp * 0.90)
+    sl_lim = round_px(sl * 0.90, coin) if is_buy else round_px(sl * 1.10, coin)
+    tp_lim = round_px(tp * 1.10, coin) if is_buy else round_px(tp * 0.90, coin)
     sl_oid = None
     sl_ok  = False
 
@@ -1082,17 +1084,17 @@ def trail_sl(position: dict, current_price: float):
     # Cible SL selon la phase
     if profit_atr >= TRAIL_TRIGGER:
         # Phase trailing : SL à TRAIL_DIST×ATR du prix courant
-        new_sl = round_px(current_price - TRAIL_DIST * atr) if is_buy \
-                 else round_px(current_price + TRAIL_DIST * atr)
+        new_sl = round_px(current_price - TRAIL_DIST * atr, coin) if is_buy \
+                 else round_px(current_price + TRAIL_DIST * atr, coin)
         phase_label = f"TRAIL (profit={profit_atr:.1f}×ATR)"
     elif profit_atr >= 1.0:
         # Phase breakeven : SL juste au-delà de l'entrée pour couvrir les frais aller-retour
         # (au prix d'entrée exact, une sortie au SL perdait quand même ≈ 0.09 % de frais).
         # Plafonné à 0.5×ATR sous/au-dessus du prix courant pour ne pas déclencher immédiatement.
         if is_buy:
-            new_sl = round_px(min(entry * (1 + BE_BUFFER_PCT / 100), current_price - 0.5 * atr))
+            new_sl = round_px(min(entry * (1 + BE_BUFFER_PCT / 100), current_price - 0.5 * atr), coin)
         else:
-            new_sl = round_px(max(entry * (1 - BE_BUFFER_PCT / 100), current_price + 0.5 * atr))
+            new_sl = round_px(max(entry * (1 - BE_BUFFER_PCT / 100), current_price + 0.5 * atr), coin)
         phase_label = f"BREAKEVEN (profit={profit_atr:.1f}×ATR)"
     else:
         return  # Pas encore assez en profit
@@ -1107,7 +1109,7 @@ def trail_sl(position: dict, current_price: float):
     # Contrairement au SL initial (10%), on ne veut pas remplir à n'importe quel prix :
     # un BUY trail à $103 avec limite à $92.70 (10%) ne remplit pas si crash à $93 → perte.
     close_buy = not is_buy
-    sl_lim = round_px(new_sl * 0.98) if is_buy else round_px(new_sl * 1.02)
+    sl_lim = round_px(new_sl * 0.98, coin) if is_buy else round_px(new_sl * 1.02, coin)
     try:
         r = exchange.order(
             coin, close_buy, position["qty"],
@@ -1157,8 +1159,8 @@ def ensure_sl_orders(open_positions: list) -> int:
             if not any(o.get("oid") == pos.get("sl_oid") for o in stops):
                 pos["sl_oid"] = stops[0]["oid"]   # resynchroniser (ex. reprise état partiel)
             continue
-        sl     = round_px(pos["sl"])
-        sl_lim = round_px(sl * 0.90) if is_buy else round_px(sl * 1.10)
+        sl     = round_px(pos["sl"], coin)
+        sl_lim = round_px(sl * 0.90, coin) if is_buy else round_px(sl * 1.10, coin)
         try:
             r = exchange.order(coin, not is_buy, pos["qty"], limit_px=sl_lim,
                                order_type={"trigger": {"triggerPx": float(sl), "isMarket": True, "tpsl": "sl"}},
@@ -1371,10 +1373,9 @@ def recover_open_positions() -> tuple[list, float]:
         entry = float(p.get("entryPx") or 0)
         qty   = abs(size)
 
-        # Tenter d'enrichir avec l'état sauvegardé (sl_oid, atr réel, sl/tp précis)
+        # État sauvegardé (sl_oid, atr réel, sl/tp précis, opened_at, conditions, trailed)
         saved = saved_state.get(coin, {})
-        enriched = saved and saved.get("side") == side
-        if not enriched:
+        if saved.get("side") != side:
             # Wallet partagé avec BotCopyTrade : une position absente de notre état
             # n'est pas à nous → ne pas l'adopter (sinon SL posé / fermeture zombie sur la copie)
             print(f"  {C.BYLW}[REPRISE]{C.RST} {coin} {side} @ ${entry:.6g} inconnue de "
@@ -1386,36 +1387,22 @@ def recover_open_positions() -> tuple[list, float]:
                 f"elle n'est plus suivie (son SL/TP sur Hyperliquid reste actif).",
                 color=0xf39c12)
             continue
-        if enriched:
-            sl       = saved.get("sl",       (entry - ATR_SL_MULT * entry * 0.002) if side == "BUY" else (entry + ATR_SL_MULT * entry * 0.002))
-            tp       = saved.get("tp",       (entry + ATR_TP_MULT * entry * 0.002) if side == "BUY" else (entry - ATR_TP_MULT * entry * 0.002))
-            atr      = saved.get("atr",      entry * 0.002)
-            sl_oid   = saved.get("sl_oid")
-            open_fee = saved.get("open_fee", 0.0)
-            oid      = saved.get("id",       f"recovered-{coin}")
-        else:
-            atr_fb   = entry * 0.002
-            sl       = (entry - ATR_SL_MULT * atr_fb) if side == "BUY" else (entry + ATR_SL_MULT * atr_fb)
-            tp       = (entry + ATR_TP_MULT * atr_fb) if side == "BUY" else (entry - ATR_TP_MULT * atr_fb)
-            atr      = atr_fb
-            sl_oid   = None
-            open_fee = 0.0
-            oid      = f"recovered-{coin}"
-
-        # Restaurer opened_at, conditions, trailed — essentiels pour zombie-detection, leçons, TRAIL
-        opened_at  = saved.get("opened_at",  time.time()) if enriched else time.time()
-        conditions = saved.get("conditions", {})           if enriched else {}
-        trailed    = saved.get("trailed",    False)        if enriched else False
-        position   = {"id": oid, "symbol": coin, "side": side,
-                      "entry": entry, "qty": qty, "sl": sl, "tp": tp,
-                      "sl_oid": sl_oid, "atr": atr, "open_fee": open_fee,
-                      "opened_at": opened_at, "conditions": conditions, "trailed": trailed}
+        # Valeurs de repli (ATR ≈ 0.2 % du prix) si un champ manque dans un ancien état
+        atr = saved.get("atr", entry * 0.002)
+        sgn = 1 if side == "BUY" else -1
+        # opened_at, conditions, trailed : essentiels pour zombie-detection, leçons, TRAIL
+        position = {"id": saved.get("id", f"recovered-{coin}"), "symbol": coin, "side": side,
+                    "entry": entry, "qty": qty,
+                    "sl": saved.get("sl", entry - sgn * ATR_SL_MULT * atr),
+                    "tp": saved.get("tp", entry + sgn * ATR_TP_MULT * atr),
+                    "sl_oid": saved.get("sl_oid"), "atr": atr, "open_fee": saved.get("open_fee", 0.0),
+                    "opened_at": saved.get("opened_at", time.time()),
+                    "conditions": saved.get("conditions", {}), "trailed": saved.get("trailed", False)}
         recovered.append(position)
         capital_used += CAPITAL_PER_TRADE
 
         _sc  = C.BGRN if side == "BUY" else C.BRED
-        _enr = (C.BGRN + "état complet" + C.RST) if enriched else (C.BYLW + "état partiel" + C.RST)
-        print(f"  {C.BCYN}[REPRISE]{C.RST} {coin} {_sc}{side}{C.RST} @ ${entry:.6g}  ({_enr})")
+        print(f"  {C.BCYN}[REPRISE]{C.RST} {coin} {_sc}{side}{C.RST} @ ${entry:.6g}")
 
     return recovered, capital_used
 
@@ -1593,24 +1580,31 @@ def write_dashboard(wb: Workbook, open_positions: list, balance: float,
             trade_rows = '<tr><td colspan="6" style="text-align:center;color:#555">Aucun trade fermé encore</td></tr>'
 
         # ── Leçons apprises ────────────────────────────────────────────────────
+        # Mêmes statistiques que get_penalty : réels + fantômes pondérés, avec oubli progressif
+        # (avant : fantômes ignorés → "0 (apprentissage…)" affiché sur des patterns pénalisés)
         MIN_SAMPLES = 5
         les_data = _load_lessons().get("buckets", {})
-        all_buckets = sorted(les_data.items(),
-                             key=lambda x: x[1]["w"] / max(1, x[1]["w"] + x[1]["l"]))
+        all_buckets = sorted(((k, v, *_bucket_stats(v)) for k, v in les_data.items()),
+                             key=lambda x: x[3])
         lessons_rows = ""
-        for k, v in all_buckets[:20]:
-            total = v["w"] + v["l"]
-            wr    = v["w"] / total if total else 0
-            pen   = round(min((0.40 - wr) * 0.5, 0.25), 3) if wr < 0.40 and total >= MIN_SAMPLES else 0.0
+        for k, v, n, wr in all_buckets[:20]:
+            adj = 0.0
+            if n >= MIN_SAMPLES and wr < 0.40:
+                adj = round(min((0.40 - wr) * 0.5, 0.25), 3)
+            elif n >= MIN_SAMPLES and wr > 0.60:
+                adj = -round(min((wr - 0.60) * 0.5, 0.15), 3)
             wr_color = "#f87171" if wr < 0.35 else ("#fbbf24" if wr < 0.50 else "#4ade80")
-            pen_str  = f'<span style="color:#f87171;font-weight:600">−{pen}</span>' if pen > 0 else '<span style="color:#555">0 (apprentissage…)</span>'
-            pnl_v    = v["pnl"]
+            pen_str  = (f'<span style="color:#f87171;font-weight:600">−{adj}</span>' if adj > 0 else
+                        f'<span style="color:#4ade80;font-weight:600">+{-adj}</span>' if adj < 0 else
+                        '<span style="color:#555">0 (apprentissage…)</span>')
+            pnl_v    = v.get("pnl", 0.0)
             pnl_cls  = "gain" if pnl_v > 0 else "loss"
+            n_ghost  = v.get("gw", 0) + v.get("gl", 0)
             lessons_rows += f"""
             <tr>
               <td style="font-family:monospace;font-size:0.85em;color:#ccc">{k}</td>
               <td style="font-weight:700;color:{wr_color}">{wr*100:.0f}%</td>
-              <td style="color:#888">{v['w']}W / {v['l']}L ({total})</td>
+              <td style="color:#888">n={n:.1f} (réels {v.get('w', 0) + v.get('l', 0):.1f} · fantômes {n_ghost:.1f})</td>
               <td class="{pnl_cls}">{_fmt(pnl_v)}</td>
               <td>{pen_str}</td>
             </tr>"""
@@ -1755,7 +1749,7 @@ def write_dashboard(wb: Workbook, open_positions: list, balance: float,
     <h2>🧠 Leçons apprises (patterns pénalisés)</h2>
     <table>
       <thead>
-        <tr><th data-tip="Catégorie de trade apprise par le bot. Ex: coin_AVAX|buy = achats AVAX · rsi70-75|buy|BBO = breakout avec RSI 70-75 · bbp&gt;1.0 = prix au-dessus de la Bollinger haute · regime_BULL = trade en régime BULL">Pattern</th><th data-tip="Taux de réussite du pattern. Rouge &lt;35% (dangereux), orange &lt;50% (faible), vert &ge;50% (bon).">Win Rate</th><th>W/L</th><th>P&amp;L cumulé</th><th data-tip="Malus sur le score si WR &lt;40% avec &ge;5 trades. Plus le malus est fort, moins le bot entre dans ce type de trade. Max -0.25.">Pénalité score</th></tr>
+        <tr><th data-tip="Catégorie de trade apprise par le bot. Ex: coin_AVAX|buy = achats AVAX · rsi70-75|buy|BBO = breakout avec RSI 70-75 · bbp&gt;1.0 = prix au-dessus de la Bollinger haute · regime_BULL = trade en régime BULL">Pattern</th><th data-tip="Taux de réussite du pattern. Rouge &lt;35% (dangereux), orange &lt;50% (faible), vert &ge;50% (bon).">Win Rate</th><th data-tip="Nombre effectif de résultats : trades réels + fantômes (poids 0.5), les anciens comptant de moins en moins.">Échantillon</th><th>P&amp;L réel cumulé</th><th data-tip="Malus (rouge) sur le score si WR &lt;40 %, bonus (vert) si WR &gt;60 %, dès 5 résultats effectifs. Malus max 0.25, bonus max 0.15.">Ajustement score</th></tr>
       </thead>
       <tbody>{lessons_rows}</tbody>
     </table>
@@ -2034,7 +2028,7 @@ def run():
     while True:
         loop_start = time.time()
         ts      = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        now_min = datetime.now(timezone.utc).minute   # défini tôt — utilisé avant la section régime
+        now_min = datetime.now(timezone.utc).minute   # affichages console périodiques
         print(f"\n{C.DIM}[{ts}] ──────────────────────────────────────────────────{C.RST}")
 
         # ── Fetch unique par cycle : user_state sert pour check_position + equity + unrealized ──
@@ -2064,7 +2058,8 @@ def run():
             capital_in_use = max(0.0, capital_in_use - CAPITAL_PER_TRADE)
 
         # Surveillance des SL toutes les 5 min (1 appel API) — position sans stop = risque max
-        if open_positions and now_min % 5 == 0:
+        if open_positions and time.time() - run.__dict__.get("_sl_check_ts", 0) >= SL_CHECK_S:
+            run._sl_check_ts = time.time()
             if ensure_sl_orders(open_positions):
                 save_positions_state(open_positions)
 
@@ -2130,10 +2125,16 @@ def run():
         hour_utc = datetime.now(timezone.utc).hour
         in_session = SESSION_START_UTC <= hour_utc < SESSION_END_UTC
 
-        # Régime de marché — mis à jour toutes les 30 min (candles journalières, pas besoin de plus)
-        if "_regime_cache" not in run.__dict__ or now_min % 30 == 0:
-            run._regime_cache = get_market_regime()
-        regime, bias, btc_chg, eth_chg = run._regime_cache
+        # Régime de marché — mis à jour toutes les 30 min (candles journalières, pas besoin de plus).
+        # Échec Bybit → on garde le régime précédent et on réessaie au cycle suivant
+        # (avant : RANGING forcé pendant 30 min ; et "minute % 30" ratait parfois sa minute).
+        if time.time() - run.__dict__.get("_regime_ts", 0) >= REGIME_REFRESH_S:
+            try:
+                run._regime_cache = _compute_regime()
+                run._regime_ts    = time.time()
+            except Exception as e:
+                log_error(f"régime (précédent conservé) : {e}")
+        regime, bias, btc_chg, eth_chg = run.__dict__.get("_regime_cache", ("RANGING", "neutral", 0.0, 0.0))
         global _current_regime
         _current_regime = regime   # partagé avec get_signal() pour les leçons
         _rc = (C.BGRN if regime == "BULL" else
