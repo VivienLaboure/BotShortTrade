@@ -4,7 +4,8 @@
 
 Lit uniquement des fichiers locaux et le journal systemd (aucun secret, aucun appel réseau) :
   service systemd, erreurs du journal, messages Discord (discord_events.jsonl),
-  fantômes clos dans trades.xlsx (onglet Fantômes)
+  stratégie tendance (trend_state.json + onglet Tendance de trades.xlsx),
+  fantômes du scalping clos dans trades.xlsx (onglet Fantômes)
 """
 from __future__ import annotations
 import argparse, json, os, re, subprocess
@@ -64,6 +65,37 @@ def stats(pnls: list[float]) -> str:
     return f"n={n:4d}  WR={100 * sum(p > 0 for p in pnls) / n:3.0f}%  moy={mu:+.3f}%  t={t:+.1f}"
 
 
+def trend_report():
+    """Positions tendance en cours (trend_state.json) et bilan des positions fermées (onglet Tendance)."""
+    try:
+        with open(os.path.join(ROOT, "trend_state.json"), encoding="utf-8") as f:
+            positions = json.load(f).get("positions", {})
+    except Exception:
+        positions = {}
+    now = datetime.now(timezone.utc).timestamp()
+    print(f"  Positions en cours : {len(positions)}")
+    for coin, p in sorted(positions.items()):
+        print(f"    {coin:5s} {'LONG ' if p['side'] == 'BUY' else 'SHORT'} entrée {p['entry']:<10.6g} "
+              f"SL {p['sl']:<10.6g} {'fantôme' if p.get('paper') else 'réel'} · "
+              f"depuis {(now - p.get('opened_at', now)) / 86400:.1f} j")
+    path = os.path.join(ROOT, "trades.xlsx")
+    if not os.path.exists(path):
+        return
+    from openpyxl import load_workbook
+    wb = load_workbook(path, read_only=True)
+    if "Tendance" not in wb.sheetnames:
+        return
+    rows = list(wb["Tendance"].iter_rows(values_only=True))
+    h = {name: i for i, name in enumerate(rows[0])}
+    closed = [r for r in rows[1:] if r[h["P&L $"]] is not None]
+    for mode in ("Réel", "Fantôme"):
+        rs = [r for r in closed if r[h["Mode"]] == mode]
+        if rs:
+            pnl = [r[h["P&L $"]] for r in rs]
+            print(f"  Fermées ({mode.lower()}) : {len(rs)} · gagnantes {sum(x > 0 for x in pnl)} · "
+                  f"P&L ${sum(pnl):+.2f} · moy {sum(r[h['P&L %']] for r in rs) / len(rs):+.2f} % du notionnel")
+
+
 def ghost_report(since: str):
     path = os.path.join(ROOT, "trades.xlsx")
     if not os.path.exists(path):
@@ -118,7 +150,9 @@ def main():
         print(f"    ×{n:<3d} {k[:140]}")
     print("\n  Messages Discord :")
     print_events(read_events(os.path.join(ROOT, "discord_events.jsonl"), since), "💓")
-    print()
+    print("\n  Stratégie tendance :")
+    trend_report()
+    print("\n  Fantômes du scalping (désactivé depuis le 2026-11-02) :")
     ghost_report(a.since)
 
 

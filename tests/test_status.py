@@ -49,6 +49,30 @@ class TestStatus(unittest.TestCase):
         self.assertIn("aurait été tradé (stratégie actuelle) :  n=   1  WR=100%  moy=+0.500%", txt)
         self.assertIn("filtrés / bloqués :  n=   1  WR=  0%  moy=-0.200%", txt)
 
+    def test_bilan_tendance(self):
+        with open(os.path.join(self.dir, "trend_state.json"), "w") as f:
+            json.dump({"positions": {"ETH": {"side": "BUY", "entry": 2000, "sl": 1800, "paper": True,
+                                             "opened_at": 0}}}, f)
+        wb = Workbook(); wb.active.title = "Trades"
+        ws = wb.create_sheet("Tendance")
+        ws.append(["ID", "Ouvert (UTC)", "Symbole", "Côté", "Mode", "Qté", "Entrée", "SL",
+                   "Notionnel $", "Statut", "Sortie", "P&L $", "P&L %", "Fermé (UTC)"])
+        row = lambda mode, pnl, pct: ["P", "", "SOL/USDT", "SELL", mode, 1, 1, 1, 11, "x", 1, pnl, pct, ""]
+        ws.append(row("Fantôme", 1.5, 13.0))
+        ws.append(row("Fantôme", -0.5, -5.0))
+        ws.append(row("Réel", None, None))        # encore ouverte
+        wb.save(os.path.join(self.dir, "trades.xlsx"))
+        out = []
+        with mock.patch.object(S, "ROOT", self.dir), \
+             mock.patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))):
+            S.trend_report()
+        txt = "\n".join(out)
+        self.assertIn("Positions en cours : 1", txt)
+        self.assertIn("ETH   LONG  entrée 2000", txt)
+        self.assertIn("fantôme", txt)
+        self.assertIn("Fermées (fantôme) : 2 · gagnantes 1 · P&L $+1.00 · moy +4.00 % du notionnel", txt)
+        self.assertNotIn("Fermées (réel)", txt)
+
 
 if __name__ == "__main__":
     unittest.main()

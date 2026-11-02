@@ -10,7 +10,7 @@ Aucun appel réseau, aucun ordre réel, aucun message Discord :
   - requests.get/post lèvent une erreur si un test oublie de les mocker
   - exécution dans un dossier temporaire (trades.xlsx, bot_state.json… factices)
 """
-import json, os, sys, tempfile, types, unittest
+import json, os, sys, tempfile, time, types, unittest
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -100,9 +100,10 @@ SIG = {"symbol": "ETH", "signal": "buy", "score": 0.8, "atr_m5": 5.0, "price": 2
 
 class BaseTest(unittest.TestCase):
     def setUp(self):
-        for f in (m.EXCEL_FILE, m.STATE_FILE, m.LESSONS_FILE):
+        for f in (m.EXCEL_FILE, m.STATE_FILE, m.LESSONS_FILE, m.TREND_FILE):
             if os.path.exists(f):
                 os.remove(f)
+        m._trend = None; m._trend_sig.clear(); m._trend_alerted.clear(); m._trend_sl_ts = 0.0
         self.alerts = []
         self._p = [
             mock.patch.object(m, "send_discord_alert",
@@ -739,7 +740,7 @@ class LoopInfo(FakeInfo):
 
 class TestRunLoop(BaseTest):
     def run_loop(self, daily_chg, asset_positions=None, get_signal=None, d1_failures=0,
-                 keep_regime=False):
+                 keep_regime=False, strategy="scalp", trend_closes=None):
         if os.path.exists(m.GHOST_FILE):
             os.remove(m.GHOST_FILE)
         m._ghosts = None
@@ -758,10 +759,13 @@ class TestRunLoop(BaseTest):
                 cycles.append(sec)
                 if len(cycles) >= 2:
                     raise _StopLoop()
-        d1_calls = []
+        d1_calls, self.m1_calls = [], []
         def fc(coin, iv, n, **k):
             if iv != m.INTERVAL_D1:
+                self.m1_calls.append(coin)
                 return _declin(n)
+            if n == m.TREND_LOOKBACK_D + 2:      # signal de la stratégie tendance
+                return _d1(trend_closes or [100.0] * 30)
             d1_calls.append(coin)
             if len(d1_calls) <= d1_failures:
                 raise RuntimeError("Bybit kline BTCUSDT: Too many visits")
@@ -770,6 +774,7 @@ class TestRunLoop(BaseTest):
              mock.patch.object(m, "fetch_candles", fc), \
              mock.patch.object(m.time, "sleep", fake_sleep), \
              mock.patch.object(m, "HEARTBEAT_HOURS", 1e-9), \
+             mock.patch.object(m, "STRATEGY", strategy), \
              mock.patch.object(m, "get_signal", get_signal or m.get_signal):
             with self.assertRaises(_StopLoop):
                 m.run()
@@ -842,6 +847,19 @@ class TestRunLoop(BaseTest):
         m.run._regime_ts = 0.0     # recalcul dû…
         ex, ghosts = self.run_loop(-2, d1_failures=99, keep_regime=True)   # …mais Bybit échoue
         self.assertTrue(ghosts and all(g["reason"] == "régime BEAR" for g in ghosts))
+
+    def test_strategie_tendance_fantome_sans_scalping(self):
+        """Mode tendance + GHOST_ONLY : une position fantôme par coin, aucun ordre, aucun scan
+        M1/M5 du scalping, et le heartbeat résume les positions tendance."""
+        with mock.patch.object(m, "GHOST_ONLY", True):
+            ex, ghosts = self.run_loop(-2, strategy="trend", trend_closes=TestTrend.UP)
+        self.assertEqual(ex.orders, [])
+        self.assertEqual(self.m1_calls, [])
+        self.assertEqual(ghosts, [])
+        self.assertEqual(set(m._load_trend()["positions"]), set(m.WATCHLIST))
+        self.assertIn("tendance journalière", dict(self.alerts)["🚀 Bot démarré"])
+        hb = [d for t, d in self.alerts if "résumé" in t]
+        self.assertTrue(hb and "Tendance : DOGE LONG +0.0 %" in hb[0])
 
     def test_ranging_mom_bloque_suivi_en_fantome(self):
         ex, ghosts = self.run_loop(-2)
@@ -986,6 +1004,234 @@ class TestDiscordJournal(unittest.TestCase):
              mock.patch("sys.stdout", new_callable=io.StringIO):
             m.send_discord_alert("t", "d")
         self.assertEqual(len(sent), 1)
+
+
+
+# ── Stratégie tendance journalière ───────────────────────────────────────────
+def _d1(closes):
+    """Bougies D1 closes se terminant hier (UTC), une par clôture (range ±2 % → ATR ≈ 4 % du prix)."""
+    y, n = (int(m.time.time()) // 86400 - 1) * 86_400_000, len(closes)
+    return [{"ts": y - (n - 1 - i) * 86_400_000, "o": c, "h": c * 1.02, "l": c * 0.98, "c": c, "v": 1.0}
+            for i, c in enumerate(closes)]
+
+class TrendExchange:
+    """Hyperliquid simulé : journalise ouvertures, SL, fermetures et annulations."""
+    def __init__(self, avg_px=100.0, sl=None, close_ok=True):
+        self.avg_px, self.close_ok, self.sl, self.calls = avg_px, close_ok, sl or [_ok(21)], []
+    def update_leverage(self, *a, **k): return {"status": "ok"}
+    def market_open(self, coin, is_buy, qty, px=None, slippage=0.02):
+        self.calls.append(("open", coin, is_buy, qty))
+        return {"status": "ok", "response": {"data": {"statuses": [
+            {"filled": {"oid": 7, "avgPx": str(self.avg_px), "totalSz": str(qty)}}]}}}
+    def order(self, coin, is_buy, qty, limit_px, order_type, reduce_only):
+        trig = order_type["trigger"]
+        self.calls.append((trig["tpsl"], coin, is_buy, trig["triggerPx"]))
+        return self.sl.pop(0) if len(self.sl) > 1 else self.sl[0]
+    def market_close(self, coin, slippage=0.05):
+        self.calls.append(("close", coin))
+        return {"status": "ok"} if self.close_ok else {"status": "err"}
+    def cancel(self, coin, oid):
+        self.calls.append(("cancel", coin, oid))
+        return {"status": "ok"}
+
+def _held(coin, szi):
+    return {"position": {"coin": coin, "szi": str(szi), "entryPx": "90", "unrealizedPnl": "0"}}
+
+class TestTrend(BaseTest):
+    UP   = [90.0] * 29 + [100.0]     # clôture > celle d'il y a 28 jours → LONG
+    DOWN = [110.0] * 29 + [100.0]    # → SHORT
+
+    def setUp(self):
+        super().setUp()
+        self.wb = m.init_excel()
+        m._trend_sl_ts = 1e18        # surveillance des SL testée à part
+        self.fetches = []
+
+    def cycle(self, ex=None, ghost=False, closes=None, per_coin=None, held=(), fills=None,
+              mids=None, orders=None, equity=111.0):
+        perp = {"assetPositions": list(held)}
+        info = OrdersInfo(orders=orders or [], mids=mids or {c: "100" for c in m.WATCHLIST},
+                          perp=perp, fills=fills or [])
+        ex = ex or TrendExchange()
+        def fc(coin, iv, n, **k):
+            self.fetches.append((coin, iv, n))
+            return _d1((per_coin or {}).get(coin, closes or self.UP))
+        with mock.patch.object(m, "info", info), mock.patch.object(m, "exchange", ex), \
+             mock.patch.object(m, "fetch_candles", fc), mock.patch.object(m, "GHOST_ONLY", ghost):
+            closed = m.trend_cycle(self.wb, perp, equity)
+        return ex, closed
+
+    def real_eth(self, side="BUY", **k):
+        pos = {"id": "7", "symbol": "ETH", "side": side, "entry": 90.0, "qty": 0.12,
+               "sl": 80.0 if side == "BUY" else 100.0, "sl_oid": 5, "atr": 3.0, "open_fee": 0.005,
+               "opened_at": time.time() - 3 * 86400, "paper": False, **k}
+        m._load_trend()["positions"]["ETH"] = pos
+        return pos
+
+    def eth_calls(self, ex):
+        return [c for c in ex.calls if c[1] == "ETH"]
+
+    # ── Signal ──
+    def test_signal_long_short_une_requete_par_coin_et_par_jour(self):
+        with mock.patch.object(m, "fetch_candles",
+                               lambda c, iv, n, **k: self.fetches.append((c, iv, n)) or
+                               _d1(self.UP if c == "ETH" else self.DOWN)):
+            self.assertEqual(m.trend_signal("ETH")[0], "BUY")
+            self.assertEqual(m.trend_signal("SOL")[0], "SELL")
+            side, close, atr = m.trend_signal("ETH")
+        self.assertEqual(self.fetches, [("ETH", "1D", 30), ("SOL", "1D", 30)])
+        self.assertEqual(close, 100.0)
+        self.assertGreater(atr, 2.0)
+
+    def test_signal_attend_la_bougie_d_hier(self):
+        """Juste après minuit, Bybit n'a pas encore publié la bougie d'hier : pas de signal
+        (sinon décision sur l'avant-veille), nouvel essai au cycle suivant."""
+        stale = [dict(c, ts=c["ts"] - 86_400_000) for c in _d1(self.UP)]
+        with mock.patch.object(m, "fetch_candles", lambda *a, **k: self.fetches.append(a) or stale):
+            self.assertIsNone(m.trend_signal("ETH"))
+            self.assertIsNone(m.trend_signal("ETH"))
+        self.assertEqual(len(self.fetches), 2)
+
+    def test_quantite_minimum_hyperliquid_et_arrondi(self):
+        with mock.patch.dict(m._sym_filters, {"XRP": {"sz_dec": 0, "sz_step": 1}}):
+            self.assertEqual(m._trend_qty("XRP", 2.5, 111.0), 5)     # 11.10 $ → 4.44 → arrondi au-dessus
+            self.assertEqual(m._trend_qty("XRP", 2.5, 1000.0), 40)   # 100 $ pile
+            self.assertEqual(m._trend_qty("XRP", 2.5, 50.0), 0)      # 11 $ > 10 $ par coin → refus
+        # Long avec SL 12 % plus bas : l'ordre stop doit aussi valoir ≥ 11 $ → 0.125 (12.50 $) au lieu de 0.111
+        self.assertEqual(m._trend_qty("ETH", 100.0, 111.0, 88.0), 0.125)
+        self.assertEqual(m._trend_qty("ETH", 100.0, 111.0, 112.0), 0.111)   # short : SL au-dessus, sans effet
+
+    # ── Mode fantôme ──
+    def test_fantome_ouvre_une_position_par_coin_sans_ordre(self):
+        ex, _ = self.cycle(ghost=True, per_coin={"SOL": self.DOWN})
+        self.assertEqual(ex.calls, [])
+        pos = m._load_trend()["positions"]
+        self.assertEqual({c: p["side"] for c, p in pos.items()},
+                         {"ETH": "BUY", "LTC": "BUY", "DOGE": "BUY", "XRP": "BUY", "SOL": "SELL"})
+        self.assertTrue(all(p["paper"] for p in pos.values()))
+        self.assertLess(pos["ETH"]["sl"], 100.0)
+        self.assertGreater(pos["SOL"]["sl"], 100.0)
+        self.assertAlmostEqual(abs(pos["ETH"]["sl"] - 100.0), m.TREND_SL_ATR * pos["ETH"]["atr"], delta=0.01)
+        rows = list(self.wb["Tendance"].iter_rows(min_row=2, values_only=True))
+        self.assertEqual([r[4] for r in rows], ["Fantôme"] * 5)
+        self.cycle(ghost=True, per_coin={"SOL": self.DOWN})          # même signal : rien de nouveau
+        self.assertEqual(self.wb["Tendance"].max_row, 6)
+        m._trend = None                                               # redémarrage
+        self.assertEqual(set(m._load_trend()["positions"]), set(m.WATCHLIST))
+
+    def test_fantome_sl_touche_puis_a_plat_jusqu_a_demain(self):
+        self.cycle(ghost=True)
+        sl = m._load_trend()["positions"]["ETH"]["sl"]
+        mids = {c: "100" for c in m.WATCHLIST}
+        mids["ETH"] = str(sl - 0.5)
+        _, closed = self.cycle(ghost=True, mids=mids)
+        self.assertEqual([(p["symbol"], p["status"]) for p in closed], [("ETH", "SL touché")])
+        self.assertLess(closed[0]["pnl"], 0)
+        _, closed = self.cycle(ghost=True)
+        self.assertEqual(closed, [])
+        self.assertNotIn("ETH", m._load_trend()["positions"])
+
+    # ── Réel ──
+    def test_inversion_du_signal_ferme_puis_ouvre_en_sens_inverse(self):
+        self.real_eth()
+        fills = [{"coin": "ETH", "dir": "Close Long", "time": time.time() * 1000, "oid": 9,
+                  "closedPnl": "1.2", "fee": "0.005"}]
+        ex, closed = self.cycle(closes=self.DOWN, held=[_held("ETH", 0.12)], fills=fills)
+        calls = self.eth_calls(ex)
+        self.assertEqual([c[0] for c in calls], ["close", "cancel", "open", "sl"])
+        self.assertEqual(calls[1], ("cancel", "ETH", 5))
+        self.assertFalse(calls[2][2])                    # vente
+        self.assertTrue(calls[3][2] and calls[3][3] > 100.0)   # SL d'un short : rachat au-dessus
+        self.assertNotIn("tp", [c[0] for c in ex.calls])       # pas de TP : sortie à l'inversion
+        self.assertEqual([(p["symbol"], p["status"]) for p in closed], [("ETH", "signal inversé")])
+        self.assertAlmostEqual(closed[0]["pnl"], 1.2 - 0.005 - 0.005)
+        new = m._load_trend()["positions"]["ETH"]
+        self.assertEqual((new["side"], new["sl_oid"], new["paper"]), ("SELL", 21, False))
+
+    def test_sl_reel_touche_pas_de_reouverture_le_meme_jour(self):
+        self.real_eth()
+        fills = [{"coin": "ETH", "dir": "Close Long", "time": time.time() * 1000, "oid": 9,
+                  "closedPnl": "-1.5", "fee": "0.005"}]
+        ex, closed = self.cycle(fills=fills)              # ETH absent du compte : SL exécuté
+        self.assertEqual([(p["symbol"], p["status"]) for p in closed], [("ETH", "SL touché")])
+        self.assertAlmostEqual(closed[0]["pnl"], -1.51)
+        self.assertEqual(self.eth_calls(ex), [])
+        ex, _ = self.cycle()
+        self.assertEqual(self.eth_calls(ex), [])
+        self.assertEqual(len([c for c in ex.calls if c[0] == "open"]), 0)   # les 4 autres déjà ouverts
+
+    def test_fill_de_fermeture_absent_attend_3_cycles(self):
+        self.real_eth()
+        for _ in range(2):
+            _, closed = self.cycle()
+            self.assertEqual(closed, [])
+            self.assertIn("ETH", m._load_trend()["positions"])
+        _, closed = self.cycle()
+        self.assertEqual([p["symbol"] for p in closed], ["ETH"])
+
+    def test_coin_tenu_par_un_autre_bot_jamais_ouvert(self):
+        ex, _ = self.cycle(held=[_held("SOL", -0.5)])
+        self.assertEqual(sorted(c[1] for c in ex.calls if c[0] == "open"), ["DOGE", "ETH", "LTC", "XRP"])
+        self.assertNotIn("SOL", m._load_trend()["positions"])
+
+    def test_compte_illisible_aucune_ouverture_reelle(self):
+        ex = TrendExchange()
+        info = OrdersInfo(mids={c: "100" for c in m.WATCHLIST})
+        with mock.patch.object(m, "info", info), mock.patch.object(m, "exchange", ex), \
+             mock.patch.object(m, "fetch_candles", lambda *a, **k: _d1(self.UP)), \
+             mock.patch.object(m, "GHOST_ONLY", False):
+            m.trend_cycle(self.wb, None, 111.0)
+        self.assertEqual(ex.calls, [])
+
+    def test_fin_du_mode_fantome_bascule_en_reel(self):
+        self.cycle(ghost=True)
+        ex, closed = self.cycle()
+        self.assertEqual({p["status"] for p in closed}, {"fin du mode fantôme"})
+        self.assertEqual(len(closed), 5)
+        self.assertEqual(len([c for c in ex.calls if c[0] == "open"]), 5)
+        self.assertFalse(any(p["paper"] for p in m._load_trend()["positions"].values()))
+
+    def test_position_reelle_gardee_si_retour_en_mode_fantome(self):
+        self.real_eth()
+        ex, _ = self.cycle(ghost=True, held=[_held("ETH", 0.12)])
+        self.assertEqual(self.eth_calls(ex), [])
+        self.assertFalse(m._load_trend()["positions"]["ETH"]["paper"])
+
+    def test_sl_refuse_deux_fois_referme_et_attend_demain(self):
+        ex = TrendExchange(sl=[_err()])
+        ex, _ = self.cycle(ex=ex, closes=None, per_coin=None)
+        self.assertEqual([c[0] for c in self.eth_calls(ex)], ["open", "sl", "sl", "close"])
+        self.assertEqual(m._load_trend()["positions"], {})
+        self.assertEqual(self.titles().count("⚠️ Tendance : ETH non ouvert"), 1)
+        n = len(ex.calls)
+        self.cycle(ex=ex)
+        self.assertEqual(len(ex.calls), n)                           # pas de nouvel essai aujourd'hui
+        self.assertEqual(self.titles().count("⚠️ Tendance : ETH non ouvert"), 1)
+
+    def test_fermeture_refusee_garde_la_position_et_n_ouvre_pas_l_inverse(self):
+        self.real_eth()
+        ex, closed = self.cycle(ex=TrendExchange(close_ok=False), closes=self.DOWN, held=[_held("ETH", 0.12)])
+        self.assertEqual([c[0] for c in self.eth_calls(ex)], ["close"])
+        self.assertEqual(closed, [])
+        self.assertEqual(m._load_trend()["positions"]["ETH"]["side"], "BUY")
+        self.assertIn("⚠️ Tendance : fermeture ETH échouée", self.titles())
+
+    def test_sl_tendance_manquant_repose(self):
+        self.real_eth()
+        m._trend_sl_ts = 0.0
+        ex, _ = self.cycle(held=[_held("ETH", 0.12)], orders=[])
+        self.assertIn(("sl", "ETH", False, 80.0), ex.calls)
+        self.assertEqual(m._load_trend()["positions"]["ETH"]["sl_oid"], 21)
+
+    def test_reprise_scalping_ignore_les_positions_tendance(self):
+        """Une position tendance n'est ni adoptée par le scalping ni signalée « non reprise »."""
+        self.real_eth()
+        m._save_trend()
+        m._trend = None
+        with mock.patch.object(m, "info", FakeInfo(perp={"assetPositions": [_held("ETH", 0.12)]})):
+            rec, _ = m.recover_open_positions()
+        self.assertEqual(rec, [])
+        self.assertEqual(self.titles(), [])
 
 
 if __name__ == "__main__":

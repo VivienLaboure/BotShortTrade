@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""
+Backtest — stratégie tendance journalière de BotShortTrade (main.trend_cycle)
+============================================================================
+Rejoue la règle du bot, avec ses paramètres (lus dans main.py), sur l'historique journalier :
+  - LONG si la clôture D1 dépasse celle d'il y a TREND_LOOKBACK_D jours, SHORT sinon ;
+  - quantité fixée à l'ouverture (TREND_EXPOSURE × équité / nb de coins), tenue jusqu'à l'inversion ;
+  - SL à TREND_SL_ATR × ATR14 D1, puis à plat jusqu'à la clôture journalière suivante ;
+  - frais taker 0.0432 % par côté ; funding Bybit (avant son historique : longs 15 %/an, shorts 0).
+Données publiques mises en cache dans backtest_data/ : bougies D1 Binance (depuis 2017) + funding Bybit.
+
+Usage :
+    python3 tools/trend_backtest.py                # rapport par période
+    python3 tools/trend_backtest.py --perm 500     # + témoin par permutation (lent)
+    python3 tools/trend_backtest.py --expo 1.0     # autre exposition
+
+Témoin « permutation » : le signal de chaque coin est décalé d'un nombre aléatoire de jours (même
+proportion long/short, même rythme d'inversions, mais plus aligné sur les prix). p = part des tirages
+au moins aussi bons que la vraie stratégie ; un signal sans valeur donne p ≈ 0.5.
+
+Résultats du 2026-11-02 (5 coins, exposition 50 %) : 2017→2026 +35 %/an, t=2.7, pire baisse −49 % ;
+2021→2026 +11 %/an, t=1.2, pire baisse −32 % ; dernière année ≈ 0 %. Avantage réel mais affaibli.
+"""
+from __future__ import annotations
+
+import argparse, json, math, os, random, statistics, sys, time, urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from backtest import CACHE_DIR, load_bot   # import isolé de main.py (aucun ordre, .env jamais lu)
+
+FEE        = 0.000432
+BINANCE    = "https://data-api.binance.vision/api/v3/klines"
+BYBIT_FUND = "https://api.bybit.com/v5/market/funding/history"
+DAY_MS     = 86_400_000
+
+
+def _get(url: str):
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(url, timeout=20) as r:
+                return json.load(r)
+        except Exception:
+            time.sleep(1 + attempt)
+    raise RuntimeError(f"injoignable : {url}")
+
+def download(coins: list[str], refresh: bool = False) -> None:
+    """Bougies D1 Binance et funding Bybit de chaque coin (cache de moins d'un jour réutilisé)."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    for coin in coins:
+        path = os.path.join(CACHE_DIR, f"{coin}_trend_1d.json")
+        if not refresh and os.path.exists(path) and time.time() - os.path.getmtime(path) < DAY_MS / 1000:
+            continue
+        rows, start = {}, 0
+        while True:
+            lst = _get(f"{BINANCE}?symbol={coin}USDT&interval=1d&limit=1000&startTime={start}")
+            for k in lst:
+                rows[int(k[0])] = [float(x) for x in k[1:5]]
+            if len(lst) < 1000:
+                break
+            start = int(lst[-1][0]) + 1
+            time.sleep(0.2)
+        fund, end = {}, int(time.time() * 1000)
+        while True:
+            lst = _get(f"{BYBIT_FUND}?category=linear&symbol={coin}USDT&limit=200&endTime={end}")["result"]["list"]
+            for r in lst:
+                fund[int(r["fundingRateTimestamp"])] = float(r["fundingRate"])
+            if len(lst) < 200:
+                break
+            end = min(int(r["fundingRateTimestamp"]) for r in lst) - 1
+            time.sleep(0.15)
+        with open(path, "w") as f:
+            json.dump({"d1": [[k] + rows[k] for k in sorted(rows)], "funding": sorted(fund.items())}, f)
+        print(f"  {coin} : {len(rows)} jours, {len(fund)} funding", file=sys.stderr)
+
+def load(coins: list[str]) -> dict:
+    """{coin: {"days": [...], "ohlc": {jour: (o, h, l, c)}, "fund": {jour: taux cumulé}, "fund_start": jour}}"""
+    data = {}
+    for coin in coins:
+        with open(os.path.join(CACHE_DIR, f"{coin}_trend_1d.json")) as f:
+            raw = json.load(f)
+        fund: dict[int, float] = {}
+        for ts, r in raw["funding"]:
+            fund[ts // DAY_MS * DAY_MS] = fund.get(ts // DAY_MS * DAY_MS, 0.0) + r
+        ohlc = {r[0]: tuple(r[1:5]) for r in raw["d1"]}
+        data[coin] = {"days": sorted(ohlc), "ohlc": ohlc, "fund": fund,
+                      "fund_start": min(fund) if fund else float("inf")}
+    return data
+
+def signals(data: dict, lookback: int) -> dict[str, dict[int, int]]:
+    """Signal décidé à la clôture de chaque jour : +1 long, −1 short."""
+    out = {}
+    for coin, d in data.items():
+        cl = [d["ohlc"][t][3] for t in d["days"]]
+        out[coin] = {d["days"][i]: (1 if cl[i] > cl[i - lookback] else -1) for i in range(lookback, len(cl))}
+    return out
+
+def shifted(sig: dict[str, dict[int, int]], rnd: random.Random) -> dict[str, dict[int, int]]:
+    """Témoin : chaque série de signaux décalée circulairement d'un nombre aléatoire de jours."""
+    out = {}
+    for coin, s in sig.items():
+        days = sorted(s)
+        vals = [s[t] for t in days]
+        k = rnd.randrange(1, len(vals))
+        out[coin] = dict(zip(days, vals[k:] + vals[:k]))
+    return out
+
+def simulate(data: dict, sig: dict, sl_atr: float, expo: float, start: int | None = None,
+             end: int | None = None) -> list[tuple[int, float]]:
+    """Courbe d'équité (jour, équité) de la règle du bot, équité initiale 1."""
+    coins = list(data)
+    days  = sorted(set().union(*[set(d["days"]) for d in data.values()]))
+    E, pos, curve = 1.0, {}, []
+    hist: dict[str, list[tuple]] = {c: [] for c in coins}
+    for day in days:
+        live = (start is None or day >= start) and (end is None or day < end)
+        for c in coins:                       # journée : SL, valorisation, funding
+            bar = data[c]["ohlc"].get(day)
+            if not bar:
+                continue
+            hist[c].append(bar)
+            p = pos.get(c)
+            if not p or not live:
+                continue
+            o, h, l, cl = bar
+            if (p["s"] > 0 and l <= p["sl"]) or (p["s"] < 0 and h >= p["sl"]):
+                gap = (p["s"] > 0 and o < p["sl"]) or (p["s"] < 0 and o > p["sl"])
+                px = o if gap else p["sl"]
+                E += p["s"] * p["q"] * (px - p["last"]) - FEE * p["q"] * px
+                del pos[c]
+                continue
+            f = data[c]["fund"].get(day, 0.15 / 365 if day < data[c]["fund_start"] else 0.0)
+            if day < data[c]["fund_start"] and p["s"] < 0:
+                f = 0.0                           # prudent : les shorts ne touchent rien avant Bybit
+            E += p["s"] * p["q"] * (cl - p["last"]) - p["s"] * f * p["q"] * cl
+            p["last"] = cl
+        if not live:
+            continue
+        for c in coins:                       # clôture : inversion → fermeture, puis ouverture
+            want, hh = sig[c].get(day), hist[c]
+            if want is None or day not in data[c]["ohlc"] or len(hh) < 15:
+                continue
+            cl, p = hh[-1][3], pos.get(c)
+            if p and p["s"] != want:
+                E -= FEE * p["q"] * cl
+                del pos[c]
+                p = None
+            if not p:
+                atr = sum(max(hh[j][1] - hh[j][2], abs(hh[j][1] - hh[j - 1][3]), abs(hh[j][2] - hh[j - 1][3]))
+                          for j in range(-14, 0)) / 14
+                q = expo * E / len(coins) / cl
+                E -= FEE * q * cl
+                pos[c] = {"s": want, "q": q, "last": cl, "sl": cl - want * sl_atr * atr}
+        curve.append((day, E))
+    return curve
+
+def stats(curve: list[tuple[int, float]]) -> dict:
+    rets = [b[1] / a[1] - 1 for a, b in zip(curve, curve[1:])]
+    mu, sd = statistics.mean(rets), statistics.stdev(rets)
+    peak, dd = 0.0, 0.0
+    for _, e in curve:
+        peak = max(peak, e)
+        dd = min(dd, e / peak - 1)
+    years = len(rets) / 365
+    return {"cagr": (curve[-1][1] / curve[0][1]) ** (1 / years) - 1, "sharpe": mu / sd * math.sqrt(365),
+            "t": mu / (sd / math.sqrt(len(rets))), "dd": dd, "mean": mu}
+
+def _fmt(label: str, curve: list) -> str:
+    s = stats(curve)
+    span = "→".join(time.strftime("%Y-%m", time.gmtime(t / 1000)) for t in (curve[0][0], curve[-1][0]))
+    return (f"{label:24s} {span}  {s['cagr'] * 100:+6.1f} %/an  sharpe={s['sharpe']:+.2f}  "
+            f"t={s['t']:+.2f}  pire baisse={s['dd'] * 100:5.1f} %")
+
+
+def main_cli(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--expo", type=float, default=None, help="exposition (défaut : TREND_EXPOSURE du bot)")
+    ap.add_argument("--perm", type=int, default=0, help="nb de tirages du témoin permutation")
+    ap.add_argument("--refresh", action="store_true")
+    ap.add_argument("--no-download", action="store_true")
+    a = ap.parse_args(argv)
+
+    bot = load_bot()
+    coins, expo = list(bot.WATCHLIST), a.expo if a.expo is not None else bot.TREND_EXPOSURE
+    if not a.no_download:
+        download(coins, a.refresh)
+    data = load(coins)
+    sig  = signals(data, bot.TREND_LOOKBACK_D)
+    sim  = lambda s, **k: simulate(data, s, bot.TREND_SL_ATR, expo, **k)
+    now  = int(time.time() * 1000)
+    print(f"Tendance {bot.TREND_LOOKBACK_D} j · SL {bot.TREND_SL_ATR:g}×ATR · exposition {expo:.0%} · {', '.join(coins)}\n")
+    full = sim(sig)
+    print(_fmt("toute la période", full))
+    for label, start in (("5 dernières années", now - 5 * 365 * DAY_MS),
+                         ("2 dernières années", now - 2 * 365 * DAY_MS),
+                         ("dernière année", now - 365 * DAY_MS)):
+        print(_fmt(label, sim(sig, start=start)))
+    mid = full[len(full) // 2][0]
+    print(_fmt("1re moitié", sim(sig, end=mid)))
+    print(_fmt("2e moitié", sim(sig, start=mid)))
+    inv = {c: {t: -v for t, v in s.items()} for c, s in sig.items()}
+    print(_fmt("témoin inversé", sim(inv)))
+    if a.perm:
+        rnd, obs, ge = random.Random(7), stats(full)["mean"], 0
+        for _ in range(a.perm):
+            ge += stats(sim(shifted(sig, rnd)))["mean"] >= obs
+        print(f"témoin permutation       p = {(ge + 1) / (a.perm + 1):.3f} ({a.perm} tirages)")
+
+
+if __name__ == "__main__":
+    main_cli()
