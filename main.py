@@ -83,6 +83,7 @@ TREND_LOOKBACKS    = (14, 28, 56)  # LONG si clôture D1 > celle d'il y a N jour
 TREND_SL_ATR       = 3.0        # SL = 3×ATR14 journalier
 TREND_FEE          = 0.000432   # frais taker par côté (P&L des positions fantômes)
 TREND_MIN_NOTIONAL = 11.0       # $ par position (minimum Hyperliquid : 10 $)
+TREND_COINS        = ["BTC", "ETH", "SOL", "XRP", "DOGE"]   # BTC a remplacé LTC le 2026-11-03
 
 # Mode fantôme : suivi virtuel des signaux NON tradés (filtrés, bloqués par régime, sans slot)
 GHOST_FILE      = "ghosts.json"
@@ -108,8 +109,8 @@ if GHOST_ONLY:
 
 # ── Symboles ───────────────────────────────────────────────────────────────────
 WATCHLIST = ["ETH", "LTC", "DOGE", "XRP", "SOL"]   # BTC retiré : 0W/15L −$12.83 historique
-SYM_LABEL   = {c: f"{c}/USDT" for c in WATCHLIST}
-SYM_BYBIT   = {c: f"{c}USDT" for c in WATCHLIST}   # format Bybit
+SYM_LABEL   = {c: f"{c}/USDT" for c in WATCHLIST + TREND_COINS}
+SYM_BYBIT   = {c: f"{c}USDT" for c in WATCHLIST + TREND_COINS}   # format Bybit
 
 INTERVAL_M1  = "1m"
 INTERVAL_M5  = "5m"
@@ -131,7 +132,7 @@ def init_exchange_info():
         meta = info.meta()
         for item in meta.get("universe", []):
             coin = item.get("name", "")
-            if coin in set(WATCHLIST):
+            if coin in set(WATCHLIST) | set(TREND_COINS):
                 sz_dec = int(item.get("szDecimals", 3))
                 _sym_filters[coin] = {
                     "sz_dec":  sz_dec,
@@ -1978,9 +1979,10 @@ def ghost_update(wb: Workbook) -> list[dict]:
 # au-dessus de celle d'il y a 14, 28 et 56 jours pour au moins 2 de ces horizons (vote), SHORT
 # sinon. Position tenue jusqu'à l'inversion du signal ; SL à TREND_SL_ATR×ATR14 D1, puis à plat
 # jusqu'à la clôture journalière suivante. Notionnel = TREND_EXPOSURE × équité / nb de coins.
-# Backtest (tools/trend_backtest.py, 5 coins, 50 % de l'équité) : 2017→2026 +40 %/an, Sharpe
-# 0.94, pire baisse −49 % ; 2e moitié (2021→2026) +15 %/an, pire baisse −41 %. Le vote bat la
-# règle 28 j seule sur chaque moitié (Sharpe +0.08), mais l'écart n'est pas significatif (t=0.9).
+# Backtest (tools/trend_backtest.py, TREND_COINS, 50 % de l'équité) : 2017→2026 +50 %/an, Sharpe
+# 1.11, pire baisse −45 % ; 2e moitié (2022→2026) +27 %/an, Sharpe 0.99, pire baisse −34 %.
+# Le vote bat la règle 28 j seule sur chaque moitié (écart non significatif, t=0.9) ; BTC à la
+# place de LTC aussi (+6 %/an, t=2.2). Hypothèses déclarées avant chaque test (docstring du backtest).
 # GHOST_ONLY : positions fantômes au prix moyen, aucun ordre (validation de la mécanique).
 TREND_FILE = "trend_state.json"
 _trend: dict | None = None             # {"positions": {coin: position}, "stopped": {coin: jour UTC}}
@@ -2042,8 +2044,8 @@ def _trend_qty(coin: str, price: float, equity: float, floor_px: float | None = 
     floor_px = min(price, floor_px or price)
     if price <= 0 or floor_px <= 0:
         return 0.0
-    qty = max(TREND_EXPOSURE * equity / len(WATCHLIST) / price, TREND_MIN_NOTIONAL / floor_px)
-    if qty * price > equity / len(WATCHLIST):
+    qty = max(TREND_EXPOSURE * equity / len(TREND_COINS) / price, TREND_MIN_NOTIONAL / floor_px)
+    if qty * price > equity / len(TREND_COINS):
         return 0.0
     dec = _flt(coin)["sz_dec"]
     return round(math.ceil(round(qty * 10 ** dec, 6)) / 10 ** dec, dec)
@@ -2191,6 +2193,19 @@ def trend_close(wb: Workbook, pos: dict, status: str, mids: dict) -> dict:
         log_error(f"P&L tendance {coin}: {e}")
     return _trend_record_close(wb, pos, status, exit_px, pnl)
 
+def _trend_try_close(wb: Workbook, pos: dict, status: str, mids: dict, closed: list) -> bool:
+    """trend_close ; si Hyperliquid refuse, une alerte par jour et False (la position garde son
+    SL, nouvel essai au cycle suivant)."""
+    try:
+        closed.append(trend_close(wb, pos, status, mids))
+        return True
+    except Exception as e:
+        log_error(f"fermeture tendance {pos['symbol']}: {e}")
+        _trend_alert_once(pos["symbol"], "close", f"⚠️ Tendance : fermeture {pos['symbol']} échouée",
+                          f"La position reste ouverte avec son SL ; nouvel essai à chaque cycle.\n"
+                          f"Erreur : `{str(e)[:300]}`")
+        return False
+
 def trend_cycle(wb: Workbook, user_state: dict | None, equity: float) -> list[dict]:
     """Un passage de la stratégie tendance (chaque cycle) : détecte les SL touchés, puis aligne
     chaque coin sur le signal du jour. Retourne les positions fermées pendant ce passage."""
@@ -2240,9 +2255,14 @@ def trend_cycle(wb: Workbook, user_state: dict | None, equity: float) -> list[di
         _trend_sl_ts = time.time()
         ensure_sl_orders(real)
 
+    # Coins retirés de TREND_COINS (LTC le 2026-11-03) : fermés, jamais rouverts
+    for coin in [c for c in positions if c not in TREND_COINS]:
+        if _trend_try_close(wb, positions[coin], "retiré de la stratégie", mids, closed):
+            del positions[coin]
+
     # 2) Signal du jour
     just_closed: set[str] = set()
-    for coin in WATCHLIST:
+    for coin in TREND_COINS:
         sig = trend_signal(coin)
         if not sig:
             continue
@@ -2252,13 +2272,7 @@ def trend_cycle(wb: Workbook, user_state: dict | None, equity: float) -> list[di
             continue
         if pos:
             status = "signal inversé" if pos["side"] != side else "fin du mode fantôme"
-            try:
-                closed.append(trend_close(wb, pos, status, mids))
-            except Exception as e:
-                log_error(f"fermeture tendance {coin}: {e}")
-                _trend_alert_once(coin, "close", f"⚠️ Tendance : fermeture {coin} échouée",
-                                  f"La position reste ouverte avec son SL ; nouvel essai à chaque cycle.\n"
-                                  f"Erreur : `{str(e)[:300]}`")
+            if not _trend_try_close(wb, pos, status, mids, closed):
                 continue
             del positions[coin]
             just_closed.add(coin)
@@ -2344,7 +2358,7 @@ def run():
         + _strat +
         f"Équité : **${balance:.2f}**\n"
         f"Positions scalping reprises : {len(open_positions)}\n"
-        f"Watchlist : {', '.join(WATCHLIST)}",
+        f"Coins : {', '.join(TREND_COINS if STRATEGY == 'trend' else WATCHLIST)}",
         color=0x3498db)
 
     # Stats du heartbeat Discord — remises à zéro après chaque envoi

@@ -748,7 +748,7 @@ class TestRunLoop(BaseTest):
         for attr in ("_sl_check_ts",) + (() if keep_regime else ("_regime_cache", "_regime_ts")):
             m.run.__dict__.pop(attr, None)
         info = LoopInfo(
-            mids={c: "100" for c in m.WATCHLIST},
+            mids={c: "100" for c in m.WATCHLIST + m.TREND_COINS},
             perp={"assetPositions": asset_positions or [],
                   "crossMarginSummary": {"accountValue": "0", "totalMarginUsed": "0"}},
             spot={"balances": [{"coin": "USDC", "total": "111.18", "hold": "0"}]})
@@ -856,10 +856,11 @@ class TestRunLoop(BaseTest):
         self.assertEqual(ex.orders, [])
         self.assertEqual(self.m1_calls, [])
         self.assertEqual(ghosts, [])
-        self.assertEqual(set(m._load_trend()["positions"]), set(m.WATCHLIST))
+        self.assertEqual(set(m._load_trend()["positions"]), set(m.TREND_COINS))
         self.assertIn("tendance journalière", dict(self.alerts)["🚀 Bot démarré"])
+        self.assertIn("Coins : BTC, ETH, SOL, XRP, DOGE", dict(self.alerts)["🚀 Bot démarré"])
         hb = [d for t, d in self.alerts if "résumé" in t]
-        self.assertTrue(hb and "Tendance : DOGE LONG +0.0 %" in hb[0])
+        self.assertTrue(hb and "Tendance : BTC LONG +0.0 %" in hb[0])
 
     def test_ranging_mom_bloque_suivi_en_fantome(self):
         ex, ghosts = self.run_loop(-2)
@@ -1050,7 +1051,7 @@ class TestTrend(BaseTest):
     def cycle(self, ex=None, ghost=False, closes=None, per_coin=None, held=(), fills=None,
               mids=None, orders=None, equity=111.0):
         perp = {"assetPositions": list(held)}
-        info = OrdersInfo(orders=orders or [], mids=mids or {c: "100" for c in m.WATCHLIST},
+        info = OrdersInfo(orders=orders or [], mids=mids or {c: "100" for c in m.TREND_COINS},
                           perp=perp, fills=fills or [])
         ex = ex or TrendExchange()
         def fc(coin, iv, n, **k):
@@ -1118,7 +1119,7 @@ class TestTrend(BaseTest):
         self.assertEqual(ex.calls, [])
         pos = m._load_trend()["positions"]
         self.assertEqual({c: p["side"] for c, p in pos.items()},
-                         {"ETH": "BUY", "LTC": "BUY", "DOGE": "BUY", "XRP": "BUY", "SOL": "SELL"})
+                         {"BTC": "BUY", "ETH": "BUY", "DOGE": "BUY", "XRP": "BUY", "SOL": "SELL"})
         self.assertTrue(all(p["paper"] for p in pos.values()))
         self.assertLess(pos["ETH"]["sl"], 100.0)
         self.assertGreater(pos["SOL"]["sl"], 100.0)
@@ -1128,12 +1129,12 @@ class TestTrend(BaseTest):
         self.cycle(ghost=True, per_coin={"SOL": self.DOWN})          # même signal : rien de nouveau
         self.assertEqual(self.wb["Tendance"].max_row, 6)
         m._trend = None                                               # redémarrage
-        self.assertEqual(set(m._load_trend()["positions"]), set(m.WATCHLIST))
+        self.assertEqual(set(m._load_trend()["positions"]), set(m.TREND_COINS))
 
     def test_fantome_sl_touche_puis_a_plat_jusqu_a_demain(self):
         self.cycle(ghost=True)
         sl = m._load_trend()["positions"]["ETH"]["sl"]
-        mids = {c: "100" for c in m.WATCHLIST}
+        mids = {c: "100" for c in m.TREND_COINS}
         mids["ETH"] = str(sl - 0.5)
         _, closed = self.cycle(ghost=True, mids=mids)
         self.assertEqual([(p["symbol"], p["status"]) for p in closed], [("ETH", "SL touché")])
@@ -1182,12 +1183,41 @@ class TestTrend(BaseTest):
 
     def test_coin_tenu_par_un_autre_bot_jamais_ouvert(self):
         ex, _ = self.cycle(held=[_held("SOL", -0.5)])
-        self.assertEqual(sorted(c[1] for c in ex.calls if c[0] == "open"), ["DOGE", "ETH", "LTC", "XRP"])
+        self.assertEqual(sorted(c[1] for c in ex.calls if c[0] == "open"), ["BTC", "DOGE", "ETH", "XRP"])
         self.assertNotIn("SOL", m._load_trend()["positions"])
+
+    # ── Liste des coins (BTC remplace LTC le 2026-11-03) ──
+    MIDS6 = {c: "100" for c in ("BTC", "ETH", "SOL", "XRP", "DOGE", "LTC")}
+
+    def test_coin_retire_de_la_liste_ferme_puis_jamais_rouvert(self):
+        self.cycle(ghost=True, mids=self.MIDS6)
+        m._load_trend()["positions"]["LTC"] = dict(m._load_trend()["positions"]["ETH"], symbol="LTC")
+        _, closed = self.cycle(ghost=True, mids=self.MIDS6)
+        self.assertEqual([(p["symbol"], p["status"]) for p in closed], [("LTC", "retiré de la stratégie")])
+        self.assertEqual(set(m._load_trend()["positions"]), {"BTC", "ETH", "SOL", "XRP", "DOGE"})
+        _, closed = self.cycle(ghost=True, mids=self.MIDS6)
+        self.assertEqual(closed, [])
+
+    def test_coin_retire_en_reel_ferme_au_marche_et_sl_annule(self):
+        m._load_trend()["positions"]["LTC"] = dict(self.real_eth(), symbol="LTC")
+        del m._load_trend()["positions"]["ETH"]
+        ex, closed = self.cycle(held=[_held("LTC", 0.12)], mids=self.MIDS6)
+        self.assertEqual([c for c in ex.calls if c[1] == "LTC"], [("close", "LTC"), ("cancel", "LTC", 5)])
+        self.assertEqual([p["status"] for p in closed], ["retiré de la stratégie"])
+        self.assertNotIn("LTC", m._load_trend()["positions"])
+
+    def test_tailles_chargees_pour_les_coins_tendance_et_scalping(self):
+        meta = {"universe": [{"name": c, "szDecimals": d} for c, d in (("BTC", 5), ("LTC", 2), ("AVAX", 2))]}
+        with mock.patch.object(m, "info", mock.Mock(meta=lambda: meta)), \
+             mock.patch.dict(m._sym_filters, {}, clear=True):
+            m.init_exchange_info()
+            self.assertEqual((m._flt("BTC")["sz_dec"], m._flt("BTC")["sz_step"]), (5, 1e-05))
+            self.assertIn("LTC", m._sym_filters)        # liste du scalping toujours servie
+            self.assertNotIn("AVAX", m._sym_filters)
 
     def test_compte_illisible_aucune_ouverture_reelle(self):
         ex = TrendExchange()
-        info = OrdersInfo(mids={c: "100" for c in m.WATCHLIST})
+        info = OrdersInfo(mids={c: "100" for c in m.TREND_COINS})
         with mock.patch.object(m, "info", info), mock.patch.object(m, "exchange", ex), \
              mock.patch.object(m, "fetch_candles", lambda *a, **k: _d1(self.UP)), \
              mock.patch.object(m, "GHOST_ONLY", False):

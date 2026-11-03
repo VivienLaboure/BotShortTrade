@@ -2,7 +2,7 @@
 """
 Backtest — stratégie tendance journalière de BotShortTrade (main.trend_cycle)
 ============================================================================
-Rejoue la règle du bot, avec ses paramètres (lus dans main.py), sur l'historique journalier :
+Rejoue la règle du bot, avec ses paramètres et ses coins (lus dans main.py), sur l'historique journalier :
   - LONG si la clôture D1 dépasse celle d'il y a N jours pour la majorité des horizons
     TREND_LOOKBACKS (14, 28, 56), SHORT sinon ;
   - quantité fixée à l'ouverture (TREND_EXPOSURE × équité / nb de coins), tenue jusqu'à l'inversion ;
@@ -27,6 +27,11 @@ Résultats du 2026-11-02 (5 coins, exposition 50 %) :
     Écart avec la règle 28 j : +3.8 %/an, t=0.9 (non significatif) ; adopté pour la robustesse.
   - rejetés (même protocole, hypothèses déclarées avant les tests) : long/plat (moins bon partout),
     10 coins (2e moitié moins bonne), taille ∝ 1/volatilité (1re moitié moins bonne).
+Résultats du 2026-11-03 (2e série, mêmes critères) :
+  - BTC à la place de LTC (adopté ; BTC = 1er perp Hyperliquid en volume, LTC = 40e) : 2017→2026
+    +50 %/an, Sharpe 1.11, pire baisse −45 %, p=0.003 ; 1re moitié 1.27 (vs 1.18), 2e moitié 0.99 (vs 0.63),
+    pire baisse 2e moitié −34 % (vs −41 %). Écart avec LTC : +6.4 %/an, t=2.2.
+  - rejetés : décision hebdomadaire (moins bon partout), filtre de funding extrême (moins bon partout).
 """
 from __future__ import annotations
 
@@ -193,7 +198,7 @@ def main_cli(argv=None):
     a = ap.parse_args(argv)
 
     bot = load_bot()
-    coins, expo = list(bot.WATCHLIST), a.expo if a.expo is not None else bot.TREND_EXPOSURE
+    coins, expo = list(bot.TREND_COINS), a.expo if a.expo is not None else bot.TREND_EXPOSURE
     if not a.no_download:
         download(coins, a.refresh)
     data = load(coins)
