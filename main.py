@@ -819,6 +819,10 @@ def _compute_regime() -> tuple[str, str, float, float]:
         return "BEAR",    "down",    btc_chg, eth_chg
     return "RANGING",     "neutral", btc_chg, eth_chg
 
+def _since_start(balance: float, initial_balance: float) -> str:
+    """« +1.2 % depuis le départ » : équité comparée au solde de référence (bot_state.json)."""
+    return f"{(balance / initial_balance - 1) * 100 if initial_balance > 0 else 0.0:+.1f} % depuis le départ"
+
 def load_initial_balance(current_balance: float) -> float:
     if os.path.exists(STATE_FILE):
         try:
@@ -2127,18 +2131,23 @@ def trend_open(wb: Workbook, coin: str, side: str, atr: float, equity: float, mi
     _sc = C.BGRN if is_buy else C.BRED
     print(f"  {_sc}[TENDANCE {'LONG' if is_buy else 'SHORT'}]{C.RST} {C.BOLD}{coin}{C.RST} {qty} @ ${entry:.6g}"
           f"  SL ${sl:.6g}  notionnel ${notional}" + ("  (fantôme)" if GHOST_ONLY else ""))
+    risk = qty * abs(entry - sl) + TREND_FEE * qty * (entry + sl)   # perte si le SL est touché, frais compris
     send_discord_alert(
         f"{'👻 ' if GHOST_ONLY else ''}{'🟢 LONG' if is_buy else '🔴 SHORT'} {coin} ouvert [tendance]",
         f"Entrée : **${entry:.6g}** · SL : **${sl:.6g}** ({abs(sl - entry) / entry * 100:.1f} %)\n"
-        f"Notionnel : **${notional}**" + (" · fantôme (aucun ordre réel)" if GHOST_ONLY else ""),
+        f"Notionnel : **${notional}** ({notional / equity * 100:.1f} % du capital) · "
+        f"perte au SL : **{-risk / equity * 100:.2f} %** du capital"
+        + (" · fantôme (aucun ordre réel)" if GHOST_ONLY else ""),
         color=0x2ecc71 if is_buy else 0xe74c3c)
     return pos
 
-def _trend_record_close(wb: Workbook, pos: dict, status: str, exit_px: float, pnl: float) -> dict:
-    """Ligne Excel, console et Discord d'une position tendance fermée."""
+def _trend_record_close(wb: Workbook, pos: dict, status: str, exit_px: float, pnl: float,
+                        equity: float) -> dict:
+    """Ligne Excel, console et Discord d'une position tendance fermée (P&L aussi en % de l'équité)."""
     coin, now = pos["symbol"], time.time()
     notional  = pos["entry"] * pos["qty"]
     pnl_pct   = pnl / notional * 100 if notional else 0.0
+    cap_pct   = pnl / equity * 100 if equity > 0 else 0.0
     pos.update(status=status, exit=exit_px, pnl=round(pnl, 4), closed_at=now)
     try:
         for row in wb["Tendance"].iter_rows(min_row=2):
@@ -2154,10 +2163,10 @@ def _trend_record_close(wb: Workbook, pos: dict, status: str, exit_px: float, pn
         log_error(f"excel tendance fermeture {coin}: {e}")
     days = (now - (pos.get("opened_at") or now)) / 86400
     print(f"  {_cp(pnl)}[TENDANCE {status}]{C.RST} {C.BOLD}{coin}{C.RST}  P&L={_cp(pnl)}${pnl:+.2f}{C.RST} "
-          f"({pnl_pct:+.2f} %) · tenu {days:.1f} j")
+          f"({pnl_pct:+.2f} % du notionnel · {cap_pct:+.2f} % du capital) · tenu {days:.1f} j")
     send_discord_alert(
         f"{'👻 ' if pos.get('paper') else ''}{'✅' if pnl >= 0 else '🛑'} {coin} {pos['side']} — {status} [tendance]",
-        f"P&L : **${pnl:+.2f}** ({pnl_pct:+.2f} % du notionnel) · tenu {days:.1f} j\n"
+        f"P&L : **{cap_pct:+.2f} %** du capital · {pnl_pct:+.2f} % du notionnel (${pnl:+.2f}) · tenu {days:.1f} j\n"
         f"Entrée : ${pos['entry']:.6g}" + (f" → sortie ${exit_px:.6g}" if exit_px else ""),
         color=0x2ecc71 if pnl >= 0 else 0xe74c3c)
     return pos
@@ -2166,13 +2175,13 @@ def _paper_pnl(pos: dict, exit_px: float) -> float:
     sgn = 1 if pos["side"] == "BUY" else -1
     return sgn * pos["qty"] * (exit_px - pos["entry"]) - TREND_FEE * pos["qty"] * exit_px - pos.get("open_fee", 0.0)
 
-def trend_close(wb: Workbook, pos: dict, status: str, mids: dict) -> dict:
+def trend_close(wb: Workbook, pos: dict, status: str, mids: dict, equity: float) -> dict:
     """Ferme la position tendance au marché (fantôme : au prix moyen). Lève une exception si
     Hyperliquid refuse la fermeture (la position et son SL restent en place)."""
     coin    = pos["symbol"]
     exit_px = float(mids.get(coin) or 0)
     if pos.get("paper"):
-        return _trend_record_close(wb, pos, status, exit_px, _paper_pnl(pos, exit_px or pos["entry"]))
+        return _trend_record_close(wb, pos, status, exit_px, _paper_pnl(pos, exit_px or pos["entry"]), equity)
     r  = exchange.market_close(coin, slippage=0.05)
     st = ((r or {}).get("response") or {}).get("data", {}).get("statuses", [{}])
     if r is not None and (r.get("status") != "ok" or (st and "error" in st[0])):
@@ -2191,13 +2200,13 @@ def trend_close(wb: Workbook, pos: dict, status: str, mids: dict) -> dict:
             pnl = gross - open_fee - close_fee
     except Exception as e:
         log_error(f"P&L tendance {coin}: {e}")
-    return _trend_record_close(wb, pos, status, exit_px, pnl)
+    return _trend_record_close(wb, pos, status, exit_px, pnl, equity)
 
-def _trend_try_close(wb: Workbook, pos: dict, status: str, mids: dict, closed: list) -> bool:
+def _trend_try_close(wb: Workbook, pos: dict, status: str, mids: dict, equity: float, closed: list) -> bool:
     """trend_close ; si Hyperliquid refuse, une alerte par jour et False (la position garde son
     SL, nouvel essai au cycle suivant)."""
     try:
-        closed.append(trend_close(wb, pos, status, mids))
+        closed.append(trend_close(wb, pos, status, mids, equity))
         return True
     except Exception as e:
         log_error(f"fermeture tendance {pos['symbol']}: {e}")
@@ -2226,7 +2235,7 @@ def trend_cycle(wb: Workbook, user_state: dict | None, equity: float) -> list[di
         if pos.get("paper"):
             px = float(mids.get(coin) or 0)
             if px and (px <= pos["sl"] if pos["side"] == "BUY" else px >= pos["sl"]):
-                closed.append(_trend_record_close(wb, pos, "SL touché", pos["sl"], _paper_pnl(pos, pos["sl"])))
+                closed.append(_trend_record_close(wb, pos, "SL touché", pos["sl"], _paper_pnl(pos, pos["sl"]), equity))
                 del positions[coin]
                 state["stopped"][coin] = day
             continue
@@ -2245,7 +2254,7 @@ def trend_cycle(wb: Workbook, user_state: dict | None, equity: float) -> list[di
                 continue
         gross, open_fee, close_fee = res or (0.0, 0.0, 0.0)
         pnl = gross - open_fee - close_fee
-        closed.append(_trend_record_close(wb, pos, "SL touché" if pnl < 0 else "Fermé (SL)", 0.0, pnl))
+        closed.append(_trend_record_close(wb, pos, "SL touché" if pnl < 0 else "Fermé (SL)", 0.0, pnl, equity))
         del positions[coin]
         state["stopped"][coin] = day
 
@@ -2257,7 +2266,7 @@ def trend_cycle(wb: Workbook, user_state: dict | None, equity: float) -> list[di
 
     # Coins retirés de TREND_COINS (LTC le 2026-11-03) : fermés, jamais rouverts
     for coin in [c for c in positions if c not in TREND_COINS]:
-        if _trend_try_close(wb, positions[coin], "retiré de la stratégie", mids, closed):
+        if _trend_try_close(wb, positions[coin], "retiré de la stratégie", mids, equity, closed):
             del positions[coin]
 
     # 2) Signal du jour
@@ -2272,7 +2281,7 @@ def trend_cycle(wb: Workbook, user_state: dict | None, equity: float) -> list[di
             continue
         if pos:
             status = "signal inversé" if pos["side"] != side else "fin du mode fantôme"
-            if not _trend_try_close(wb, pos, status, mids, closed):
+            if not _trend_try_close(wb, pos, status, mids, equity, closed):
                 continue
             del positions[coin]
             just_closed.add(coin)
@@ -2299,6 +2308,30 @@ def trend_summary(mids: dict | None) -> str:
         chg = ((px - p["entry"]) / p["entry"] * 100 * (1 if p["side"] == "BUY" else -1)) if px else 0.0
         parts.append(f"{coin} {'LONG' if p['side'] == 'BUY' else 'SHORT'} {chg:+.1f} %")
     return " · ".join(parts) or "aucune position"
+
+def trend_heartbeat(wb: Workbook, mids: dict | None, equity: float, closed: list[dict]) -> str:
+    """Bloc tendance du résumé Discord : variation de chaque position depuis l'entrée, puis latent,
+    fermetures de la période et bilan du mode en cours (fantôme / réel) en % de l'équité."""
+    pct  = lambda usd: usd / equity * 100 if equity > 0 else 0.0
+    poss = _load_trend()["positions"]
+    lat  = {c: (1 if p["side"] == "BUY" else -1) * p["qty"] * (float(mids[c]) - p["entry"])
+            for c, p in poss.items() if (mids or {}).get(c)}
+    mode = "Fantôme" if GHOST_ONLY else "Réel"
+    done: list[float] = []
+    try:
+        done = [r[11] for r in wb["Tendance"].iter_rows(min_row=2, values_only=True)
+                if r[4] == mode and r[11] is not None]
+    except Exception as e:
+        log_error(f"bilan tendance (Excel) : {e}")
+    wins    = sum(1 for x in done if x > 0)
+    mode_lt = sum(v for c, v in lat.items() if bool(poss[c].get("paper")) == GHOST_ONLY)
+    period  = sum(p["pnl"] for p in closed)
+    return (f"Tendance : {trend_summary(mids)}\n"
+            f"Latent : **{pct(sum(lat.values())):+.2f} %** du capital\n"
+            f"Fermetures tendance : {len(closed)}"
+            + (f" · **{pct(period):+.2f} %** du capital (${period:+.2f})" if closed else "") + "\n"
+            f"Bilan {mode.lower()} depuis le début : **{pct(sum(done) + mode_lt):+.2f} %** du capital "
+            f"({len(done)} fermée{'s' if len(done) > 1 else ''}, {wins} gagnante{'s' if wins > 1 else ''})")
 
 def run():
     print(f"\n{C.BCYN}{'═' * 60}{C.RST}")
@@ -2356,7 +2389,7 @@ def run():
         f"Réseau : **{'TESTNET' if HL_TESTNET else 'MAINNET'}**"
         + (" · **mode fantôme seul (aucun ordre réel)**" if GHOST_ONLY else "") + "\n"
         + _strat +
-        f"Équité : **${balance:.2f}**\n"
+        f"Équité : **${balance:.2f}** · {_since_start(balance, initial_balance)}\n"
         f"Positions scalping reprises : {len(open_positions)}\n"
         f"Coins : {', '.join(TREND_COINS if STRATEGY == 'trend' else WATCHLIST)}",
         color=0x3498db)
@@ -2720,12 +2753,9 @@ def run():
                     _hb_mids = info.all_mids()
                 except Exception:
                     _hb_mids = None
-                _tp = sum(p["pnl"] for p in hb_t_closed)
-                _body = (f"Tendance : {trend_summary(_hb_mids)}\n"
-                         f"Fermetures tendance : {len(hb_t_closed)}"
-                         + (f" · P&L ${_tp:+.2f}" if hb_t_closed else "") + "\n"
+                _body = (trend_heartbeat(wb, _hb_mids, min(balance, MAX_LIQUIDITY), hb_t_closed) + "\n"
                          f"Régime : **{regime}** (BTC {btc_chg:+.1f}% · ETH {eth_chg:+.1f}% 7j)\n"
-                         f"Équité : **${balance:.2f}**\n"
+                         f"Équité : **${balance:.2f}** · {_since_start(balance, initial_balance)}\n"
                          f"Cycles : {hb_cycles}")
             else:
                 _body = (f"Régime : **{regime}** (BTC {btc_chg:+.1f}% · ETH {eth_chg:+.1f}% 7j)\n"

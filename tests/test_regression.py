@@ -861,6 +861,9 @@ class TestRunLoop(BaseTest):
         self.assertIn("Coins : BTC, ETH, SOL, XRP, DOGE", dict(self.alerts)["🚀 Bot démarré"])
         hb = [d for t, d in self.alerts if "résumé" in t]
         self.assertTrue(hb and "Tendance : BTC LONG +0.0 %" in hb[0])
+        self.assertIn("Équité : **$111.18** · +0.0 % depuis le départ", dict(self.alerts)["🚀 Bot démarré"])
+        self.assertIn("Latent : **+0.00 %** du capital", hb[0])
+        self.assertIn("Équité : **$111.18** · +0.0 % depuis le départ", hb[0])
 
     def test_ranging_mom_bloque_suivi_en_fantome(self):
         ex, ghosts = self.run_loop(-2)
@@ -1188,6 +1191,35 @@ class TestTrend(BaseTest):
 
     # ── Liste des coins (BTC remplace LTC le 2026-11-03) ──
     MIDS6 = {c: "100" for c in ("BTC", "ETH", "SOL", "XRP", "DOGE", "LTC")}
+
+    # ── Messages Discord en % du capital ──
+    def test_ouverture_et_sl_en_pourcentages_du_capital(self):
+        self.cycle(ghost=True, per_coin={"SOL": self.DOWN})
+        pos = m._load_trend()["positions"]["SOL"]
+        opened = dict(self.alerts)["👻 🔴 SHORT SOL ouvert [tendance]"]
+        risk = pos["qty"] * (pos["sl"] - pos["entry"]) + m.TREND_FEE * pos["qty"] * (pos["entry"] + pos["sl"])
+        self.assertIn("Notionnel : **$11.1** (10.0 % du capital)", opened)
+        self.assertIn(f"perte au SL : **{-risk / 111 * 100:.2f} %** du capital", opened)
+        mids = {c: "100" for c in m.TREND_COINS}
+        mids["SOL"] = str(pos["sl"] + 1)
+        _, closed = self.cycle(ghost=True, per_coin={"SOL": self.DOWN}, mids=mids)
+        msg = dict(self.alerts)["👻 🛑 SOL SELL — SL touché [tendance]"]
+        self.assertIn(f"P&L : **{closed[0]['pnl'] / 111 * 100:+.2f} %** du capital · ", msg)
+        self.assertAlmostEqual(closed[0]["pnl"] / 111 * 100, -risk / 111 * 100, places=2)
+
+    def test_bilan_heartbeat_en_pourcentages_du_capital(self):
+        m._load_trend()["positions"]["ETH"] = {"symbol": "ETH", "side": "BUY", "qty": 0.111, "entry": 100.0,
+                                               "sl": 90.0, "paper": True}
+        ws = self.wb["Tendance"]
+        ws.append(["1", "", "SOL/USDT", "SELL", "Fantôme", 0.1, 100, 110, 11.1, "SL touché", 110, -1.11, -10.0, ""])
+        ws.append(["2", "", "BTC/USDT", "BUY", "Réel", 0.1, 100, 90, 11.1, "signal inversé", 150, 5.0, 45.0, ""])
+        ws.append(["3", "", "XRP/USDT", "BUY", "Fantôme", 0.1, 100, 90, 11.1, "Ouvert", None, None, None, None])
+        with mock.patch.object(m, "GHOST_ONLY", True):
+            txt = m.trend_heartbeat(self.wb, {"ETH": "120"}, 111.0, [{"pnl": -1.11}])
+        self.assertIn("Tendance : ETH LONG +20.0 %", txt)
+        self.assertIn("Latent : **+2.00 %** du capital", txt)
+        self.assertIn("Fermetures tendance : 1 · **-1.00 %** du capital ($-1.11)", txt)
+        self.assertIn("Bilan fantôme depuis le début : **+1.00 %** du capital (1 fermée, 0 gagnante)", txt)
 
     def test_coin_retire_de_la_liste_ferme_puis_jamais_rouvert(self):
         self.cycle(ghost=True, mids=self.MIDS6)
