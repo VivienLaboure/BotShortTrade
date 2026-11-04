@@ -1044,7 +1044,7 @@ class TrendExchange:
     """Hyperliquid simulé : journalise ouvertures, SL, fermetures et annulations."""
     def __init__(self, avg_px=100.0, sl=None, close_ok=True):
         self.avg_px, self.close_ok, self.sl, self.calls = avg_px, close_ok, sl or [_ok(21)], []
-        self.stops = []   # (coin, qté, prix limite) de chaque ordre stop
+        self.stops = []   # (coin, qté, prix limite, déclenchement) de chaque ordre stop
     def update_leverage(self, *a, **k): return {"status": "ok"}
     def market_open(self, coin, is_buy, qty, px=None, slippage=0.02):
         self.calls.append(("open", coin, is_buy, qty))
@@ -1053,7 +1053,7 @@ class TrendExchange:
     def order(self, coin, is_buy, qty, limit_px, order_type, reduce_only):
         trig = order_type["trigger"]
         self.calls.append((trig["tpsl"], coin, is_buy, trig["triggerPx"]))
-        self.stops.append((coin, qty, limit_px))
+        self.stops.append((coin, qty, limit_px, trig["triggerPx"]))
         return self.sl.pop(0) if len(self.sl) > 1 else self.sl[0]
     def market_close(self, coin, slippage=0.05):
         self.calls.append(("close", coin))
@@ -1135,10 +1135,10 @@ class TestTrend(BaseTest):
         with mock.patch.dict(m._sym_filters, {"XRP": {"sz_dec": 0, "sz_step": 1}}):
             self.assertEqual(m._trend_qty("XRP", 2.5, 111.0), 5)     # 11.10 $ → 4.44 → arrondi au-dessus
             self.assertEqual(m._trend_qty("XRP", 2.5, 1000.0), 40)   # 100 $ pile
-            self.assertEqual(m._trend_qty("XRP", 2.5, 50.0), 0)      # 11 $ > 10 $ par coin → refus
-        # Long avec SL 12 % plus bas : l'ordre stop doit aussi valoir ≥ 11 $ → 0.125 (12.50 $) au lieu de 0.111
-        self.assertEqual(m._trend_qty("ETH", 100.0, 111.0, 88.0), 0.125)
-        self.assertEqual(m._trend_qty("ETH", 100.0, 111.0, 112.0), 0.111)   # short : SL au-dessus, sans effet
+            self.assertEqual(m._trend_qty("XRP", 2.5, 50.0), 0)      # 10.50 $ > 10 $ par coin → refus
+        # Pire prix d'un ordre à 88 (ex. limite du SL d'un long) : 10,5 $ à ce prix → 0.12 (12 $) au lieu de 0.111
+        self.assertEqual(m._trend_qty("ETH", 100.0, 111.0, 88.0), 0.12)
+        self.assertEqual(m._trend_qty("ETH", 100.0, 111.0, 112.0), 0.111)   # au-dessus du prix : sans effet
 
     # ── Mode fantôme ──
     def test_fantome_ouvre_une_position_par_coin_sans_ordre(self):
@@ -1222,13 +1222,60 @@ class TestTrend(BaseTest):
         self.assertEqual(sorted(c[1] for c in ex.calls if c[0] == "open"), ["BTC", "DOGE", "ETH", "XRP"])
         self.assertNotIn("SOL", m._load_trend()["positions"])
 
-    def test_sl_d_un_long_vaut_le_minimum_meme_a_son_prix_limite(self):
-        """L'ordre stop d'un long (vente, prix limite 10 % sous le SL) vaut au moins 11 $ à ce prix
-        limite, au cas où Hyperliquid y contrôle son minimum de 10 $ (avant : 0.126 × 78.66 = 9.91 $)."""
+    # ── Aucun ordre sous TREND_MIN_NOTIONAL (10,5 $), à son pire prix ──
+    def assert_ordres_au_minimum(self, ex, px=100.0):
+        """Chaque ouverture (vente : jusqu'à 2 % sous px) et chaque SL (vente : jusqu'à sa limite ;
+        achat : à son déclenchement) vaut au moins TREND_MIN_NOTIONAL."""
+        for _, coin, is_buy, qty in [c for c in ex.calls if c[0] == "open"]:
+            self.assertGreaterEqual(qty * (px if is_buy else px * (1 - m.TREND_SLIP_OPEN)), m.TREND_MIN_NOTIONAL, coin)
+        for coin, qty, limit_px, trigger in ex.stops:
+            self.assertGreaterEqual(qty * min(limit_px, trigger), m.TREND_MIN_NOTIONAL, coin)
+
+    def test_long_ouverture_et_sl_au_minimum_a_leur_pire_prix(self):
+        """Le SL d'un long (vente jusqu'à 10 % sous son déclenchement) vaut ≥ 10,5 $ à ce prix limite,
+        au cas où Hyperliquid y contrôle son minimum de 10 $ (avant le 2026-11-04 : 0.126 × 78.66 = 9.91 $)."""
         ex, _ = self.cycle()
         self.assertEqual(len(ex.stops), 5)
-        for coin, qty, limit_px in ex.stops:
-            self.assertGreaterEqual(qty * limit_px, m.TREND_MIN_NOTIONAL, coin)
+        self.assert_ordres_au_minimum(ex)
+
+    def test_short_ouverture_au_minimum_a_son_pire_prix(self):
+        """Équité de 100 $ (10 $ visés par coin) : la vente d'ouverture d'un short vaut ≥ 10,5 $ même
+        exécutée 2 % sous le prix → 0.108 (avant : minimum de 11 $ au prix moyen → 0.11)."""
+        ex, _ = self.cycle(closes=self.DOWN, equity=100.0)
+        self.assertEqual([c[3] for c in ex.calls if c[0] == "open"], [0.108] * 5)
+        self.assert_ordres_au_minimum(ex)
+
+    def test_short_tres_gagnant_renforce_avant_fermeture(self):
+        """Short dont la fermeture vaudrait 9.60 $ (0.12 × 80) : renfort d'abord (vente ≥ 10,5 $ à son pire
+        prix), puis fermeture du tout ; frais du renfort déduits du P&L (avant : ordre de 9.60 $)."""
+        self.real_eth(side="SELL")                        # 0.12 ETH vendus à 90
+        mids = {c: "100" for c in m.TREND_COINS}
+        mids["ETH"] = "80"
+        fills = [{"coin": "ETH", "dir": "Close Short", "time": time.time() * 1000, "oid": 9,
+                  "closedPnl": "1.2", "fee": "0.005"}]
+        ex, closed = self.cycle(held=[_held("ETH", -0.12)], fills=fills, mids=mids)   # signal LONG : inversion
+        calls = self.eth_calls(ex)
+        self.assertEqual([c[0] for c in calls], ["open", "close", "cancel", "open", "sl"])
+        add = calls[0][3]
+        self.assertFalse(calls[0][2])                                   # renfort du short : une vente
+        self.assertGreaterEqual(add * 80 * (1 - m.TREND_SLIP_OPEN), m.TREND_MIN_NOTIONAL)
+        self.assertGreaterEqual((0.12 + add) * 80, m.TREND_MIN_NOTIONAL)   # fermeture du tout (achat)
+        self.assertEqual([p["status"] for p in closed], ["signal inversé"])
+        self.assertAlmostEqual(closed[0]["pnl"], 1.2 - 0.005 - 0.005 - m.TREND_FEE * add * 80, places=4)
+        self.assertIn(f"Renforcée de {add:g}", dict(self.alerts)["✅ ETH SELL — signal inversé [tendance]"])
+        self.assertEqual(m._load_trend()["positions"]["ETH"]["side"], "BUY")
+
+    def test_renfort_fait_mais_fermeture_refusee_pas_de_second_renfort(self):
+        """Renfort passé, fermeture refusée : au cycle suivant la position (renfort compris) vaut assez,
+        on retente la fermeture seule — jamais de renforts en série."""
+        self.real_eth(side="SELL")
+        mids = {c: "100" for c in m.TREND_COINS}
+        mids["ETH"] = "80"
+        ex = TrendExchange(close_ok=False)
+        for _ in range(2):
+            self.cycle(ex=ex, held=[_held("ETH", -0.254)], mids=mids)
+        self.assertEqual([c[0] for c in self.eth_calls(ex)], ["open", "close", "close"])
+        self.assertAlmostEqual(m._load_trend()["positions"]["ETH"]["top_up"], 0.134)
 
     # ── Liste des coins (BTC remplace LTC le 2026-11-03) ──
     MIDS6 = {c: "100" for c in ("BTC", "ETH", "SOL", "XRP", "DOGE", "LTC")}

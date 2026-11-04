@@ -84,8 +84,10 @@ SL_CHECK_S       = 5 * 60    # vérification que chaque position a bien son stop
 TREND_LOOKBACKS    = (14, 28, 56)  # LONG si clôture D1 > celle d'il y a N jours pour 2 horizons sur 3
 TREND_SL_ATR       = 3.0        # SL = 3×ATR14 journalier
 TREND_FEE          = 0.000432   # frais taker par côté (P&L des positions fantômes)
-TREND_MIN_NOTIONAL = 11.0       # $ par position (minimum Hyperliquid : 10 $)
-TREND_SL_SLIPPAGE  = 0.10       # prix limite de l'ordre SL : 10 % au-delà du déclenchement
+TREND_MIN_NOTIONAL = 10.5       # $ minimum de CHAQUE ordre, à son pire prix (Hyperliquid refuse < 10 $)
+TREND_SLIP_OPEN    = 0.02       # prix limite d'un ordre au marché : 2 % (ouverture, renfort)…
+TREND_SLIP_CLOSE   = 0.05       # … 5 % (fermeture)
+TREND_SLIP_SL      = 0.10       # … 10 % au-delà du déclenchement (stop-loss)
 TREND_COINS        = ["BTC", "ETH", "SOL", "XRP", "DOGE"]   # BTC a remplacé LTC le 2026-11-03
 
 # Mode fantôme : suivi virtuel des signaux NON tradés (filtrés, bloqués par régime, sans slot)
@@ -1985,7 +1987,8 @@ def ghost_update(wb: Workbook) -> list[dict]:
 # Momentum de série temporelle : chaque jour, pour chaque coin, LONG si la clôture D1 est
 # au-dessus de celle d'il y a 14, 28 et 56 jours pour au moins 2 de ces horizons (vote), SHORT
 # sinon. Position tenue jusqu'à l'inversion du signal ; SL à TREND_SL_ATR×ATR14 D1, puis à plat
-# jusqu'à la clôture journalière suivante. Notionnel = TREND_EXPOSURE × équité / nb de coins.
+# jusqu'à la clôture journalière suivante. Notionnel = TREND_EXPOSURE × équité / nb de coins, et aucun
+# ordre sous TREND_MIN_NOTIONAL à son pire prix (fermeture trop petite : renfort d'abord, _trend_top_up).
 # Backtest (tools/trend_backtest.py, TREND_COINS, 50 % de l'équité) : 2017→2026 +50 %/an, Sharpe
 # 1.11, pire baisse −45 % ; 2e moitié (2022→2026) +27 %/an, Sharpe 0.99, pire baisse −34 %.
 # Le vote bat la règle 28 j seule sur chaque moitié (écart non significatif, t=0.9) ; BTC à la
@@ -2044,18 +2047,27 @@ def trend_signal(coin: str) -> tuple[str, float, float] | None:
     _trend_sig[coin] = (day, side, cs[-1]["c"], _atr(cs, 14))
     return _trend_sig[coin][1:]
 
+def _worst_px(px: float, is_buy: bool, slip: float) -> float:
+    """Prix le plus bas auquel un ordre au marché (prix limite à `slip`) peut s'exécuter : sa valeur
+    minimale vaut qty × ce prix. Une vente peut descendre jusqu'à sa limite ; un achat, pas sous px."""
+    return px if is_buy else px * (1 - slip)
+
+def _ceil_qty(coin: str, qty: float) -> float:
+    """Quantité arrondie au pas du coin, vers le haut."""
+    dec = _flt(coin)["sz_dec"]
+    return round(math.ceil(round(qty * 10 ** dec, 6)) / 10 ** dec, dec)
+
 def _trend_qty(coin: str, price: float, equity: float, floor_px: float | None = None) -> float:
     """Quantité pour TREND_EXPOSURE × équité / nb de coins, arrondie au pas du coin vers le haut,
-    et valant au moins TREND_MIN_NOTIONAL même au prix floor_px (prix limite du SL d'un long :
-    l'ordre stop doit lui aussi dépasser le minimum Hyperliquid). 0 si l'équité ne permet pas ce minimum."""
+    et valant au moins TREND_MIN_NOTIONAL même au prix floor_px (pire prix de l'ouverture et du SL).
+    0 si l'équité ne permet pas ce minimum."""
     floor_px = min(price, floor_px or price)
     if price <= 0 or floor_px <= 0:
         return 0.0
     qty = max(TREND_EXPOSURE * equity / len(TREND_COINS) / price, TREND_MIN_NOTIONAL / floor_px)
     if qty * price > equity / len(TREND_COINS):
         return 0.0
-    dec = _flt(coin)["sz_dec"]
-    return round(math.ceil(round(qty * 10 ** dec, 6)) / 10 ** dec, dec)
+    return _ceil_qty(coin, qty)
 
 def _trend_alert_once(coin: str, why: str, title: str, desc: str, color: int = 0xf39c12):
     key = (coin, _today(), why)
@@ -2065,7 +2077,7 @@ def _trend_alert_once(coin: str, why: str, title: str, desc: str, color: int = 0
 
 def _place_sl(coin: str, is_buy: bool, qty: float, sl: float):
     """Pose le stop-loss (trigger reduce-only) d'une position ; 2 essais. Retourne l'oid, ou None."""
-    sl_lim = round_px(sl * (1 - TREND_SL_SLIPPAGE if is_buy else 1 + TREND_SL_SLIPPAGE), coin)
+    sl_lim = round_px(sl * (1 - TREND_SLIP_SL if is_buy else 1 + TREND_SLIP_SL), coin)
     for attempt in range(2):
         try:
             r = exchange.order(coin, not is_buy, qty, limit_px=sl_lim,
@@ -2088,17 +2100,18 @@ def trend_open(wb: Workbook, coin: str, side: str, atr: float, equity: float, mi
     is_buy, sgn = side == "BUY", (1 if side == "BUY" else -1)
     price = float(mids.get(coin) or 0)
     sl_px = price - sgn * TREND_SL_ATR * atr
-    # Long : son ordre stop (une vente) vaut qty × prix limite, 10 % sous le SL. Hyperliquid peut
-    # contrôler son minimum de 10 $ sur ce prix plutôt que sur le déclenchement : on dimensionne dessus.
-    qty   = _trend_qty(coin, price, equity, sl_px * (1 - TREND_SL_SLIPPAGE) if is_buy else sl_px)
+    # L'ouverture et le SL (ordre inverse) valent chacun ≥ TREND_MIN_NOTIONAL à leur pire prix :
+    # long → SL vendu jusqu'à 10 % sous son déclenchement ; short → vente jusqu'à 2 % sous le prix
+    floor = min(_worst_px(price, is_buy, TREND_SLIP_OPEN), _worst_px(sl_px, not is_buy, TREND_SLIP_SL))
+    qty   = _trend_qty(coin, price, equity, floor)
     if not qty:
-        raise RuntimeError(f"équité ${equity:.2f} insuffisante pour {TREND_MIN_NOTIONAL:.0f} $ par coin")
+        raise RuntimeError(f"équité ${equity:.2f} insuffisante pour {TREND_MIN_NOTIONAL:g} $ par ordre")
     now = time.time()
     if GHOST_ONLY:
         oid, entry, open_fee = f"P{int(now * 1000)}-{coin}", price, TREND_FEE * qty * price
     else:
         set_leverage(coin)
-        r  = exchange.market_open(coin, is_buy, qty, px=None, slippage=0.02)
+        r  = exchange.market_open(coin, is_buy, qty, px=None, slippage=TREND_SLIP_OPEN)
         st = ((r or {}).get("response") or {}).get("data", {}).get("statuses", [{}])
         if not r or r.get("status") != "ok" or "error" in st[0]:
             raise RuntimeError(f"ordre refusé : {r}")
@@ -2115,7 +2128,7 @@ def trend_open(wb: Workbook, coin: str, side: str, atr: float, equity: float, mi
         if pos["sl_oid"] is None:
             # Position sans stop : on la referme tout de suite (comme place_order)
             try:
-                rc = exchange.market_close(coin, slippage=0.05)
+                rc = exchange.market_close(coin, slippage=TREND_SLIP_CLOSE)
                 closed = rc is not None and rc.get("status") == "ok"
             except Exception as e:
                 log_error(f"market_close urgence {coin}: {e}")
@@ -2173,7 +2186,9 @@ def _trend_record_close(wb: Workbook, pos: dict, status: str, exit_px: float, pn
     send_discord_alert(
         f"{'👻 ' if pos.get('paper') else ''}{'✅' if pnl >= 0 else '🛑'} {coin} {pos['side']} — {status} [tendance]",
         f"P&L : **{cap_pct:+.2f} %** du capital · {pnl_pct:+.2f} % du notionnel (${pnl:+.2f}) · tenu {days:.1f} j\n"
-        f"Entrée : ${pos['entry']:.6g}" + (f" → sortie ${exit_px:.6g}" if exit_px else ""),
+        f"Entrée : ${pos['entry']:.6g}" + (f" → sortie ${exit_px:.6g}" if exit_px else "")
+        + (f"\nRenforcée de {pos['top_up']:g} juste avant : la fermeture seule valait moins de "
+           f"{TREND_MIN_NOTIONAL:g} $" if pos.get("top_up") else ""),
         color=0x2ecc71 if pnl >= 0 else 0xe74c3c)
     return pos
 
@@ -2181,14 +2196,35 @@ def _paper_pnl(pos: dict, exit_px: float) -> float:
     sgn = 1 if pos["side"] == "BUY" else -1
     return sgn * pos["qty"] * (exit_px - pos["entry"]) - TREND_FEE * pos["qty"] * exit_px - pos.get("open_fee", 0.0)
 
+def _trend_top_up(pos: dict, px: float):
+    """Si l'ordre de fermeture vaudrait moins de TREND_MIN_NOTIONAL (short qui a beaucoup gagné : sa
+    valeur a fondu), renforce d'abord la position d'un ordre qui vaut lui-même ce minimum ; la
+    fermeture emporte ensuite le tout. Aucun ordre sous le minimum, pour ~0.01 $ de frais en plus."""
+    coin, is_buy = pos["symbol"], pos["side"] == "BUY"
+    held = pos["qty"] + pos.get("top_up", 0.0)   # renfort d'un essai précédent dont la fermeture a échoué
+    if not px or held * _worst_px(px, not is_buy, TREND_SLIP_CLOSE) >= TREND_MIN_NOTIONAL:
+        return
+    add = _ceil_qty(coin, TREND_MIN_NOTIONAL / min(_worst_px(px, is_buy, TREND_SLIP_OPEN),
+                                                   _worst_px(px, not is_buy, TREND_SLIP_CLOSE)))
+    r  = exchange.market_open(coin, is_buy, add, px=None, slippage=TREND_SLIP_OPEN)
+    st = ((r or {}).get("response") or {}).get("data", {}).get("statuses", [{}])
+    if not r or r.get("status") != "ok" or "error" in st[0]:
+        raise RuntimeError(f"renfort avant fermeture refusé : {r}")
+    add = float((st[0].get("filled") or {}).get("totalSz") or add)
+    pos["top_up"]     = pos.get("top_up", 0.0) + add
+    pos["top_up_fee"] = pos.get("top_up_fee", 0.0) + TREND_FEE * add * px
+    print(f"  {C.BYLW}[TENDANCE RENFORT]{C.RST} {coin} +{add} avant fermeture (ordre < {TREND_MIN_NOTIONAL:g} $ évité)")
+
 def trend_close(wb: Workbook, pos: dict, status: str, mids: dict, equity: float) -> dict:
-    """Ferme la position tendance au marché (fantôme : au prix moyen). Lève une exception si
-    Hyperliquid refuse la fermeture (la position et son SL restent en place)."""
+    """Ferme la position tendance au marché (fantôme : au prix moyen), après un renfort si l'ordre de
+    fermeture vaudrait moins de TREND_MIN_NOTIONAL. Lève une exception si Hyperliquid refuse
+    (la position et son SL restent en place)."""
     coin    = pos["symbol"]
     exit_px = float(mids.get(coin) or 0)
     if pos.get("paper"):
         return _trend_record_close(wb, pos, status, exit_px, _paper_pnl(pos, exit_px or pos["entry"]), equity)
-    r  = exchange.market_close(coin, slippage=0.05)
+    _trend_top_up(pos, exit_px)
+    r  = exchange.market_close(coin, slippage=TREND_SLIP_CLOSE)
     st = ((r or {}).get("response") or {}).get("data", {}).get("statuses", [{}])
     if r is not None and (r.get("status") != "ok" or (st and "error" in st[0])):
         raise RuntimeError(f"fermeture refusée : {r}")
@@ -2203,7 +2239,7 @@ def trend_close(wb: Workbook, pos: dict, status: str, mids: dict, equity: float)
         res = _closing_pnl(pos, info.user_fills(WALLET_ADDRESS))
         if res:
             gross, open_fee, close_fee = res
-            pnl = gross - open_fee - close_fee
+            pnl = gross - open_fee - close_fee - pos.get("top_up_fee", 0.0)
     except Exception as e:
         log_error(f"P&L tendance {coin}: {e}")
     return _trend_record_close(wb, pos, status, exit_px, pnl, equity)
