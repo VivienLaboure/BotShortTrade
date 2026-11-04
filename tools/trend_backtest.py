@@ -53,6 +53,16 @@ Résultats du 2026-11-04 (4e série, techniques plus complexes, mêmes critères
     mais son résultat tient à quelques journées extrêmes (DOGE le 2021-01-28 : +75 % d'équité en un
     jour) : Sharpe 1.11 → 0.78 sans les 10 meilleures journées sur 3 300, 2e moitié 1.00 → 0.49. Normal
     pour un suivi de tendance ; ne jamais filtrer les entrées ni laisser le bot à l'arrêt.
+Résultats du 2026-11-04 (5e série, diversification multi-actifs comme les fonds de tendance, mêmes critères) :
+  - ajout de 3 marchés Hyperliquid (trade.xyz, marge croisée) : S&P 500, or, pétrole Brent (historique Yahoo
+    depuis 2015, week-ends à plat), chacun au même risque qu'un coin crypto (ATR% médian crypto / ATR% du
+    marché, plafond 5× ; notionnel moyen des 3 : 121 % de l'équité). Coûts prudents : frais 0.045 %/côté
+    (or 0.09 %), longs paient 5.5 %/an de funding, shorts ne touchent rien. Sharpe 0.93 (vs 1.11),
+    1re moitié 1.16 (vs 1.27), 2e moitié 0.65 (vs 0.97), pire baisse −46 % (vs −45 %). Rejeté.
+  - avec les frais actuels (growth mode 0.009 %, or exclu) et le funding reçu par les shorts : 1.01 / 1.21 /
+    0.77, toujours moins bon. Les 3 marchés seuls : −5.7 %/an (−2.1 %/an avec ces coûts), corrélation 0.08
+    avec les cryptos. La règle 14/28/56 j est trop rapide pour eux : l'or, triplé depuis 2017, est short 42 %
+    du temps et ne gagne rien avant frais ; le funding coûte et la marge en USDC ne rapporte rien.
 """
 from __future__ import annotations
 
