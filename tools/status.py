@@ -1,11 +1,11 @@
 """
 État de BotShortTrade en une commande, sans copier-coller Discord :
-  python3 tools/status.py [--hours 24] [--since "2026-10-27 17:09"]
+  python3 tools/status.py [--hours 24] [--scalp [--since "2026-10-27 17:09"]]
 
 Lit uniquement des fichiers locaux et le journal systemd (aucun secret, aucun appel réseau) :
   service systemd, erreurs du journal, messages Discord (discord_events.jsonl),
   stratégie tendance (trend_state.json + onglet Tendance de trades.xlsx),
-  fantômes du scalping clos dans trades.xlsx (onglet Fantômes)
+  et avec --scalp les fantômes du scalping clos dans trades.xlsx (onglet Fantômes)
 """
 from __future__ import annotations
 import argparse, json, os, re, subprocess
@@ -131,6 +131,7 @@ def ghost_report(since: str):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--hours", type=float, default=24, help="fenêtre du journal et des messages (h)")
+    ap.add_argument("--scalp", action="store_true", help="bilan des fantômes du scalping (désactivé depuis le 2026-11-02)")
     ap.add_argument("--since", default=GHOST_ONLY_SINCE, help="date UTC de début du bilan des fantômes")
     a = ap.parse_args()
     since = datetime.now(timezone.utc) - timedelta(hours=a.hours)
@@ -152,8 +153,9 @@ def main():
     print_events(read_events(os.path.join(ROOT, "discord_events.jsonl"), since), "💓")
     print("\n  Stratégie tendance :")
     trend_report()
-    print("\n  Fantômes du scalping (désactivé depuis le 2026-11-02) :")
-    ghost_report(a.since)
+    if a.scalp:
+        print("\n  Fantômes du scalping (désactivé depuis le 2026-11-02) :")
+        ghost_report(a.since)
 
 
 if __name__ == "__main__":

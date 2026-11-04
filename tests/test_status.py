@@ -73,6 +73,19 @@ class TestStatus(unittest.TestCase):
         self.assertIn("Fermées (fantôme) : 2 · gagnantes 1 · P&L $+1.00 · moy +4.00 % du notionnel", txt)
         self.assertNotIn("Fermées (réel)", txt)
 
+    def test_fantomes_du_scalping_seulement_avec_option(self):
+        """Scalping désactivé depuis le 2026-11-02 : son bilan n'encombre plus le statut, sauf --scalp."""
+        def run(*args):
+            out = []
+            with mock.patch.object(S, "ROOT", self.dir), mock.patch.object(S, "sh", lambda cmd: ""), \
+                 mock.patch("sys.argv", ["status.py", *args]), \
+                 mock.patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))):
+                S.main()
+            return "\n".join(out)
+        self.assertNotIn("Fantômes du scalping", run())
+        self.assertIn("Stratégie tendance", run())
+        self.assertIn("Fantômes du scalping", run("--scalp"))
+
 
 if __name__ == "__main__":
     unittest.main()

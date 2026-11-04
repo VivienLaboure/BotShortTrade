@@ -90,10 +90,13 @@ class FakeInfo:
     def __init__(self, mids=None, perp=None, spot=None, fills=None):
         self.mids = mids or {"ETH": "2000"}
         self.perp, self.spot, self.fills = perp or {}, spot or {"balances": []}, fills or []
+        self.funding, self.rates = [], []   # paiements de financement du compte, taux horaires publics
     def all_mids(self): return self.mids
     def user_state(self, addr): return self.perp
     def spot_user_state(self, addr): return self.spot
     def user_fills(self, addr): return self.fills
+    def user_funding_history(self, addr, start): return [f for f in self.funding if f["time"] >= start]
+    def funding_history(self, coin, start): return [r for r in self.rates if r["time"] >= start]
 
 SIG = {"symbol": "ETH", "signal": "buy", "score": 0.8, "atr_m5": 5.0, "price": 2000,
        "conditions": {"mode": "MR", "regime": "RANGING", "rsi": 50, "bbp": 0.3, "vol_ratio": 1.5}}
@@ -742,6 +745,14 @@ class _Minute0(datetime):
     def now(cls, tz=None):
         return datetime.now(tz).replace(minute=0)
 
+def _at_utc_hour(h: int):
+    """datetime dont now() tombe à h heures (même jour)."""
+    class _H(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.now(tz).replace(hour=h)
+    return _H
+
 class LoopInfo(FakeInfo):
     def meta(self): return {"universe": []}
 
@@ -1022,6 +1033,19 @@ class TestDiscordJournal(unittest.TestCase):
         self.assertEqual(len(ev), 1)
         self.assertEqual((ev[0]["title"], ev[0]["description"]), ("💓 Bot actif", "ligne 1\nligne 2"))
 
+    def test_limite_de_debit_discord_attente_puis_nouvel_essai(self):
+        """Rafale de messages (minuit, passage en réel) : 429 → attente demandée par Discord puis nouvel
+        envoi (avant : message perdu sans bruit) ; dernier envoi permis → attente avant le suivant."""
+        resp = [mock.Mock(status_code=429, headers={"Retry-After": "1.5"}),
+                mock.Mock(status_code=204, headers={"X-RateLimit-Remaining": "0", "X-RateLimit-Reset-After": "0.8"})]
+        sent, slept = [], []
+        with mock.patch.object(m, "DISCORD_WEBHOOK_URL", "http://hook"), \
+             mock.patch.object(m.requests, "post", lambda *a, **k: sent.append(k) or resp.pop(0)), \
+             mock.patch.object(m.time, "sleep", slept.append):
+            m.send_discord_alert("t", "d")
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(slept, [1.5, 0.8])
+
     def test_journal_en_erreur_n_empeche_pas_l_envoi(self):
         sent = []
         with mock.patch.object(m, "EVENTS_FILE", os.path.join(_TMP, "absent", "x.jsonl")), \
@@ -1076,16 +1100,19 @@ class TestTrend(BaseTest):
         self.fetches = []
 
     def cycle(self, ex=None, ghost=False, closes=None, per_coin=None, held=(), fills=None,
-              mids=None, orders=None, equity=111.0):
+              mids=None, orders=None, equity=111.0, funding=(), rates=(), fetch=None, meta=None):
         perp = {"assetPositions": list(held)}
         info = OrdersInfo(orders=orders or [], mids=mids or {c: "100" for c in m.TREND_COINS},
                           perp=perp, fills=fills or [])
+        info.funding, info.rates = list(funding), list(rates)
+        if meta is not None:
+            info.meta = meta
         ex = ex or TrendExchange()
         def fc(coin, iv, n, **k):
             self.fetches.append((coin, iv, n))
             return _d1((per_coin or {}).get(coin, closes or self.UP))
         with mock.patch.object(m, "info", info), mock.patch.object(m, "exchange", ex), \
-             mock.patch.object(m, "fetch_candles", fc), mock.patch.object(m, "GHOST_ONLY", ghost):
+             mock.patch.object(m, "fetch_candles", fetch or fc), mock.patch.object(m, "GHOST_ONLY", ghost):
             closed = m.trend_cycle(self.wb, perp, equity)
         return ex, closed
 
@@ -1340,6 +1367,101 @@ class TestTrend(BaseTest):
             self.cycle(ex=ex, held=[_held("ETH", -0.256)], mids=mids)
         self.assertEqual([c[0] for c in self.eth_calls(ex)], ["open", "close", "close"])
         self.assertAlmostEqual(m._load_trend()["positions"]["ETH"]["top_up"], 0.136)
+
+    # ── Sources de bougies, tailles des coins ──
+    def hl_candles(self, closes):
+        """candles_snapshot de Hyperliquid renvoyant les bougies D1 `closes` (format de l'API)."""
+        hl = [{"t": c["ts"], "o": str(c["o"]), "h": str(c["h"]), "l": str(c["l"]), "c": str(c["c"]), "v": "1"}
+              for c in _d1(closes)]
+        return lambda coin, iv, start, end: [c for c in hl if start <= c["t"] <= end]
+
+    def test_bybit_indisponible_signal_avec_les_bougies_hyperliquid(self):
+        """Bybit injoignable (panne, accès bloqué) ou figé : signal calculé sur les bougies journalières
+        de Hyperliquid (avant : plus aucune décision, positions figées sans alerte)."""
+        info = FakeInfo()
+        info.candles_snapshot = self.hl_candles(self.DOWN)
+        with mock.patch.object(m, "fetch_candles", mock.Mock(side_effect=RuntimeError("bybit"))), \
+             mock.patch.object(m, "info", info):
+            self.assertEqual(m.trend_signal("ETH")[0], "SELL")
+            m._trend_sig.clear()
+            info.candles_snapshot = self.hl_candles(self.UP)
+            self.assertEqual(m.trend_signal("ETH")[0], "BUY")
+        # Bybit répond mais sans la bougie d'hier (données figées) : Hyperliquid aussi
+        stale = [dict(c, ts=c["ts"] - 86_400_000) for c in _d1(self.UP)]
+        m._trend_sig.clear()
+        info.candles_snapshot = self.hl_candles(self.DOWN)
+        with mock.patch.object(m, "fetch_candles", lambda *a, **k: stale), mock.patch.object(m, "info", info):
+            self.assertEqual(m.trend_signal("ETH")[0], "SELL")
+
+    def test_aucune_bougie_alerte_une_fois_passe_1_h(self):
+        """Ni Bybit ni Hyperliquid : rien n'est fait (positions gardées avec leur SL) ; une alerte par coin
+        et par jour passé 1 h UTC (juste après minuit, la bougie peut simplement tarder)."""
+        down = mock.Mock(side_effect=RuntimeError("bybit"))
+        with mock.patch.object(m, "datetime", _at_utc_hour(0)):
+            ex, _ = self.cycle(fetch=down)
+        self.assertEqual((ex.calls, self.titles()), ([], []))
+        with mock.patch.object(m, "datetime", _at_utc_hour(3)):
+            self.cycle(fetch=down)
+            self.cycle(fetch=down)
+        self.assertEqual(self.titles().count("⚠️ Tendance : pas de signal ETH"), 1)
+        self.assertEqual(len(self.titles()), 5)
+
+    def test_tailles_inconnues_aucune_ouverture_reelle_puis_nouvel_essai(self):
+        """Tailles des coins non chargées (Hyperliquid injoignable au démarrage) : aucune ouverture réelle
+        (quantité au mauvais pas → refusée, ou BTC à 0.001 = 78 $), nouvel essai à chaque cycle, puis
+        ouvertures dès qu'elles sont connues (avant : mauvaises tailles toute la session)."""
+        universe = {"universe": [{"name": c, "szDecimals": 3} for c in m.TREND_COINS]}
+        with mock.patch.object(m, "_sym_filters_ok", False), mock.patch.dict(m._sym_filters, {}, clear=True):
+            ex, _ = self.cycle(meta=mock.Mock(side_effect=RuntimeError("502")))
+            self.assertEqual([c for c in ex.calls if c[0] == "open"], [])
+            self.assertFalse(m._sym_filters_ok)
+            ex, _ = self.cycle(meta=lambda: universe)
+            self.assertEqual(len([c for c in ex.calls if c[0] == "open"]), 5)
+            self.assertTrue(m._sym_filters_ok)
+
+    # ── Financement compris dans le P&L ──
+    def test_financement_reel_compte_dans_le_pnl(self):
+        """Position réelle fermée : P&L des fills + financement payé sur CE coin depuis l'ouverture (avant :
+        ignoré, alors que le backtest le compte)."""
+        pos = self.real_eth()
+        t0 = pos["opened_at"] * 1000
+        funding = [{"time": t0 - 3_600_000, "delta": {"coin": "ETH", "usdc": "-9"}},     # avant l'ouverture
+                   {"time": t0 + 3_600_000, "delta": {"coin": "ETH", "usdc": "-0.03"}},
+                   {"time": t0 + 7_200_000, "delta": {"coin": "BTC", "usdc": "-5"}},     # autre coin
+                   {"time": t0 + 7_200_000, "delta": {"coin": "ETH", "usdc": "-0.02"}}]
+        fills = [{"coin": "ETH", "dir": "Close Long", "time": time.time() * 1000, "oid": 9,
+                  "closedPnl": "1.2", "fee": "0.005", "px": "100", "sz": "0.12"}]
+        _, closed = self.cycle(closes=self.DOWN, held=[_held("ETH", 0.12)], fills=fills, funding=funding)
+        self.assertAlmostEqual(closed[0]["pnl"], 1.2 - 0.005 - 0.005 - 0.05)
+        self.assertAlmostEqual(closed[0]["funding"], -0.05)
+        self.assertIn("Financement payé : $0.05 (compris dans le P&L)",
+                      dict(self.alerts)["✅ ETH BUY — signal inversé [tendance]"])
+
+    def test_financement_fantome_estime_avec_les_taux_publics(self):
+        """Short fantôme : reçoit le financement quand le taux est positif (les longs paient les shorts)."""
+        self.cycle(ghost=True, closes=self.DOWN)
+        pos = dict(m._load_trend()["positions"]["ETH"])
+        rates = [{"time": pos["opened_at"] * 1000 + h * 3_600_000, "fundingRate": "0.0000125"} for h in range(1, 25)]
+        m._trend_sig.clear()                                             # nouveau jour : signal LONG, inversion
+        _, closed = self.cycle(ghost=True, rates=rates)
+        eth = [p for p in closed if p["symbol"] == "ETH"][0]
+        funding = pos["qty"] * pos["entry"] * 24 * 0.0000125
+        self.assertAlmostEqual(eth["funding"], funding, places=4)
+        self.assertAlmostEqual(eth["pnl"], m._paper_pnl(pos, 100.0) + funding, places=4)
+
+    def test_financement_sur_plusieurs_pages_ou_indisponible(self):
+        """Position tenue des semaines : plus de 500 paiements, toutes les pages sont lues. API en erreur :
+        financement non compté (None), la fermeture n'est pas bloquée."""
+        pos = self.real_eth()
+        t0 = int(pos["opened_at"] * 1000)
+        rows = [{"time": t0 + i, "delta": {"coin": "ETH", "usdc": "-0.001"}} for i in range(1, 701)]
+        info, starts = FakeInfo(), []
+        info.user_funding_history = lambda a, start: starts.append(start) or [r for r in rows if r["time"] >= start][:500]
+        with mock.patch.object(m, "info", info):
+            self.assertAlmostEqual(m._trend_funding(pos), -0.7)
+            self.assertEqual(starts, [t0, t0 + 501])
+            info.user_funding_history = mock.Mock(side_effect=RuntimeError("502"))
+            self.assertIsNone(m._trend_funding(pos))
 
     # ── Liste des coins (BTC remplace LTC le 2026-11-03) ──
     MIDS6 = {c: "100" for c in ("BTC", "ETH", "SOL", "XRP", "DOGE", "LTC")}

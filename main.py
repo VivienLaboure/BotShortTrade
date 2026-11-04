@@ -129,12 +129,14 @@ BYBIT_KLINE  = "https://api.bybit.com/v5/market/kline"
 
 # ── Filtres instruments ────────────────────────────────────────────────────────
 _sym_filters: dict[str, dict] = {}
+_sym_filters_ok = True   # False après un échec de chargement : tailles inconnues, aucune ouverture réelle
 
 def _flt(coin: str) -> dict:
     return _sym_filters.get(coin, {"sz_dec": 3, "sz_step": 0.001})
 
-def init_exchange_info():
-    global _sym_filters
+def init_exchange_info() -> bool:
+    """Charge le pas de taille (szDecimals) de chaque coin ; False si Hyperliquid ne répond pas."""
+    global _sym_filters, _sym_filters_ok
     try:
         meta = info.meta()
         for item in meta.get("universe", []):
@@ -147,8 +149,11 @@ def init_exchange_info():
                     "max_lev": int(item.get("maxLeverage", 50)),
                 }
         print(f"  Exchange info : {len(_sym_filters)} symboles chargés")
+        _sym_filters_ok = True
     except Exception as e:
         log_error(f"init_exchange_info: {e}")
+        _sym_filters_ok = False
+    return _sym_filters_ok
 
 # ── Excel ──────────────────────────────────────────────────────────────────────
 EXCEL_FILE = "trades.xlsx"
@@ -957,11 +962,19 @@ def send_discord_alert(title: str, description: str, color: int = 0xe74c3c):
             "timestamp": datetime.now(timezone.utc).isoformat()
         }]
     }
-    try:
-        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5)
-        r.raise_for_status()
-    except Exception:
-        pass  # Ne jamais crasher le bot à cause de Discord
+    for _ in range(3):
+        try:
+            r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5)
+            if r.status_code != 429:
+                r.raise_for_status()
+                if r.headers.get("X-RateLimit-Remaining") == "0":   # le message suivant serait refusé
+                    time.sleep(min(float(r.headers.get("X-RateLimit-Reset-After") or 1), 5))
+                return
+            # Limite de débit du webhook (≈ 5 messages / 2 s) : rafale de minuit ou du passage en réel.
+            # Avant : message perdu sans bruit.
+            time.sleep(min(float(r.headers.get("Retry-After") or 1), 5))
+        except Exception:
+            return  # Ne jamais crasher le bot à cause de Discord
 
 
 # ── Passer un ordre ───────────────────────────────────────────────────────────
@@ -2036,22 +2049,39 @@ def trend_coins() -> set[str]:
     """Coins tenus en réel par la stratégie tendance (à ne pas adopter par le scalping)."""
     return {c for c, p in _load_trend()["positions"].items() if not p.get("paper")}
 
+def _hl_d1(coin: str, count: int) -> list[dict]:
+    """Les `count` dernières bougies D1 closes de Hyperliquid, au format de fetch_candles. Secours
+    quand Bybit ne répond pas ou tarde : clôtures à 0.05 % près en moyenne et mêmes votes (vérifié le
+    2026-11-04)."""
+    end = int(time.time()) // 86400 * 86_400_000          # minuit UTC : bougie du jour (non close) exclue
+    raw = info.candles_snapshot(coin, "1d", end - (count + 1) * 86_400_000, end - 1)
+    cs  = [{"ts": int(c["t"]), "o": float(c["o"]), "h": float(c["h"]), "l": float(c["l"]),
+            "c": float(c["c"]), "v": float(c["v"])} for c in raw]
+    return sorted(cs, key=lambda c: c["ts"])[-count:]
+
 def trend_signal(coin: str) -> tuple[str, float, float] | None:
     """(côté, dernière clôture D1, ATR14 D1) calculé sur les bougies journalières closes, en cache
-    pour la journée UTC. None si Bybit échoue ou n'a pas encore publié la bougie d'hier (juste
-    après minuit) : nouvel essai au cycle suivant."""
+    pour la journée UTC : Bybit, ou Hyperliquid si Bybit ne répond pas ou n'a pas la bougie d'hier.
+    None si aucune source ne l'a (juste après minuit, ou panne) : nouvel essai au cycle suivant."""
     day = _today()
     cached = _trend_sig.get(coin)
     if cached and cached[0] == day:
         return cached[1:]
     n = max(TREND_LOOKBACKS)
-    try:
-        cs = fetch_candles(coin, INTERVAL_D1, n + 2)
-    except Exception as e:
-        log_error(f"tendance {coin} : bougies D1 indisponibles ({e})")
-        return None
     yesterday = (int(time.time()) // 86400 - 1) * 86_400_000
-    if len(cs) < n + 1 or cs[-1]["ts"] != yesterday:
+    errors = []
+    for source, fetch in (("Bybit", lambda: fetch_candles(coin, INTERVAL_D1, n + 2)),
+                          ("Hyperliquid", lambda: _hl_d1(coin, n + 2))):
+        try:
+            cs = fetch()
+        except Exception as e:
+            errors.append(f"{source} : {e}")
+            continue
+        if len(cs) >= n + 1 and cs[-1]["ts"] == yesterday:
+            break
+    else:
+        if len(errors) == 2:
+            log_error(f"tendance {coin} : bougies D1 indisponibles ({' ; '.join(errors)})")
         return None
     votes = sum(1 if cs[-1]["c"] > cs[-1 - lb]["c"] else -1 for lb in TREND_LOOKBACKS)
     side = "BUY" if votes > 0 else "SELL"
@@ -2171,14 +2201,38 @@ def trend_open(wb: Workbook, coin: str, side: str, atr: float, equity: float, mi
         color=0x2ecc71 if is_buy else 0xe74c3c)
     return pos
 
+def _trend_funding(pos: dict) -> float | None:
+    """Financement reçu (+) ou payé (−) par la position depuis son ouverture : paiements du compte
+    (réelle ; à un jour près, Hyperliquid regroupant les anciens paiements par jour à 00:00 UTC) ou
+    taux horaires publics × notionnel (fantôme). None si Hyperliquid ne répond pas."""
+    coin, start, total = pos["symbol"], int((pos.get("opened_at") or 0) * 1000), 0.0
+    sgn = 1 if pos["side"] == "BUY" else -1
+    try:
+        for _ in range(50):          # pages de 500 lignes au plus (taux horaires : ≈ 3 semaines)
+            if pos.get("paper"):
+                page   = info.funding_history(coin, start)
+                total -= sgn * pos["qty"] * pos["entry"] * sum(float(f["fundingRate"]) for f in page)
+            else:
+                page   = info.user_funding_history(WALLET_ADDRESS, start)
+                total += sum(float(f["delta"]["usdc"]) for f in page if f["delta"].get("coin") == coin)
+            if len(page) < 500:
+                return total
+            start = int(page[-1]["time"]) + 1
+    except Exception as e:
+        log_error(f"financement tendance {coin} (non compté) : {e}")
+    return None
+
 def _trend_record_close(wb: Workbook, pos: dict, status: str, exit_px: float, pnl: float,
                         equity: float) -> dict:
-    """Ligne Excel, console et Discord d'une position tendance fermée (P&L aussi en % de l'équité)."""
+    """Ligne Excel, console et Discord d'une position tendance fermée (P&L aussi en % de l'équité),
+    financement compris (le backtest le compte aussi)."""
     coin, now = pos["symbol"], time.time()
+    funding   = _trend_funding(pos) or 0.0
+    pnl      += funding
     notional  = pos["entry"] * pos["qty"]
     pnl_pct   = pnl / notional * 100 if notional else 0.0
     cap_pct   = pnl / equity * 100 if equity > 0 else 0.0
-    pos.update(status=status, exit=exit_px, pnl=round(pnl, 4), closed_at=now)
+    pos.update(status=status, exit=exit_px, pnl=round(pnl, 4), funding=round(funding, 4), closed_at=now)
     try:
         for row in wb["Tendance"].iter_rows(min_row=2):
             if str(row[0].value) == str(pos["id"]):
@@ -2198,6 +2252,8 @@ def _trend_record_close(wb: Workbook, pos: dict, status: str, exit_px: float, pn
         f"{'👻 ' if pos.get('paper') else ''}{'✅' if pnl >= 0 else '🛑'} {coin} {pos['side']} — {status} [tendance]",
         f"P&L : **{cap_pct:+.2f} %** du capital · {pnl_pct:+.2f} % du notionnel (${pnl:+.2f}) · tenu {days:.1f} j\n"
         f"Entrée : ${pos['entry']:.6g}" + (f" → sortie ${exit_px:.6g}" if exit_px else "")
+        + (f"\nFinancement {'reçu' if funding > 0 else 'payé'} : ${abs(funding):.2f} (compris dans le P&L)"
+           if round(funding, 2) else "")
         + (f"\nRenforcée de {pos['top_up']:g} juste avant : la fermeture seule valait moins de "
            f"{TREND_MIN_NOTIONAL:g} $ (+1 % de marge)" if pos.get("top_up") else ""),
         color=0x2ecc71 if pnl >= 0 else 0xe74c3c)
@@ -2340,9 +2396,16 @@ def trend_cycle(wb: Workbook, user_state: dict | None, equity: float) -> list[di
 
     # 2) Signal du jour. État enregistré après chaque ordre : une position ouverte mais absente de
     #    trend_state.json (bot arrêté juste après l'ordre) serait ensuite prise pour celle d'un autre bot.
+    # Tailles des coins non chargées au démarrage (Hyperliquid injoignable) : nouvel essai à chaque
+    # cycle, et aucune ouverture réelle d'ici là (quantité au mauvais pas : ordre refusé ou trop gros).
+    sizes_ok = _sym_filters_ok or init_exchange_info()
     just_closed: set[str] = set()
     for coin in TREND_COINS:
         sig = trend_signal(coin)
+        if not sig and datetime.now(timezone.utc).hour >= 1:   # toujours rien une heure après minuit
+            _trend_alert_once(coin, "signal", f"⚠️ Tendance : pas de signal {coin}",
+                              "Bougies journalières d'hier indisponibles (Bybit et Hyperliquid) : aucune "
+                              "décision sur ce coin, sa position éventuelle garde son SL. Nouvel essai à chaque cycle.")
         if not sig or not float(mids.get(coin) or 0):
             continue   # bougies ou prix indisponibles : nouvel essai au cycle suivant
         side, _close, atr = sig
@@ -2359,9 +2422,9 @@ def trend_cycle(wb: Workbook, user_state: dict | None, equity: float) -> list[di
                 just_closed.add(coin)   # encore visible sur le compte lu en début de cycle
         if state["stopped"].get(coin) == day:
             continue
-        if not GHOST_ONLY and (held_on_account is None or
+        if not GHOST_ONLY and (held_on_account is None or not sizes_ok or
                                (coin in held_on_account and coin not in just_closed)):
-            continue   # compte illisible, ou position d'un autre bot (BotCopyTrade) sur ce coin
+            continue   # compte illisible, tailles inconnues, ou position d'un autre bot (BotCopyTrade)
         try:
             positions[coin] = trend_open(wb, coin, side, atr, equity, mids)
         except Exception as e:

@@ -130,6 +130,12 @@ class HLSim:
     def user_fills(self, addr=None):
         return list(reversed(self.fills))            # plus récent d'abord, comme l'API
 
+    def user_funding_history(self, addr, start):    # financement hors simulation (P&L comparé aux fills)
+        return []
+
+    def funding_history(self, coin, start):
+        return []
+
     def frontend_open_orders(self, addr=None):
         return [{"coin": o["coin"], "oid": oid, "isTrigger": True, "reduceOnly": True, "orderType": "Stop Market",
                  "triggerPx": str(o["trigger"]), "sz": str(o["sz"])} for oid, o in self.stops.items()]
