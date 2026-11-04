@@ -42,6 +42,17 @@ Résultats du 2026-11-04 (3e série, techniques documentées chez les traders, m
     pas mieux sur la 2e moitié.
   - écartés sans test : carry de funding (aucun marché spot liquide sur Hyperliquid pour couvrir), taille
     continue selon la force du signal (Carver) : impossible tant que chaque coin est au minimum de 10,5 $.
+Résultats du 2026-11-04 (4e série, techniques plus complexes, mêmes critères) :
+  - ensemble EWMAC de Carver (8/32 à 64/256, signe de la moyenne des prévisions plafonnées) : dès 2018-05,
+    Sharpe 0.80 (vs 1.09), 2e moitié 0.31 (vs 0.84), pire baisse −72 % (vs −45 %). Rejeté : trop lent pour
+    le crypto (194 inversions contre 1 236).
+  - méta-étiquetage (López de Prado) : régression logistique réentraînée chaque année sur le passé seul,
+    entrée si P(gagnante à 14 j) ≥ 0.5. Justesse hors échantillon 49 % pour 51 % de positions gagnantes :
+    aucun pouvoir de prédiction ; 2020→2026 Sharpe 0.97 (vs 1.18). Rejeté.
+  - la règle du bot passe le ratio de Sharpe « dégonflé » (Bailey et López de Prado) même pour 30 essais,
+    mais son résultat tient à quelques journées extrêmes (DOGE le 2021-01-28 : +75 % d'équité en un
+    jour) : Sharpe 1.11 → 0.78 sans les 10 meilleures journées sur 3 300, 2e moitié 1.00 → 0.49. Normal
+    pour un suivi de tendance ; ne jamais filtrer les entrées ni laisser le bot à l'arrêt.
 """
 from __future__ import annotations
 
