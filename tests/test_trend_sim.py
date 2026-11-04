@@ -4,7 +4,9 @@ Stratégie tendance sur un Hyperliquid simulé avec ses vraies règles (tailles 
   - chaque ordre (ouverture, SL, renfort, fermeture) vaut au moins TREND_MIN_NOTIONAL à son pire prix ;
   - après chaque cycle, les positions suivies par le bot sont exactement celles du compte, chacune
     avec son SL ; aucun SL orphelin ;
-  - le P&L et le prix de sortie enregistrés de chaque position fermée sont ceux du compte (fills).
+  - le P&L et le prix de sortie enregistrés de chaque position fermée sont ceux du compte (fills) ;
+  - avec des réponses perdues (délai dépassé, avant ou après l'exécution de l'ordre), tout cela reste
+    vrai dès le cycle suivant.
 Aucun réseau : test_regression (importé en premier) isole main.py.
 """
 import math, random, time, unittest
@@ -25,16 +27,26 @@ def _hl_px(px: float, coin: str) -> float:
 class HLSim:
     """Compte Hyperliquid simulé : ordres au marché exécutés au prix moyen, SL déclenchés quand le prix
     les franchit, fills avec closedPnl et frais comme l'API. Toute règle enfreinte va dans `problems`."""
-    def __init__(self, fail_close: float = 0.0, rnd: random.Random | None = None):
+    def __init__(self, fail_close: float = 0.0, rnd: random.Random | None = None, lost: float = 0.0):
         self.mids     = dict(START)
         self.pos: dict[str, dict] = {}       # coin → {"szi", "entry"}
         self.stops: dict[int, dict] = {}     # oid → SL au repos
         self.fills: list[dict] = []
         self.problems: list[str] = []
-        self.done: dict[str, list[tuple]] = {}   # coin → (P&L réel, prix de sortie) de chaque position fermée
+        self.done: dict[str, list[tuple]] = {}   # coin → (P&L réel, prix de sortie, renfort sans réponse) par position fermée
+        self._lost_top_up: set[str] = set()      # coins dont un renfort est passé sans réponse (frais estimés)
         self._ep: dict[str, float] = {}
         self.fail_close, self.rnd = fail_close, rnd or random.Random(0)
+        self.lost, self.lost_now = lost, set()   # réponses perdues : probabilité, coins touchés ce cycle
         self.oid, self.t = 100, time.time() * 1000
+
+    def _lose(self, coin: str) -> str | None:
+        """Réponse perdue au hasard (probabilité `lost`) : « avant » (ordre jamais arrivé) ou « après »
+        (exécuté) ; l'appel lève alors une exception, comme un délai dépassé."""
+        if not self.lost or self.rnd.random() >= self.lost:
+            return None
+        self.lost_now.add(coin)
+        return self.rnd.choice(("avant", "après"))
 
     def _next_oid(self) -> int:
         self.oid += 1
@@ -72,7 +84,8 @@ class HLSim:
         self._ep[coin] = self._ep.get(coin, 0.0) + pnl - fee
         if p["szi"] == 0:
             del self.pos[coin]
-            self.done.setdefault(coin, []).append((self._ep.pop(coin), px))
+            self.done.setdefault(coin, []).append((self._ep.pop(coin), px, coin in self._lost_top_up))
+            self._lost_top_up.discard(coin)
 
     @staticmethod
     def _filled(sz: float, px: float, oid: int) -> dict:
@@ -86,8 +99,15 @@ class HLSim:
     def market_open(self, coin, is_buy, sz, px=None, slippage=0.05):
         mid = self.mids[coin]
         self._check("ouverture", coin, sz, _hl_px(mid * (1 + slippage if is_buy else 1 - slippage), coin))
+        lost = self._lose(coin)
+        if lost == "avant":
+            raise TimeoutError("Read timed out (ordre jamais arrivé)")
+        if lost and coin in self.pos:
+            self._lost_top_up.add(coin)
         oid = self._next_oid()
         self._fill(coin, is_buy, sz, mid, oid)
+        if lost:
+            raise TimeoutError("Read timed out (ordre exécuté)")
         return self._filled(sz, mid, oid)
 
     def market_close(self, coin, sz=None, px=None, slippage=0.05):
@@ -99,8 +119,13 @@ class HLSim:
         if self.rnd.random() < self.fail_close:
             return {"status": "ok", "response": {"type": "order", "data": {"statuses": [
                 {"error": "Order could not immediately match against any resting orders."}]}}}
+        lost = self._lose(coin)
+        if lost == "avant":
+            raise TimeoutError("Read timed out (ordre jamais arrivé)")
         oid = self._next_oid()
         self._fill(coin, is_buy, sz, mid, oid)
+        if lost:
+            raise TimeoutError("Read timed out (ordre exécuté)")
         return self._filled(sz, mid, oid)
 
     def order(self, coin, is_buy, sz, limit_px, order_type, reduce_only):
@@ -114,7 +139,13 @@ class HLSim:
         return {"status": "ok", "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": oid}}]}}}
 
     def cancel(self, coin, oid):
-        if self.stops.pop(oid, None) is None:
+        lost = self._lose(coin)
+        if lost == "avant":
+            raise TimeoutError("Read timed out (annulation jamais arrivée)")
+        existed = self.stops.pop(oid, None) is not None
+        if lost:
+            raise TimeoutError("Read timed out (annulation faite)")
+        if not existed:
             return {"status": "err", "response": "Order was never placed, already canceled, or filled."}
         return {"status": "ok", "response": {"type": "cancel", "data": {"statuses": ["success"]}}}
 
@@ -138,7 +169,8 @@ class HLSim:
 
     def frontend_open_orders(self, addr=None):
         return [{"coin": o["coin"], "oid": oid, "isTrigger": True, "reduceOnly": True, "orderType": "Stop Market",
-                 "triggerPx": str(o["trigger"]), "sz": str(o["sz"])} for oid, o in self.stops.items()]
+                 "side": "B" if o["is_buy"] else "A", "triggerPx": str(o["trigger"]), "sz": str(o["sz"])}
+                for oid, o in self.stops.items()]
 
     # ── Marché ──
     def move(self, coin: str, px: float):
@@ -155,11 +187,11 @@ class HLSim:
 
 class TestTrendSurHyperliquidSimule(T.BaseTest):
     def simulate(self, seed: int, equity: float, days: int = 150, ticks: int = 4, vol: float = 0.05,
-                 fail_close: float = 0.0, paper_days: int = 0, drift: float = 0.0):
+                 fail_close: float = 0.0, paper_days: int = 0, drift: float = 0.0, lost: float = 0.0):
         """`days` jours de prix aléatoires (`ticks` cycles par jour), dont les `paper_days` premiers en
         mode fantôme ; retourne le compte simulé et les positions fermées."""
         rnd = random.Random(seed)
-        sim = HLSim(fail_close, rnd)
+        sim = HLSim(fail_close, rnd, lost)
         hist = {}
         for c in m.TREND_COINS:                              # 60 jours d'historique finissant au prix de départ
             walk = [0.0]
@@ -178,6 +210,7 @@ class TestTrendSurHyperliquidSimule(T.BaseTest):
                 for _ in range(ticks):
                     for c in m.TREND_COINS:
                         sim.move(c, _hl_px(sim.mids[c] * math.exp(rnd.gauss(drift / ticks, vol / ticks ** 0.5)), c))
+                    sim.lost_now = set()
                     closed += m.trend_cycle(wb, sim.user_state(), equity)
                     self.assert_compte_coherent(sim)
                 for c in m.TREND_COINS:
@@ -189,15 +222,22 @@ class TestTrendSurHyperliquidSimule(T.BaseTest):
                 bot.setdefault(p["symbol"], []).append((p["pnl"], p["exit"]))
         for c in m.TREND_COINS:              # P&L et sortie enregistrés = ceux du compte, position par position
             self.assertEqual(len(bot.get(c, [])), len(sim.done.get(c, [])), c)
-            for (pnl, exit_px), (real_pnl, real_px) in zip(bot.get(c, []), sim.done.get(c, [])):
-                self.assertAlmostEqual(pnl, real_pnl, places=3, msg=c)
+            for (pnl, exit_px), (real_pnl, real_px, estimated) in zip(bot.get(c, []), sim.done.get(c, [])):
+                # Renfort resté sans réponse : ses frais sont estimés au prix du cycle suivant
+                self.assertAlmostEqual(pnl, real_pnl, delta=2e-3 if estimated else 5e-4, msg=c)
                 self.assertAlmostEqual(exit_px, real_px, places=9, msg=c)
         return sim, closed
 
     def assert_compte_coherent(self, sim: HLSim):
-        poss = {c: p for c, p in m._load_trend()["positions"].items() if not p.get("paper")}
-        self.assertEqual(set(poss), set(sim.pos), "positions du bot ≠ positions du compte")
+        state = m._load_trend()
+        poss  = {c: p for c, p in state["positions"].items() if not p.get("paper")}
+        # Positions du bot = celles du compte, sauf réponse perdue ce cycle : ouverture notée dans
+        # « opening » (reprise au cycle suivant), fermeture ou renfort constatés au cycle suivant
+        self.assertLessEqual(set(sim.pos) - set(poss), set(state.get("opening", {})), "position du compte inconnue du bot")
+        self.assertLessEqual(set(poss) - set(sim.pos), sim.lost_now, "position du bot absente du compte")
         for c, p in poss.items():
+            if c in sim.lost_now:
+                continue
             hl = sim.pos[c]
             self.assertEqual(hl["szi"] > 0, p["side"] == "BUY", c)
             self.assertAlmostEqual(abs(hl["szi"]), p["qty"] + p.get("top_up", 0.0), places=9, msg=c)
@@ -205,7 +245,8 @@ class TestTrendSurHyperliquidSimule(T.BaseTest):
             self.assertEqual(list(stops), [p["sl_oid"]], f"{c} : un seul SL, celui que suit le bot")
             # Le SL couvre la quantité ouverte ; un renfort n'existe que le temps de réessayer sa fermeture
             self.assertAlmostEqual(stops[p["sl_oid"]]["sz"], p["qty"], places=9, msg=c)
-        self.assertEqual({o["coin"] for o in sim.stops.values()} - set(poss), set(), "SL orphelin")
+        pending = {c for c, _ in state.get("cancels", [])}     # annulation perdue : nouvel essai au cycle suivant
+        self.assertEqual({o["coin"] for o in sim.stops.values()} - set(poss) - pending, set(), "SL orphelin")
 
     def statuses(self, closed: list[dict]) -> set[str]:
         return {p["status"] for p in closed}
@@ -231,6 +272,14 @@ class TestTrendSurHyperliquidSimule(T.BaseTest):
         ni de renforts en série, P&L toujours celui du compte."""
         sim, closed = self.simulate(5, 111.0, fail_close=0.33)
         self.assertGreater(len(closed), 30)
+
+    def test_reponses_perdues_au_hasard(self):
+        """Une réponse sur cinq perdue (délai dépassé, 5xx), l'ordre étant passé ou non : ouvertures,
+        renforts, fermetures et annulations de SL. Jamais de position oubliée ni de SL orphelin au-delà
+        d'un cycle, P&L toujours celui du compte (avant : position ouverte sans réponse jamais gérée)."""
+        sim, closed = self.simulate(6, 111.0, lost=0.2)
+        self.assertGreater(len(closed), 30)
+        self.assertTrue(any("position retrouvée sur le compte" in d for _, d in self.alerts))
 
 
 if __name__ == "__main__":

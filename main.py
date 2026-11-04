@@ -4,7 +4,7 @@ Stratégie par défaut (STRATEGY=trend) : tendance journalière, vote 14/28/56 j
 (cf. section « Stratégie tendance journalière »).
 Ancien scalping (STRATEGY=scalp) : M15 biais → M5 confirm → M1 entrée | SL=1.5×ATR | TP=4×ATR | 5× levier
 """
-import json, math, os, time, traceback
+import json, math, os, sys, time, traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -105,8 +105,11 @@ LESSON_DECAY    = 0.97   # oubli progressif : chaque nouveau résultat × 0.97 s
 _account       = Account.from_key(HL_PRIVATE_KEY)
 WALLET_ADDRESS = _account.address
 API_URL        = constants.TESTNET_API_URL if HL_TESTNET else constants.MAINNET_API_URL
-info           = Info(API_URL, skip_ws=True)
-exchange       = Exchange(_account, API_URL)
+# Délai max d'une requête Hyperliquid. Le SDK n'en met aucun : une connexion restée bloquée (coupure
+# Wi-Fi) figeait le bot sans erreur ni alerte. Ordre sans réponse : cf. « opening » (tendance).
+HL_TIMEOUT_S   = 20
+info           = Info(API_URL, skip_ws=True, timeout=HL_TIMEOUT_S)
+exchange       = Exchange(_account, API_URL, timeout=HL_TIMEOUT_S)
 
 print(f"  {C.DIM}Wallet : {WALLET_ADDRESS}{C.RST}")
 _net_color = C.BYLW if HL_TESTNET else C.BRED
@@ -230,8 +233,17 @@ def init_excel() -> Workbook:
             if created:
                 _safe_save(wb)
             return wb
-        except Exception:
-            pass
+        except Exception as e:
+            # Fichier illisible : mis de côté avant d'en créer un neuf (avant : écrasé, historique perdu)
+            bad = f"trades-illisible-{datetime.now(timezone.utc):%Y%m%d-%H%M%S}.xlsx"
+            try:
+                os.replace(EXCEL_FILE, bad)
+            except OSError as err:
+                log_error(f"{EXCEL_FILE} : mise de côté impossible ({err})")
+            log_error(f"{EXCEL_FILE} illisible ({e}) : copie gardée sous {bad}, nouveau fichier créé")
+            send_discord_alert(f"⚠️ {EXCEL_FILE} illisible",
+                               f"Copie gardée sous `{bad}` ; un nouveau fichier est créé. Les positions "
+                               f"et les SL ne sont pas touchés.\nErreur : `{str(e)[:300]}`", color=0xf39c12)
     wb = Workbook()
     ws = wb.active
     ws.title = "Trades"
@@ -1200,8 +1212,11 @@ def ensure_sl_orders(open_positions: list) -> int:
     for pos in open_positions:
         coin   = pos["symbol"]
         is_buy = pos["side"] == "BUY"
+        # Un stop du même sens que la position (« B » = achat) ne la protège pas : SL orphelin d'une
+        # position inverse précédente, dont l'annulation est en attente
         stops  = [o for o in orders if o.get("coin") == coin and o.get("isTrigger")
-                  and o.get("reduceOnly") and str(o.get("orderType", "")).startswith("Stop")]
+                  and o.get("reduceOnly") and str(o.get("orderType", "")).startswith("Stop")
+                  and o.get("side") != ("B" if is_buy else "A")]
         if stops:
             if not any(o.get("oid") == pos.get("sl_oid") for o in stops):
                 pos["sl_oid"] = stops[0]["oid"]   # resynchroniser (ex. reprise état partiel)
@@ -2016,7 +2031,9 @@ def ghost_update(wb: Workbook) -> list[dict]:
 # place de LTC aussi (+6 %/an, t=2.2). Hypothèses déclarées avant chaque test (docstring du backtest).
 # GHOST_ONLY : positions fantômes au prix moyen, aucun ordre (validation de la mécanique).
 TREND_FILE = "trend_state.json"
-_trend: dict | None = None             # {"positions": {coin: position}, "stopped": {coin: jour UTC}}
+# {"positions": {coin: position}, "stopped": {coin: jour UTC},
+#  "opening": {coin: ouverture sans réponse de Hyperliquid}, "cancels": [[coin, oid] de SL à annuler]}
+_trend: dict | None = None
 _trend_sig: dict[str, tuple] = {}      # coin → (jour UTC, côté, clôture D1, ATR14 D1)
 _trend_alerted: set[tuple] = set()     # (coin, jour, motif) : une seule alerte d'échec par jour
 _trend_sl_ts = 0.0                     # dernière vérification des SL tendance sur Hyperliquid
@@ -2037,6 +2054,8 @@ def _load_trend() -> dict:
             _trend = {}
         _trend.setdefault("positions", {})
         _trend.setdefault("stopped", {})
+        _trend.setdefault("opening", {})
+        _trend.setdefault("cancels", [])
     return _trend
 
 def _save_trend():
@@ -2046,8 +2065,10 @@ def _save_trend():
     os.replace(tmp, TREND_FILE)
 
 def trend_coins() -> set[str]:
-    """Coins tenus en réel par la stratégie tendance (à ne pas adopter par le scalping)."""
-    return {c for c, p in _load_trend()["positions"].items() if not p.get("paper")}
+    """Coins tenus en réel par la stratégie tendance (à ne pas adopter par le scalping), y compris
+    ceux d'une ouverture restée sans réponse."""
+    state = _load_trend()
+    return {c for c, p in state["positions"].items() if not p.get("paper")} | set(state["opening"])
 
 def _hl_d1(coin: str, count: int) -> list[dict]:
     """Les `count` dernières bougies D1 closes de Hyperliquid, au format de fetch_candles. Secours
@@ -2137,7 +2158,8 @@ def _place_sl(coin: str, is_buy: bool, qty: float, sl: float):
 
 def trend_open(wb: Workbook, coin: str, side: str, atr: float, equity: float, mids: dict) -> dict:
     """Ouvre la position tendance (fantôme si GHOST_ONLY) avec son SL. Lève une exception si
-    l'ouverture échoue ou si le SL est refusé (la position est alors refermée au marché)."""
+    l'ouverture échoue ou si le SL est refusé (la position est alors refermée au marché). Ordre
+    resté sans réponse : il reste noté dans « opening », trend_cycle le vérifie au cycle suivant."""
     is_buy, sgn = side == "BUY", (1 if side == "BUY" else -1)
     price = float(mids.get(coin) or 0)
     sl_px = price - sgn * TREND_SL_ATR * atr
@@ -2152,7 +2174,14 @@ def trend_open(wb: Workbook, coin: str, side: str, atr: float, equity: float, mi
         oid, entry, open_fee = f"P{int(now * 1000)}-{coin}", price, TREND_FEE * qty * price
     else:
         set_leverage(coin)
+        # Noté AVANT l'ordre : réponse perdue (délai dépassé, 5xx) ou bot arrêté pendant l'ordre →
+        # la position éventuellement ouverte est reprise ensuite (avant : prise pour celle d'un autre
+        # bot, jamais gérée, sans SL)
+        opening = _load_trend()["opening"]
+        opening[coin] = {"side": side, "atr": atr, "ts": now}
+        _save_trend()
         r  = exchange.market_open(coin, is_buy, qty, px=None, slippage=TREND_SLIP_OPEN)
+        del opening[coin]   # réponse reçue ; enregistré par l'appelant avec la position ou l'échec
         st = ((r or {}).get("response") or {}).get("data", {}).get("statuses", [{}])
         if not r or r.get("status") != "ok" or "error" in st[0]:
             raise RuntimeError(f"ordre refusé : {r}")
@@ -2180,25 +2209,46 @@ def trend_open(wb: Workbook, coin: str, side: str, atr: float, equity: float, mi
                                "SL tendance refusé ET fermeture d'urgence échouée. "
                                "**Intervention manuelle requise.** (nouvel essai de SL toutes les 5 min)",
                                color=0xff0000)
+    _trend_log_open(wb, pos, equity)
+    return pos
+
+def _trend_log_open(wb: Workbook, pos: dict, equity: float, note: str = ""):
+    """Ligne Excel, console et Discord d'une position tendance ouverte (`note` : ligne de plus sur Discord)."""
+    coin, side, entry, qty, sl = pos["symbol"], pos["side"], pos["entry"], pos["qty"], pos["sl"]
+    is_buy, paper = side == "BUY", pos.get("paper")
     notional = round(qty * entry, 2)
     try:
-        wb["Tendance"].append([oid, datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d %H:%M"),
-                               SYM_LABEL[coin], side, "Fantôme" if GHOST_ONLY else "Réel", qty,
+        wb["Tendance"].append([pos["id"], datetime.fromtimestamp(pos["opened_at"], timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                               SYM_LABEL[coin], side, "Fantôme" if paper else "Réel", qty,
                                round(entry, 6), sl, notional, "Ouvert", None, None, None, None])
         _safe_save(wb)
     except Exception as e:
         log_error(f"excel tendance {coin}: {e}")
     _sc = C.BGRN if is_buy else C.BRED
     print(f"  {_sc}[TENDANCE {'LONG' if is_buy else 'SHORT'}]{C.RST} {C.BOLD}{coin}{C.RST} {qty} @ ${entry:.6g}"
-          f"  SL ${sl:.6g}  notionnel ${notional}" + ("  (fantôme)" if GHOST_ONLY else ""))
+          f"  SL ${sl:.6g}  notionnel ${notional}" + ("  (fantôme)" if paper else ""))
     risk = qty * abs(entry - sl) + TREND_FEE * qty * (entry + sl)   # perte si le SL est touché, frais compris
     send_discord_alert(
-        f"{'👻 ' if GHOST_ONLY else ''}{'🟢 LONG' if is_buy else '🔴 SHORT'} {coin} ouvert [tendance]",
+        f"{'👻 ' if paper else ''}{'🟢 LONG' if is_buy else '🔴 SHORT'} {coin} ouvert [tendance]",
         f"Entrée : **${entry:.6g}** · SL : **${sl:.6g}** ({abs(sl - entry) / entry * 100:.1f} %)\n"
         f"Notionnel : **${notional}** ({notional / equity * 100:.1f} % du capital) · "
         f"perte au SL : **{-risk / equity * 100:.2f} %** du capital"
-        + (" · fantôme (aucun ordre réel)" if GHOST_ONLY else ""),
+        + (" · fantôme (aucun ordre réel)" if paper else "") + note,
         color=0x2ecc71 if is_buy else 0xe74c3c)
+
+def _trend_adopt(wb: Workbook, coin: str, o: dict, p: dict, equity: float) -> dict:
+    """Position ouverte par un ordre resté sans réponse (`o`, noté dans « opening ») : reprise telle
+    qu'elle est sur le compte (`p`), avec son SL, posé s'il ne l'a pas encore été."""
+    global _trend_sl_ts
+    sgn = 1 if o["side"] == "BUY" else -1
+    entry, qty = float(p["entryPx"]), abs(float(p["szi"]))
+    pos = {"id": f"hl-{coin}-{int(o['ts'])}", "symbol": coin, "side": o["side"], "entry": entry, "qty": qty,
+           "sl": round_px(entry - sgn * TREND_SL_ATR * o["atr"], coin), "sl_oid": None, "atr": o["atr"],
+           "open_fee": TREND_FEE * qty * entry, "opened_at": o["ts"], "paper": False}
+    _trend_log_open(wb, pos, equity, "\nHyperliquid n'avait pas répondu à l'ordre : position retrouvée sur le compte")
+    ensure_sl_orders([pos])
+    if pos["sl_oid"] is None:
+        _trend_sl_ts = 0.0   # SL pas encore posé : nouvel essai dès ce cycle, puis toutes les 5 min
     return pos
 
 def _trend_funding(pos: dict) -> float | None:
@@ -2293,6 +2343,17 @@ def _trend_top_up(pos: dict, px: float):
     pos["top_up_fee"] = pos.get("top_up_fee", 0.0) + TREND_FEE * add * px
     print(f"  {C.BYLW}[TENDANCE RENFORT]{C.RST} {coin} +{add} avant fermeture (ordre sous {TREND_MIN_NOTIONAL:g} $ + 1 % évité)")
 
+def _trend_cancel_sl(coin: str, oid):
+    """Annule le SL d'une position fermée. Échec (réseau) : nouvel essai à chaque cycle (« cancels ») ;
+    resté en place, ce SL reduce-only fermerait plus tard une position du même sens à l'ancien niveau."""
+    if not oid:
+        return
+    try:
+        exchange.cancel(coin, int(oid))
+    except Exception as e:
+        log_error(f"annulation SL tendance {coin} (nouvel essai au cycle suivant) : {e}")
+        _load_trend()["cancels"].append([coin, oid])
+
 def trend_close(wb: Workbook, pos: dict, status: str, mids: dict, equity: float) -> dict:
     """Ferme la position tendance au marché (fantôme : au prix moyen), après un renfort si l'ordre de
     fermeture vaudrait moins de TREND_MIN_TARGET. Lève une exception si Hyperliquid refuse
@@ -2306,11 +2367,7 @@ def trend_close(wb: Workbook, pos: dict, status: str, mids: dict, equity: float)
     st = ((r or {}).get("response") or {}).get("data", {}).get("statuses", [{}])
     if r is not None and (r.get("status") != "ok" or (st and "error" in st[0])):
         raise RuntimeError(f"fermeture refusée : {r}")
-    if pos.get("sl_oid"):
-        try:
-            exchange.cancel(coin, int(pos["sl_oid"]))
-        except Exception as e:
-            log_error(f"annulation SL tendance {coin}: {e}")
+    _trend_cancel_sl(coin, pos.get("sl_oid"))
     time.sleep(1)   # propagation des fills
     res = None
     try:
@@ -2344,12 +2401,35 @@ def trend_cycle(wb: Workbook, user_state: dict | None, equity: float) -> list[di
     positions  = state["positions"]
     state["stopped"] = {c: d for c, d in state["stopped"].items() if d == day}
     closed: list[dict] = []
-    held_on_account = account_coins(user_state) if user_state is not None else None
+    acct = {ap["position"]["coin"]: ap["position"] for ap in (user_state or {}).get("assetPositions", [])
+            if float(ap["position"].get("szi") or 0)}   # positions du compte (de tous les bots du wallet)
+    held_on_account = set(acct) if user_state is not None else None
     try:
         mids = info.all_mids()
     except Exception as e:
         log_error(f"tendance all_mids (nouvel essai au cycle suivant) : {e}")
         return closed
+
+    # 0) Ordres restés sans réponse (délai dépassé, bot arrêté pendant l'ordre). Ouverture : position
+    #    reprise si elle est sur le compte, sinon nouvel essai plus bas. SL à annuler : nouvel essai.
+    if state["cancels"]:
+        try:   # seulement les SL encore en place (sinon déjà annulés ou exécutés : rien à refaire)
+            resting = {o.get("oid") for o in info.frontend_open_orders(WALLET_ADDRESS)}
+        except Exception as e:
+            log_error(f"ordres ouverts (annulation de SL au cycle suivant) : {e}")
+            resting = None
+        for coin, oid in list(state["cancels"]):
+            if resting is not None:
+                state["cancels"].remove([coin, oid])
+                if oid in resting:
+                    _trend_cancel_sl(coin, oid)
+        _save_trend()
+    for coin, o in list(state["opening"].items() if held_on_account is not None else ()):
+        p = acct.get(coin)
+        if coin not in positions and p and (float(p["szi"]) > 0) == (o["side"] == "BUY"):
+            positions[coin] = _trend_adopt(wb, coin, o, p, equity)
+        del state["opening"][coin]
+        _save_trend()
 
     # 1) SL touchés (réel : position absente du compte ; fantôme : prix moyen au-delà du SL)
     for coin, pos in list(positions.items()):
@@ -2362,6 +2442,12 @@ def trend_cycle(wb: Workbook, user_state: dict | None, equity: float) -> list[di
             continue
         if held_on_account is None or coin in held_on_account:
             pos.pop("_missing", None)
+            # Renfort passé sans réponse : la taille du compte fait foi (sinon second renfort inutile)
+            extra = round(abs(float(acct[coin]["szi"])) - pos["qty"], 9) if coin in acct else 0.0
+            if extra > pos.get("top_up", 0.0) + 1e-9:
+                pos["top_up_fee"] = (pos.get("top_up_fee", 0.0)
+                                     + TREND_FEE * (extra - pos.get("top_up", 0.0)) * float(mids.get(coin) or pos["entry"]))
+                pos["top_up"] = extra
             continue
         res = None
         try:
@@ -2378,6 +2464,9 @@ def trend_cycle(wb: Workbook, user_state: dict | None, equity: float) -> list[di
         pnl, exit_px, exit_ts = res
         closed.append(_trend_record_close(wb, pos, "SL touché" if pnl < 0 else "Fermé (SL)", exit_px, pnl, equity))
         del positions[coin]
+        # Fermée par autre chose que son SL (fermeture restée sans réponse, à la main) : SL orphelin annulé.
+        # Après un vrai SL, Hyperliquid répond simplement « déjà exécuté ».
+        _trend_cancel_sl(coin, pos.get("sl_oid"))
         if _utc_day(exit_ts) == day:   # SL d'un jour passé (bot arrêté à ce moment) : rien à attendre
             state["stopped"][coin] = day
         _save_trend()
@@ -2428,10 +2517,15 @@ def trend_cycle(wb: Workbook, user_state: dict | None, equity: float) -> list[di
         try:
             positions[coin] = trend_open(wb, coin, side, atr, equity, mids)
         except Exception as e:
-            state["stopped"][coin] = day   # pas de nouvel essai avant demain (évite d'insister chaque minute)
+            unsure = coin in state["opening"]   # ordre sans réponse : vérifié au cycle suivant
+            if not unsure:
+                state["stopped"][coin] = day   # refus : pas de nouvel essai avant demain (évite d'insister)
             log_error(f"ouverture tendance {coin}: {e}")
             _trend_alert_once(coin, "open", f"⚠️ Tendance : {coin} non ouvert",
-                              f"{side} {coin} : `{str(e)[:300]}`\nNouvel essai demain.")
+                              f"{side} {coin} : `{str(e)[:300]}`\n"
+                              + ("Hyperliquid n'a pas répondu : au cycle suivant, la position est reprise avec "
+                                 "son SL si l'ordre est passé, sinon l'ouverture est retentée." if unsure
+                                 else "Nouvel essai demain."))
         _save_trend()
     _save_trend()
     return closed
@@ -2543,6 +2637,7 @@ def run():
     hb_g_opened = 0                   # fantômes ouverts sur la période
     hb_g_closed: list[dict] = []      # fantômes clos sur la période
     hb_t_closed: list[dict] = []      # positions tendance fermées sur la période
+    cycle_errors: set[tuple] = set()  # (jour UTC, erreur) imprévues déjà signalées sur Discord
 
     def _ghost_all(sigs: list[dict], reason_of) -> int:
         """Ouvre un fantôme pour chaque signal (raison calculée par reason_of(sig))
@@ -2557,370 +2652,382 @@ def run():
 
     while True:
         loop_start = time.time()
-        ts      = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        now_min = datetime.now(timezone.utc).minute   # affichages console périodiques
-        print(f"\n{C.DIM}[{ts}] ──────────────────────────────────────────────────{C.RST}")
-
-        # ── Fetch unique par cycle : user_state sert pour check_position + equity + unrealized ──
-        # Avant : 3–4 appels info.user_state() par cycle (check × N + get_equity + get_unrealized)
-        # Maintenant : 1 seul appel, partagé par tous.
-        _user_state: dict | None = None
         try:
-            _user_state = info.user_state(WALLET_ADDRESS)
-        except Exception as e:
-            log_error(f"user_state: {e}")
+            ts      = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            now_min = datetime.now(timezone.utc).minute   # affichages console périodiques
+            print(f"\n{C.DIM}[{ts}] ──────────────────────────────────────────────────{C.RST}")
 
-        # Suivi des positions ouvertes
-        closed_this_loop = []
-        _cycle_mids: dict | None = None
-        if open_positions and _user_state is not None:
+            # ── Fetch unique par cycle : user_state sert pour check_position + equity + unrealized ──
+            # Avant : 3–4 appels info.user_state() par cycle (check × N + get_equity + get_unrealized)
+            # Maintenant : 1 seul appel, partagé par tous.
+            _user_state: dict | None = None
             try:
-                _cycle_mids = info.all_mids()
-            except Exception:
-                pass
-        for pos in list(open_positions):
-            result = check_position(wb, pos, _user_state, _cycle_mids)
-            if result is not None:
-                closed_this_loop.append(pos)
-
-        for pos in closed_this_loop:
-            open_positions.remove(pos)
-            capital_in_use = max(0.0, capital_in_use - CAPITAL_PER_TRADE)
-
-        # Surveillance des SL toutes les 5 min (1 appel API) — position sans stop = risque max
-        if open_positions and time.time() - run.__dict__.get("_sl_check_ts", 0) >= SL_CHECK_S:
-            run._sl_check_ts = time.time()
-            if ensure_sl_orders(open_positions):
-                save_positions_state(open_positions)
-
-        # Mode fantôme : résolution des signaux virtuels ouverts
-        try:
-            hb_g_closed += ghost_update(wb)
-        except Exception as e:
-            log_error(f"ghost_update: {e}")
-
-        # Persister l'état après chaque cycle de vérification :
-        # - positions fermées : évident
-        # - positions ouvertes : sl, sl_oid et trailed peuvent avoir changé via trail_sl()
-        #   Si le bot crashe avant le prochain save, le nouvel sl_oid serait perdu sur disque
-        save_positions_state(open_positions)
-
-        # Balance : si des positions ont fermé ce cycle, user_state est stale → refetch
-        try:
-            balance = get_equity(None if closed_this_loop else _user_state)
-        except Exception as e:
-            log_error(f"équité (solde précédent conservé) : {e}")
-
-        # ── Auto-recalibrage du capital ───────────────────────────────────────────
-        # Recalibrer si le solde réel s'écarte significativement de MAX_LIQUIDITY
-        # (baisse > 20% OU hausse > 20%) ET aucune position ouverte.
-        # Hausse = dépôt ou profit accumulé. Baisse = perte ou retrait.
-        balance_drift = abs(balance - MAX_LIQUIDITY) / max(MAX_LIQUIDITY, 0.01)
-        if balance_drift > 0.20 and len(open_positions) == 0:
-            old_max = MAX_LIQUIDITY
-            MAX_LIQUIDITY      = max(balance, 0.01)
-            CAPITAL_PER_TRADE  = MAX_LIQUIDITY * CAPITAL_PCT
-            capital_in_use     = 0.0
-            direction = "↑" if balance > old_max else "↓"
-            print(f"  {C.BYLW}[RECALIBRAGE {direction}]{C.RST} Solde ${old_max:.2f} → ${MAX_LIQUIDITY:.2f} | "
-                  f"par trade ${CAPITAL_PER_TRADE:.2f}")
-
-        # Disponible = min(tracking interne, cash libre réel)
-        # Le solde Hyperliquid (balance) inclut la marge des positions ouvertes.
-        # Si balance < capital_in_use, le compte est en sous-marge → bloquer tout nouveau trade.
-        internal_avail = MAX_LIQUIDITY - capital_in_use
-        real_free      = max(0.0, balance - capital_in_use)
-        avail_capital  = min(internal_avail, real_free)
-
-        # Alerte divergence — seulement toutes les 5 min pour ne pas spammer
-        if (internal_avail > 0 and real_free < internal_avail * 0.8
-                and now_min % 5 == 0):
-            print(f"  {C.BRED}[ALERTE]{C.RST} Dispo interne ${internal_avail:.2f} vs "
-                  f"cash libre ${real_free:.2f} — {len(open_positions)} position(s) en marge")
-
-        max_slots     = MAX_TRADES if MAX_TRADES > 0 else 999
-        slots_left    = max_slots - len(open_positions)
-
-        pnl_total, pnl_week = calc_portfolio_pnl(wb)
-        pnl_today  = calc_daily_pnl(wb)   # P&L du jour calculé ici → réutilisé pour le filtre
-        unrealized = get_unrealized_pnl(_user_state, {p["symbol"] for p in open_positions} | trend_coins())
-        net_pnl = pnl_total + unrealized
-        net_pct = (net_pnl / initial_balance * 100) if initial_balance > 0 else 0.0
-        _dispo_c = C.BRED if avail_capital <= 0 else (C.BYLW if avail_capital < CAPITAL_PER_TRADE * 2 else C.WHT)
-        print(f"  Positions: {C.BOLD}{len(open_positions)}{C.RST}  Dispo: {_dispo_c}${avail_capital:.2f}{C.RST}  Équité: {C.BOLD}${balance:.2f}{C.RST}")
-        print(f"  P&L réalisé: {_cp(pnl_total)}${pnl_total:+.2f}{C.RST}  |  Non réalisé: {_cp(unrealized)}${unrealized:+.2f}{C.RST}  |  Net: {_cp(net_pnl)}{C.BOLD}${net_pnl:+.2f} ({net_pct:+.1f}%){C.RST}")
-        print(f"  P&L 7j: {_cp(pnl_week)}${pnl_week:+.2f}{C.RST}  |  Aujourd'hui: {_cp(pnl_today)}${pnl_today:+.2f}{C.RST}")
-
-        # Filtre horaire (heures UTC)
-        hour_utc = datetime.now(timezone.utc).hour
-        in_session = SESSION_START_UTC <= hour_utc < SESSION_END_UTC
-
-        # Régime de marché — mis à jour toutes les 30 min (candles journalières, pas besoin de plus).
-        # Échec Bybit → on garde le régime précédent et on réessaie au cycle suivant
-        # (avant : RANGING forcé pendant 30 min ; et "minute % 30" ratait parfois sa minute).
-        if time.time() - run.__dict__.get("_regime_ts", 0) >= REGIME_REFRESH_S:
-            try:
-                run._regime_cache = _compute_regime()
-                run._regime_ts    = time.time()
+                _user_state = info.user_state(WALLET_ADDRESS)
             except Exception as e:
-                log_error(f"régime (précédent conservé) : {e}")
-        regime, bias, btc_chg, eth_chg = run.__dict__.get("_regime_cache", ("RANGING", "neutral", 0.0, 0.0))
-        global _current_regime
-        _current_regime = regime   # partagé avec get_signal() pour les leçons
-        _rc = (C.BGRN if regime == "BULL" else
-               C.BRED if regime in ("BEAR", "DIVERGING") else C.BYLW)
-        print(f"  Régime: {_rc}{regime}{C.RST}  BTC={btc_chg:+.1f}%  ETH={eth_chg:+.1f}%")
+                log_error(f"user_state: {e}")
 
-        # Limite de perte journalière (pnl_today déjà calculé plus haut)
-        daily_loss_limit = -MAX_LIQUIDITY * MAX_DAILY_LOSS_PCT / 100
-        daily_loss_hit = pnl_today <= daily_loss_limit
-        if daily_loss_hit:
-            print(f"  {C.BRED}[STOP]{C.RST} Perte du jour atteinte (${pnl_today:.2f} ≤ ${daily_loss_limit:.2f})")
-
-        # Bloquer les nouveaux trades en régime dangereux
-        regime_blocked = regime in ("BEAR", "DIVERGING")
-        if regime_blocked:
-            print(f"  {C.BRED}[RÉGIME]{C.RST} {regime} — aucun nouveau trade")
-
-        # Raison de non-scan (lisible)
-        if not in_session:
-            print(f"  {C.BYLW}[PAUSE]{C.RST} Hors session ({hour_utc}h UTC, actif {SESSION_START_UTC}h-{SESSION_END_UTC}h)")
-
-        # Avertissement solde insuffisant (< 2 trades possibles, aucune position ouverte)
-        if balance < CAPITAL_PER_TRADE * 2 and len(open_positions) == 0 and now_min % 5 == 0:
-            print(f"  {C.BRED}[SOLDE BAS]{C.RST} Équité ${balance:.2f} — "
-                  f"insuffisant pour trader (min recommandé ${CAPITAL_PER_TRADE * 3:.2f}). "
-                  f"Déposer des fonds pour reprendre.")
-
-        # Stratégie tendance : SL touchés + alignement sur le signal du jour (aucun scan scalping)
-        if STRATEGY == "trend":
-            try:
-                hb_t_closed += trend_cycle(wb, _user_state, min(balance, MAX_LIQUIDITY))
-            except Exception as e:
-                log_error(f"tendance : {e}")
-                traceback.print_exc()
-            _held = ", ".join(c + " " + p["side"] for c, p in sorted(_load_trend()["positions"].items()))
-            print(f"  Tendance{' (fantôme)' if GHOST_ONLY else ''} : {_held or 'aucune position'}")
-
-        # Scalping : chercher un nouveau signal
-        elif slots_left > 0 and avail_capital >= CAPITAL_PER_TRADE and in_session and not daily_loss_hit and not regime_blocked:
-            # + coins tenus par BotCopyTrade : 2 positions sur un coin fusionneraient
-            #   (user_state illisible → coins inconnus → aucun scan réel ce cycle)
-            open_coins = {p["symbol"] for p in open_positions} | (
-                account_coins(_user_state) if _user_state is not None else set(WATCHLIST))
-            _ghost_candidates.clear()
-            signals    = scan_all(open_coins)
-            raw_signals = list(signals)   # pour le mode fantôme (signaux non tradés)
-            _print_scan_summary()
-            hb_scans += 1
-            hb_raw   += len(signals)
-            for s_ in signals:
-                if hb_best is None or s_["score"] > hb_best["score"]:
-                    hb_best = s_
-
-            # Filtrage par régime :
-            # BULL     → BUY dans la tendance + SELL MR autorisé (suracheté, score ≥ 0.75)
-            #            SELL MOM bloqué (ne pas shorter un crash en plein BULL)
-            # RANGING  → exige score ≥ 0.75 (marché sans direction claire)
-            min_score = 0.75 if regime == "RANGING" else 0.45  # BULL : filtre les signaux trop faibles
-            bull_ok = signals
-            if regime == "BULL":
-                signals = bull_ok = [s for s in signals if
-                           s["signal"] == "buy" or
-                           (s["signal"] == "sell" and
-                            s.get("conditions", {}).get("mode") == "MR" and
-                            s["score"] >= 0.75)]
-            signals = [s for s in signals if s["score"] >= min_score]
-            hb_kept += len(signals)
-            would_trade: list[dict] = []
-            if GHOST_ONLY:   # aucun ordre réel : les signaux retenus deviennent des fantômes
-                would_trade, signals = signals, []
-
-            # Ouvrir jusqu'à slots_left positions si plusieurs bons signaux disponibles
-            opened_this_cycle = 0
-            traded: list[dict] = []
-            while signals and slots_left > 0 and avail_capital >= CAPITAL_PER_TRADE:
-                sig = best_signal(signals)
-                if not sig:
-                    break
-                signals = [s for s in signals if s["symbol"] != sig["symbol"]]
-                _ss = C.BGRN if sig["signal"] == "buy" else C.BRED
-                print(f"\n  {_ss}[SIGNAL] {sig['symbol']} {sig['signal'].upper()}{C.RST}  score={sig['score']:.3f}  régime={regime}")
+            # Suivi des positions ouvertes
+            closed_this_loop = []
+            _cycle_mids: dict | None = None
+            if open_positions and _user_state is not None:
                 try:
-                    pos = place_order(sig, wb)
-                    traded.append(sig)
-                    open_positions.append(pos)
-                    capital_in_use += CAPITAL_PER_TRADE
-                    avail_capital  -= CAPITAL_PER_TRADE
-                    slots_left     -= 1
-                    opened_this_cycle += 1
+                    _cycle_mids = info.all_mids()
+                except Exception:
+                    pass
+            for pos in list(open_positions):
+                result = check_position(wb, pos, _user_state, _cycle_mids)
+                if result is not None:
+                    closed_this_loop.append(pos)
+
+            for pos in closed_this_loop:
+                open_positions.remove(pos)
+                capital_in_use = max(0.0, capital_in_use - CAPITAL_PER_TRADE)
+
+            # Surveillance des SL toutes les 5 min (1 appel API) — position sans stop = risque max
+            if open_positions and time.time() - run.__dict__.get("_sl_check_ts", 0) >= SL_CHECK_S:
+                run._sl_check_ts = time.time()
+                if ensure_sl_orders(open_positions):
                     save_positions_state(open_positions)
-                except Exception as e:
-                    log_error(f"place_order: {e}")
-                    traceback.print_exc()
-                    break  # ne pas tenter un 2e ordre si le 1er échoue
 
-            hb_opened += opened_this_cycle
-            if opened_this_cycle == 0:
-                print(f"  {C.DIM}Pas de signal retenu ce cycle{C.RST}")
+            # Mode fantôme : résolution des signaux virtuels ouverts
+            try:
+                hb_g_closed += ghost_update(wb)
+            except Exception as e:
+                log_error(f"ghost_update: {e}")
 
-            # Fantômes : tous les signaux détectés mais non tradés
-            hb_g_opened += _ghost_all(
-                [sg for sg in raw_signals if not any(sg is t for t in traded)],
-                lambda sg: ("fantôme seul (aurait été tradé)" if any(sg is w for w in would_trade) else
-                            "filtre BULL" if not any(sg is b for b in bull_ok) else
-                            f"score<{min_score}" if sg["score"] < min_score else
-                            "non pris (slot/capital)"))
-        else:
-            if slots_left <= 0:
-                print(f"  {C.DIM}Toutes les positions sont ouvertes — scan réel ignoré{C.RST}")
-            elif avail_capital < CAPITAL_PER_TRADE:
-                print(f"  {C.DIM}Capital insuffisant (${avail_capital:.2f} < ${CAPITAL_PER_TRADE:.2f}) — scan réel ignoré{C.RST}")
-            _scan_log.clear()
-            # Scan fantôme : aucun trade possible (régime, slots, capital, perte du jour),
-            # mais on suit virtuellement les signaux pour apprendre (ex. SELL MOM en BEAR)
-            if in_session:
-                _gwhy = ("positions max" if slots_left <= 0 else
-                         "capital insuffisant" if avail_capital < CAPITAL_PER_TRADE else
-                         "perte du jour" if daily_loss_hit else f"régime {regime}")
-                _ghost_candidates.clear()
+            # Persister l'état après chaque cycle de vérification :
+            # - positions fermées : évident
+            # - positions ouvertes : sl, sl_oid et trailed peuvent avoir changé via trail_sl()
+            #   Si le bot crashe avant le prochain save, le nouvel sl_oid serait perdu sur disque
+            save_positions_state(open_positions)
+
+            # Balance : si des positions ont fermé ce cycle, user_state est stale → refetch
+            try:
+                balance = get_equity(None if closed_this_loop else _user_state)
+            except Exception as e:
+                log_error(f"équité (solde précédent conservé) : {e}")
+
+            # ── Auto-recalibrage du capital ───────────────────────────────────────────
+            # Recalibrer si le solde réel s'écarte significativement de MAX_LIQUIDITY
+            # (baisse > 20% OU hausse > 20%) ET aucune position ouverte.
+            # Hausse = dépôt ou profit accumulé. Baisse = perte ou retrait.
+            balance_drift = abs(balance - MAX_LIQUIDITY) / max(MAX_LIQUIDITY, 0.01)
+            if balance_drift > 0.20 and len(open_positions) == 0:
+                old_max = MAX_LIQUIDITY
+                MAX_LIQUIDITY      = max(balance, 0.01)
+                CAPITAL_PER_TRADE  = MAX_LIQUIDITY * CAPITAL_PCT
+                capital_in_use     = 0.0
+                direction = "↑" if balance > old_max else "↓"
+                print(f"  {C.BYLW}[RECALIBRAGE {direction}]{C.RST} Solde ${old_max:.2f} → ${MAX_LIQUIDITY:.2f} | "
+                      f"par trade ${CAPITAL_PER_TRADE:.2f}")
+
+            # Disponible = min(tracking interne, cash libre réel)
+            # Le solde Hyperliquid (balance) inclut la marge des positions ouvertes.
+            # Si balance < capital_in_use, le compte est en sous-marge → bloquer tout nouveau trade.
+            internal_avail = MAX_LIQUIDITY - capital_in_use
+            real_free      = max(0.0, balance - capital_in_use)
+            avail_capital  = min(internal_avail, real_free)
+
+            # Alerte divergence — seulement toutes les 5 min pour ne pas spammer
+            if (internal_avail > 0 and real_free < internal_avail * 0.8
+                    and now_min % 5 == 0):
+                print(f"  {C.BRED}[ALERTE]{C.RST} Dispo interne ${internal_avail:.2f} vs "
+                      f"cash libre ${real_free:.2f} — {len(open_positions)} position(s) en marge")
+
+            max_slots     = MAX_TRADES if MAX_TRADES > 0 else 999
+            slots_left    = max_slots - len(open_positions)
+
+            pnl_total, pnl_week = calc_portfolio_pnl(wb)
+            pnl_today  = calc_daily_pnl(wb)   # P&L du jour calculé ici → réutilisé pour le filtre
+            unrealized = get_unrealized_pnl(_user_state, {p["symbol"] for p in open_positions} | trend_coins())
+            net_pnl = pnl_total + unrealized
+            net_pct = (net_pnl / initial_balance * 100) if initial_balance > 0 else 0.0
+            _dispo_c = C.BRED if avail_capital <= 0 else (C.BYLW if avail_capital < CAPITAL_PER_TRADE * 2 else C.WHT)
+            print(f"  Positions: {C.BOLD}{len(open_positions)}{C.RST}  Dispo: {_dispo_c}${avail_capital:.2f}{C.RST}  Équité: {C.BOLD}${balance:.2f}{C.RST}")
+            print(f"  P&L réalisé: {_cp(pnl_total)}${pnl_total:+.2f}{C.RST}  |  Non réalisé: {_cp(unrealized)}${unrealized:+.2f}{C.RST}  |  Net: {_cp(net_pnl)}{C.BOLD}${net_pnl:+.2f} ({net_pct:+.1f}%){C.RST}")
+            print(f"  P&L 7j: {_cp(pnl_week)}${pnl_week:+.2f}{C.RST}  |  Aujourd'hui: {_cp(pnl_today)}${pnl_today:+.2f}{C.RST}")
+
+            # Filtre horaire (heures UTC)
+            hour_utc = datetime.now(timezone.utc).hour
+            in_session = SESSION_START_UTC <= hour_utc < SESSION_END_UTC
+
+            # Régime de marché — mis à jour toutes les 30 min (candles journalières, pas besoin de plus).
+            # Échec Bybit → on garde le régime précédent et on réessaie au cycle suivant
+            # (avant : RANGING forcé pendant 30 min ; et "minute % 30" ratait parfois sa minute).
+            if time.time() - run.__dict__.get("_regime_ts", 0) >= REGIME_REFRESH_S:
                 try:
-                    gsigs = scan_all({p["symbol"] for p in open_positions})
-                    _scan_log.clear()
-                    hb_g_opened += _ghost_all(gsigs, lambda sg: _gwhy)
+                    run._regime_cache = _compute_regime()
+                    run._regime_ts    = time.time()
                 except Exception as e:
-                    log_error(f"scan fantôme: {e}")
+                    log_error(f"régime (précédent conservé) : {e}")
+            regime, bias, btc_chg, eth_chg = run.__dict__.get("_regime_cache", ("RANGING", "neutral", 0.0, 0.0))
+            global _current_regime
+            _current_regime = regime   # partagé avec get_signal() pour les leçons
+            _rc = (C.BGRN if regime == "BULL" else
+                   C.BRED if regime in ("BEAR", "DIVERGING") else C.BYLW)
+            print(f"  Régime: {_rc}{regime}{C.RST}  BTC={btc_chg:+.1f}%  ETH={eth_chg:+.1f}%")
 
-        # Afficher le résumé des leçons du scalping toutes les 10 min (inutile en mode tendance)
-        if STRATEGY != "trend" and now_min % 10 == 0:
-            print_lessons_summary()
+            # Limite de perte journalière (pnl_today déjà calculé plus haut)
+            daily_loss_limit = -MAX_LIQUIDITY * MAX_DAILY_LOSS_PCT / 100
+            daily_loss_hit = pnl_today <= daily_loss_limit
+            if daily_loss_hit:
+                print(f"  {C.BRED}[STOP]{C.RST} Perte du jour atteinte (${pnl_today:.2f} ≤ ${daily_loss_limit:.2f})")
 
-        # ── Détection d'anomalies + alertes Discord ───────────────────────────────
-        # 1) Flash crash : équité chute > 5% en 1 cycle (60s)
-        #    Ignoré si des positions viennent de se fermer ce cycle (faux positif
-        #    courant : la marge libérée par un SL/TP n'est pas encore reflétée)
-        if hasattr(run, '_prev_equity') and run._prev_equity > 0 and not closed_this_loop:
-            equity_drop_pct = (run._prev_equity - balance) / run._prev_equity * 100
-            if equity_drop_pct > 5.0:
-                msg = (f"Équité: **${run._prev_equity:.2f}** → **${balance:.2f}** "
-                       f"(**-{equity_drop_pct:.1f}%** en 1 cycle)")
-                print(f"  {C.BRED}[🔴 FLASH CRASH]{C.RST} {equity_drop_pct:.1f}% en 1 cycle")
-                send_discord_alert("⚡ Flash Crash Détecté", msg, color=0xe74c3c)
-        run._prev_equity = balance
+            # Bloquer les nouveaux trades en régime dangereux
+            regime_blocked = regime in ("BEAR", "DIVERGING")
+            if regime_blocked:
+                print(f"  {C.BRED}[RÉGIME]{C.RST} {regime} — aucun nouveau trade")
 
-        # 2) Drawdown non-réalisé > 4% de l'équité
-        if len(open_positions) > 0 and balance > 0:
-            dd_pct = abs(unrealized) / balance * 100
-            if unrealized < -balance * 0.04:
-                if not getattr(run, '_drawdown_alerted', False):
-                    msg = (f"P&L non-réalisé: **${unrealized:.2f}** ({dd_pct:.1f}% de l'équité)\n"
-                           f"{len(open_positions)} position(s) ouverte(s)")
-                    print(f"  {C.BRED}[📉 DRAWDOWN]{C.RST} {dd_pct:.1f}% de l'équité non-réalisé")
-                    send_discord_alert("📉 Drawdown Élevé", msg, color=0xe67e22)
-                    run._drawdown_alerted = True
-            else:
-                run._drawdown_alerted = False
+            # Raison de non-scan (lisible)
+            if not in_session:
+                print(f"  {C.BYLW}[PAUSE]{C.RST} Hors session ({hour_utc}h UTC, actif {SESSION_START_UTC}h-{SESSION_END_UTC}h)")
 
-        # 3) Position zombie : ouverte depuis > 6h sans fermeture
-        #    • En drawdown → fermeture automatique (capital libéré pour de nouveaux trades)
-        #    • En profit   → alerte seulement (le trailing stop protège)
-        for pos in list(open_positions):
-            opened_at = pos.get('opened_at')
-            if opened_at:
-                age_h = (time.time() - opened_at) / 3600
-                alert_key = f"_zombie_{pos['symbol']}_{pos['id']}"
-                if age_h > 6.0 and not getattr(run, alert_key, False):
-                    # P&L non-réalisé depuis le cache user_state du cycle
-                    _zpnl = 0.0
-                    if _user_state:
-                        for _ap in _user_state.get("assetPositions", []):
-                            if _ap["position"]["coin"] == pos["symbol"]:
-                                _zpnl = float(_ap["position"].get("unrealizedPnl", 0))
-                                break
-                    print(f"  {C.BRED}[🧟 ZOMBIE]{C.RST} {pos['symbol']} ouverte depuis "
-                          f"{age_h:.1f}h  P&L={_cp(_zpnl)}${_zpnl:.2f}{C.RST}")
-                    if _zpnl < 0:
-                        # Retirer et sauvegarder AVANT la fermeture sur l'exchange.
-                        # Si le bot s'arrête mid-close, au prochain redémarrage la position
-                        # n'a plus d'enrichissement → opened_at = time.time() → pas zombie.
-                        if pos in open_positions:
-                            open_positions.remove(pos)
-                            capital_in_use = max(0.0, capital_in_use - CAPITAL_PER_TRADE)
-                        save_positions_state(open_positions)
-                        if force_close_zombie(wb, pos) is None:
-                            # Échec : la position reste ouverte (SL intact) → on la remet en suivi
-                            # et on réessaiera au prochain cycle (alert_key non posé)
-                            open_positions.append(pos)
-                            capital_in_use += CAPITAL_PER_TRADE
-                            save_positions_state(open_positions)
-                            continue
-                    else:
-                        # En profit → alerter seulement, laisser le trailing gérer
-                        msg = (f"**{pos['symbol']}** ouverte depuis **{age_h:.1f}h** — en profit ${_zpnl:.2f}\n"
-                               f"SL trailing actif : ${pos.get('sl', 0):.4f}")
-                        send_discord_alert("🧟 Position Zombie (profitable)", msg, color=0xf39c12)
-                    setattr(run, alert_key, True)
+            # Avertissement solde insuffisant (< 2 trades possibles, aucune position ouverte)
+            if balance < CAPITAL_PER_TRADE * 2 and len(open_positions) == 0 and now_min % 5 == 0:
+                print(f"  {C.BRED}[SOLDE BAS]{C.RST} Équité ${balance:.2f} — "
+                      f"insuffisant pour trader (min recommandé ${CAPITAL_PER_TRADE * 3:.2f}). "
+                      f"Déposer des fonds pour reprendre.")
 
-        # ── Heartbeat Discord : preuve de vie + résumé de la période ──
-        hb_cycles += 1
-        hb_closed += len(closed_this_loop)
-        if STRATEGY == "scalp" and not (slots_left > 0 and avail_capital >= CAPITAL_PER_TRADE and in_session
-                                        and not daily_loss_hit and not regime_blocked):
-            _why = ("positions max" if slots_left <= 0 else
-                    "capital insuffisant" if avail_capital < CAPITAL_PER_TRADE else
-                    "hors session" if not in_session else
-                    "perte du jour" if daily_loss_hit else f"régime {regime}")
-            hb_blocked[_why] = hb_blocked.get(_why, 0) + 1
-        if HEARTBEAT_HOURS > 0 and time.time() - hb_last >= HEARTBEAT_HOURS * 3600:
-            _best = (f"{hb_best['symbol']} {hb_best['signal'].upper()} "
-                     f"[{hb_best.get('conditions', {}).get('mode', '?')}] score {hb_best['score']:.3f}"
-                     if hb_best else "aucun")
-            _blk = (" · ".join(f"{k} ×{v}" for k, v in hb_blocked.items())) or "—"
-            _gw  = sum(1 for g in hb_g_closed if g["pnl_pct"] > 0)
-            _gavg = (sum(g["pnl_pct"] for g in hb_g_closed) / len(hb_g_closed)) if hb_g_closed else 0.0
-            _gtxt = (f"{len(_load_ghosts())} en cours · {hb_g_opened} ouverts · {len(hb_g_closed)} clos"
-                     + (f" (✓{_gw} ✗{len(hb_g_closed) - _gw}, moy {_gavg:+.2f}%)" if hb_g_closed else ""))
-            if hb_g_closed:
-                _gtxt += "\nFantômes par type : " + _ghost_by_type(hb_g_closed)
-            _rej = (" · ".join(f"{k} ×{v}" for k, v in
-                               sorted(_reject_stats.items(), key=lambda kv: -kv[1]))) or "—"
+            # Stratégie tendance : SL touchés + alignement sur le signal du jour (aucun scan scalping)
             if STRATEGY == "trend":
                 try:
-                    _hb_mids = info.all_mids()
-                except Exception:
-                    _hb_mids = None
-                _body = (trend_heartbeat(wb, _hb_mids, min(balance, MAX_LIQUIDITY), hb_t_closed) + "\n"
-                         f"Régime : **{regime}** (BTC {btc_chg:+.1f}% · ETH {eth_chg:+.1f}% 7j)\n"
-                         f"Équité : **${balance:.2f}** · {_since_start(balance, initial_balance)}\n"
-                         f"Cycles : {hb_cycles}")
-            else:
-                _body = (f"Régime : **{regime}** (BTC {btc_chg:+.1f}% · ETH {eth_chg:+.1f}% 7j)\n"
-                         f"Équité : **${balance:.2f}** · positions ouvertes : {len(open_positions)}\n"
-                         f"P&L aujourd'hui : ${pnl_today:+.2f}\n"
-                         f"Cycles : {hb_cycles} · scans : {hb_scans}\n"
-                         f"Signaux : {hb_raw} détectés → {hb_kept} retenus (min score {0.75 if regime == 'RANGING' else 0.45})\n"
-                         f"Trades : {hb_opened} ouverts · {hb_closed} fermés\n"
-                         f"Meilleur signal vu : {_best}\n"
-                         f"Scans bloqués : {_blk}\n"
-                         f"Rejets (1er filtre) : {_rej}\n"
-                         f"Fantômes : {_gtxt}")
-            send_discord_alert(
-                f"💓 Bot actif — résumé {HEARTBEAT_HOURS:g}h",
-                ("Mode : **fantôme seul** (aucun ordre réel)\n" if GHOST_ONLY else "") + _body,
-                color=0x2ecc71 if hb_opened else 0x95a5a6)
-            hb_last = time.time()
-            hb_t_closed = []
-            hb_cycles = hb_scans = hb_raw = hb_kept = hb_opened = hb_closed = 0
-            hb_best = None
-            hb_blocked = {}
-            _reject_stats.clear()
-            hb_g_opened = 0
-            hb_g_closed = []
+                    hb_t_closed += trend_cycle(wb, _user_state, min(balance, MAX_LIQUIDITY))
+                except Exception as e:
+                    log_error(f"tendance : {e}")
+                    traceback.print_exc()
+                _held = ", ".join(c + " " + p["side"] for c, p in sorted(_load_trend()["positions"].items()))
+                print(f"  Tendance{' (fantôme)' if GHOST_ONLY else ''} : {_held or 'aucune position'}")
 
-        # Régénérer le dashboard HTML à chaque cycle
-        write_dashboard(wb, open_positions + list(_load_trend()["positions"].values()), balance, initial_balance,
-                        pnl_total, pnl_week, unrealized, avail_capital,
-                        regime, btc_chg, eth_chg, pnl_today)
+            # Scalping : chercher un nouveau signal
+            elif slots_left > 0 and avail_capital >= CAPITAL_PER_TRADE and in_session and not daily_loss_hit and not regime_blocked:
+                # + coins tenus par BotCopyTrade : 2 positions sur un coin fusionneraient
+                #   (user_state illisible → coins inconnus → aucun scan réel ce cycle)
+                open_coins = {p["symbol"] for p in open_positions} | (
+                    account_coins(_user_state) if _user_state is not None else set(WATCHLIST))
+                _ghost_candidates.clear()
+                signals    = scan_all(open_coins)
+                raw_signals = list(signals)   # pour le mode fantôme (signaux non tradés)
+                _print_scan_summary()
+                hb_scans += 1
+                hb_raw   += len(signals)
+                for s_ in signals:
+                    if hb_best is None or s_["score"] > hb_best["score"]:
+                        hb_best = s_
+
+                # Filtrage par régime :
+                # BULL     → BUY dans la tendance + SELL MR autorisé (suracheté, score ≥ 0.75)
+                #            SELL MOM bloqué (ne pas shorter un crash en plein BULL)
+                # RANGING  → exige score ≥ 0.75 (marché sans direction claire)
+                min_score = 0.75 if regime == "RANGING" else 0.45  # BULL : filtre les signaux trop faibles
+                bull_ok = signals
+                if regime == "BULL":
+                    signals = bull_ok = [s for s in signals if
+                               s["signal"] == "buy" or
+                               (s["signal"] == "sell" and
+                                s.get("conditions", {}).get("mode") == "MR" and
+                                s["score"] >= 0.75)]
+                signals = [s for s in signals if s["score"] >= min_score]
+                hb_kept += len(signals)
+                would_trade: list[dict] = []
+                if GHOST_ONLY:   # aucun ordre réel : les signaux retenus deviennent des fantômes
+                    would_trade, signals = signals, []
+
+                # Ouvrir jusqu'à slots_left positions si plusieurs bons signaux disponibles
+                opened_this_cycle = 0
+                traded: list[dict] = []
+                while signals and slots_left > 0 and avail_capital >= CAPITAL_PER_TRADE:
+                    sig = best_signal(signals)
+                    if not sig:
+                        break
+                    signals = [s for s in signals if s["symbol"] != sig["symbol"]]
+                    _ss = C.BGRN if sig["signal"] == "buy" else C.BRED
+                    print(f"\n  {_ss}[SIGNAL] {sig['symbol']} {sig['signal'].upper()}{C.RST}  score={sig['score']:.3f}  régime={regime}")
+                    try:
+                        pos = place_order(sig, wb)
+                        traded.append(sig)
+                        open_positions.append(pos)
+                        capital_in_use += CAPITAL_PER_TRADE
+                        avail_capital  -= CAPITAL_PER_TRADE
+                        slots_left     -= 1
+                        opened_this_cycle += 1
+                        save_positions_state(open_positions)
+                    except Exception as e:
+                        log_error(f"place_order: {e}")
+                        traceback.print_exc()
+                        break  # ne pas tenter un 2e ordre si le 1er échoue
+
+                hb_opened += opened_this_cycle
+                if opened_this_cycle == 0:
+                    print(f"  {C.DIM}Pas de signal retenu ce cycle{C.RST}")
+
+                # Fantômes : tous les signaux détectés mais non tradés
+                hb_g_opened += _ghost_all(
+                    [sg for sg in raw_signals if not any(sg is t for t in traded)],
+                    lambda sg: ("fantôme seul (aurait été tradé)" if any(sg is w for w in would_trade) else
+                                "filtre BULL" if not any(sg is b for b in bull_ok) else
+                                f"score<{min_score}" if sg["score"] < min_score else
+                                "non pris (slot/capital)"))
+            else:
+                if slots_left <= 0:
+                    print(f"  {C.DIM}Toutes les positions sont ouvertes — scan réel ignoré{C.RST}")
+                elif avail_capital < CAPITAL_PER_TRADE:
+                    print(f"  {C.DIM}Capital insuffisant (${avail_capital:.2f} < ${CAPITAL_PER_TRADE:.2f}) — scan réel ignoré{C.RST}")
+                _scan_log.clear()
+                # Scan fantôme : aucun trade possible (régime, slots, capital, perte du jour),
+                # mais on suit virtuellement les signaux pour apprendre (ex. SELL MOM en BEAR)
+                if in_session:
+                    _gwhy = ("positions max" if slots_left <= 0 else
+                             "capital insuffisant" if avail_capital < CAPITAL_PER_TRADE else
+                             "perte du jour" if daily_loss_hit else f"régime {regime}")
+                    _ghost_candidates.clear()
+                    try:
+                        gsigs = scan_all({p["symbol"] for p in open_positions})
+                        _scan_log.clear()
+                        hb_g_opened += _ghost_all(gsigs, lambda sg: _gwhy)
+                    except Exception as e:
+                        log_error(f"scan fantôme: {e}")
+
+            # Afficher le résumé des leçons du scalping toutes les 10 min (inutile en mode tendance)
+            if STRATEGY != "trend" and now_min % 10 == 0:
+                print_lessons_summary()
+
+            # ── Détection d'anomalies + alertes Discord ───────────────────────────────
+            # 1) Flash crash : équité chute > 5% en 1 cycle (60s)
+            #    Ignoré si des positions viennent de se fermer ce cycle (faux positif
+            #    courant : la marge libérée par un SL/TP n'est pas encore reflétée)
+            if hasattr(run, '_prev_equity') and run._prev_equity > 0 and not closed_this_loop:
+                equity_drop_pct = (run._prev_equity - balance) / run._prev_equity * 100
+                if equity_drop_pct > 5.0:
+                    msg = (f"Équité: **${run._prev_equity:.2f}** → **${balance:.2f}** "
+                           f"(**-{equity_drop_pct:.1f}%** en 1 cycle)")
+                    print(f"  {C.BRED}[🔴 FLASH CRASH]{C.RST} {equity_drop_pct:.1f}% en 1 cycle")
+                    send_discord_alert("⚡ Flash Crash Détecté", msg, color=0xe74c3c)
+            run._prev_equity = balance
+
+            # 2) Drawdown non-réalisé > 4% de l'équité
+            if len(open_positions) > 0 and balance > 0:
+                dd_pct = abs(unrealized) / balance * 100
+                if unrealized < -balance * 0.04:
+                    if not getattr(run, '_drawdown_alerted', False):
+                        msg = (f"P&L non-réalisé: **${unrealized:.2f}** ({dd_pct:.1f}% de l'équité)\n"
+                               f"{len(open_positions)} position(s) ouverte(s)")
+                        print(f"  {C.BRED}[📉 DRAWDOWN]{C.RST} {dd_pct:.1f}% de l'équité non-réalisé")
+                        send_discord_alert("📉 Drawdown Élevé", msg, color=0xe67e22)
+                        run._drawdown_alerted = True
+                else:
+                    run._drawdown_alerted = False
+
+            # 3) Position zombie : ouverte depuis > 6h sans fermeture
+            #    • En drawdown → fermeture automatique (capital libéré pour de nouveaux trades)
+            #    • En profit   → alerte seulement (le trailing stop protège)
+            for pos in list(open_positions):
+                opened_at = pos.get('opened_at')
+                if opened_at:
+                    age_h = (time.time() - opened_at) / 3600
+                    alert_key = f"_zombie_{pos['symbol']}_{pos['id']}"
+                    if age_h > 6.0 and not getattr(run, alert_key, False):
+                        # P&L non-réalisé depuis le cache user_state du cycle
+                        _zpnl = 0.0
+                        if _user_state:
+                            for _ap in _user_state.get("assetPositions", []):
+                                if _ap["position"]["coin"] == pos["symbol"]:
+                                    _zpnl = float(_ap["position"].get("unrealizedPnl", 0))
+                                    break
+                        print(f"  {C.BRED}[🧟 ZOMBIE]{C.RST} {pos['symbol']} ouverte depuis "
+                              f"{age_h:.1f}h  P&L={_cp(_zpnl)}${_zpnl:.2f}{C.RST}")
+                        if _zpnl < 0:
+                            # Retirer et sauvegarder AVANT la fermeture sur l'exchange.
+                            # Si le bot s'arrête mid-close, au prochain redémarrage la position
+                            # n'a plus d'enrichissement → opened_at = time.time() → pas zombie.
+                            if pos in open_positions:
+                                open_positions.remove(pos)
+                                capital_in_use = max(0.0, capital_in_use - CAPITAL_PER_TRADE)
+                            save_positions_state(open_positions)
+                            if force_close_zombie(wb, pos) is None:
+                                # Échec : la position reste ouverte (SL intact) → on la remet en suivi
+                                # et on réessaiera au prochain cycle (alert_key non posé)
+                                open_positions.append(pos)
+                                capital_in_use += CAPITAL_PER_TRADE
+                                save_positions_state(open_positions)
+                                continue
+                        else:
+                            # En profit → alerter seulement, laisser le trailing gérer
+                            msg = (f"**{pos['symbol']}** ouverte depuis **{age_h:.1f}h** — en profit ${_zpnl:.2f}\n"
+                                   f"SL trailing actif : ${pos.get('sl', 0):.4f}")
+                            send_discord_alert("🧟 Position Zombie (profitable)", msg, color=0xf39c12)
+                        setattr(run, alert_key, True)
+
+            # ── Heartbeat Discord : preuve de vie + résumé de la période ──
+            hb_cycles += 1
+            hb_closed += len(closed_this_loop)
+            if STRATEGY == "scalp" and not (slots_left > 0 and avail_capital >= CAPITAL_PER_TRADE and in_session
+                                            and not daily_loss_hit and not regime_blocked):
+                _why = ("positions max" if slots_left <= 0 else
+                        "capital insuffisant" if avail_capital < CAPITAL_PER_TRADE else
+                        "hors session" if not in_session else
+                        "perte du jour" if daily_loss_hit else f"régime {regime}")
+                hb_blocked[_why] = hb_blocked.get(_why, 0) + 1
+            if HEARTBEAT_HOURS > 0 and time.time() - hb_last >= HEARTBEAT_HOURS * 3600:
+                _best = (f"{hb_best['symbol']} {hb_best['signal'].upper()} "
+                         f"[{hb_best.get('conditions', {}).get('mode', '?')}] score {hb_best['score']:.3f}"
+                         if hb_best else "aucun")
+                _blk = (" · ".join(f"{k} ×{v}" for k, v in hb_blocked.items())) or "—"
+                _gw  = sum(1 for g in hb_g_closed if g["pnl_pct"] > 0)
+                _gavg = (sum(g["pnl_pct"] for g in hb_g_closed) / len(hb_g_closed)) if hb_g_closed else 0.0
+                _gtxt = (f"{len(_load_ghosts())} en cours · {hb_g_opened} ouverts · {len(hb_g_closed)} clos"
+                         + (f" (✓{_gw} ✗{len(hb_g_closed) - _gw}, moy {_gavg:+.2f}%)" if hb_g_closed else ""))
+                if hb_g_closed:
+                    _gtxt += "\nFantômes par type : " + _ghost_by_type(hb_g_closed)
+                _rej = (" · ".join(f"{k} ×{v}" for k, v in
+                                   sorted(_reject_stats.items(), key=lambda kv: -kv[1]))) or "—"
+                if STRATEGY == "trend":
+                    try:
+                        _hb_mids = info.all_mids()
+                    except Exception:
+                        _hb_mids = None
+                    _body = (trend_heartbeat(wb, _hb_mids, min(balance, MAX_LIQUIDITY), hb_t_closed) + "\n"
+                             f"Régime : **{regime}** (BTC {btc_chg:+.1f}% · ETH {eth_chg:+.1f}% 7j)\n"
+                             f"Équité : **${balance:.2f}** · {_since_start(balance, initial_balance)}\n"
+                             f"Cycles : {hb_cycles}")
+                else:
+                    _body = (f"Régime : **{regime}** (BTC {btc_chg:+.1f}% · ETH {eth_chg:+.1f}% 7j)\n"
+                             f"Équité : **${balance:.2f}** · positions ouvertes : {len(open_positions)}\n"
+                             f"P&L aujourd'hui : ${pnl_today:+.2f}\n"
+                             f"Cycles : {hb_cycles} · scans : {hb_scans}\n"
+                             f"Signaux : {hb_raw} détectés → {hb_kept} retenus (min score {0.75 if regime == 'RANGING' else 0.45})\n"
+                             f"Trades : {hb_opened} ouverts · {hb_closed} fermés\n"
+                             f"Meilleur signal vu : {_best}\n"
+                             f"Scans bloqués : {_blk}\n"
+                             f"Rejets (1er filtre) : {_rej}\n"
+                             f"Fantômes : {_gtxt}")
+                send_discord_alert(
+                    f"💓 Bot actif — résumé {HEARTBEAT_HOURS:g}h",
+                    ("Mode : **fantôme seul** (aucun ordre réel)\n" if GHOST_ONLY else "") + _body,
+                    color=0x2ecc71 if hb_opened else 0x95a5a6)
+                hb_last = time.time()
+                hb_t_closed = []
+                hb_cycles = hb_scans = hb_raw = hb_kept = hb_opened = hb_closed = 0
+                hb_best = None
+                hb_blocked = {}
+                _reject_stats.clear()
+                hb_g_opened = 0
+                hb_g_closed = []
+
+            # Régénérer le dashboard HTML à chaque cycle
+            write_dashboard(wb, open_positions + list(_load_trend()["positions"].values()), balance, initial_balance,
+                            pnl_total, pnl_week, unrealized, avail_capital,
+                            regime, btc_chg, eth_chg, pnl_today)
+        except Exception as e:
+            # Erreur imprévue : journalisée, signalée une fois par jour, nouvel essai au cycle suivant
+            # (avant : bot arrêté, et systemd ne le relançait pas, la sortie semblant normale)
+            log_error(f"cycle : {e}")
+            traceback.print_exc()
+            err = f"{type(e).__name__}: {e}"[:300]
+            if (_today(), err) not in cycle_errors:
+                cycle_errors.add((_today(), err))
+                send_discord_alert("⚠️ Erreur inattendue (le bot continue)",
+                                   f"`{err}`\nNouvel essai à chaque cycle ; les SL restent en place sur Hyperliquid.",
+                                   color=0xf39c12)
 
         elapsed = time.time() - loop_start
         wait    = max(0.0, LOOP_SECONDS - elapsed)
@@ -2928,7 +3035,7 @@ def run():
             time.sleep(wait)
 
 
-if __name__ == "__main__":
+def main():
     try:
         run()
     except KeyboardInterrupt:
@@ -2936,3 +3043,11 @@ if __name__ == "__main__":
     except Exception as e:
         log_error(f"Crash fatal: {e}")
         traceback.print_exc()
+        send_discord_alert("💥 Bot arrêté par une erreur",
+                           f"`{type(e).__name__}: {str(e)[:300]}`\nRedémarrage automatique dans 15 s ; "
+                           f"les SL restent en place sur Hyperliquid.", color=0xff0000)
+        sys.exit(1)   # code d'erreur : systemd (Restart=on-failure) relance le bot (avant : sortie 0, bot arrêté)
+
+
+if __name__ == "__main__":
+    main()

@@ -30,9 +30,9 @@ os.environ.update({
 })
 
 class _StubInfo:
-    def __init__(self, *a, **k): pass
+    def __init__(self, *a, **k): self.kwargs = k
 class _StubExchange:
-    def __init__(self, *a, **k): pass
+    def __init__(self, *a, **k): self.kwargs = k
 for name, attr, cls in [("hyperliquid.info", "Info", _StubInfo),
                         ("hyperliquid.exchange", "Exchange", _StubExchange)]:
     mod = types.ModuleType(name); setattr(mod, attr, cls); sys.modules[name] = mod
@@ -216,6 +216,24 @@ class TestExcel(BaseTest):
         ws2 = m.init_excel()["Trades"]
         self.assertEqual([c.value for c in ws2[1]], m.COL_HEADERS)
         self.assertEqual(ws2.cell(2, 1).value, "1")   # données conservées
+
+    def test_fichier_illisible_garde_sous_un_autre_nom(self):
+        """trades.xlsx illisible (abîmé, réenregistré dans un autre format) : gardé sous un autre nom avec
+        une alerte, puis nouveau fichier (avant : écrasé par un classeur vide, historique perdu)."""
+        with open(m.EXCEL_FILE, "wb") as f:
+            f.write(b"pas un classeur")
+        wb = m.init_excel()
+        kept = [f for f in os.listdir(".") if f.startswith("trades-illisible-")]
+        try:
+            self.assertEqual(len(kept), 1)
+            self.assertTrue(kept[0].endswith(".xlsx"))         # ignoré par git (*.xlsx)
+            with open(kept[0], "rb") as f:
+                self.assertEqual(f.read(), b"pas un classeur")
+        finally:
+            for f in kept:
+                os.remove(f)
+        self.assertIn("Tendance", wb.sheetnames)
+        self.assertIn("⚠️ trades.xlsx illisible", self.titles())
 
 
 # ── Équité ───────────────────────────────────────────────────────────────────
@@ -428,6 +446,15 @@ class TestSLWatchdog(BaseTest):
         self.assertEqual(ex.orders[0]["tpsl"], "sl")
         self.assertEqual(pos["sl_oid"], 11)
         self.assertTrue(any("SL manquant" in t for t in self.titles()))
+
+    def test_stop_du_meme_sens_que_la_position_ignore(self):
+        """Un stop d'achat ne protège pas un long (SL orphelin d'un ancien short) : SL reposé (avant : pris
+        pour le SL du long, qui restait sans protection)."""
+        n, pos, ex = self.watch([dict(self.STOP, side="B")])
+        self.assertEqual(n, 1)
+        self.assertEqual(pos["sl_oid"], 11)
+        n, pos, ex = self.watch([dict(self.STOP, side="A")])    # stop de vente : c'est bien son SL
+        self.assertEqual((n, pos["sl_oid"]), (0, 55))
 
     def test_sl_absent_et_refuse_alerte_critique(self):
         n, pos, ex = self.watch([], LogExchange(sl=[_err()]))
@@ -898,6 +925,26 @@ class TestRunLoop(BaseTest):
         self.assertTrue(shown)
         self.assertEqual(set(shown), {"scalp"})
 
+    def test_erreur_imprevue_le_bot_continue(self):
+        """Erreur imprévue au milieu d'un cycle : journalisée, une seule alerte, et les cycles suivants ont
+        lieu (avant : bot arrêté ; systemd ne le relançait pas, la sortie semblant normale)."""
+        with mock.patch.object(m, "calc_portfolio_pnl", mock.Mock(side_effect=KeyError("P&L"))), \
+             mock.patch("sys.stderr", new_callable=io.StringIO):
+            self.run_loop(-2)                                  # 2 cycles complets malgré l'erreur
+        self.assertEqual(self.titles().count("⚠️ Erreur inattendue (le bot continue)"), 1)
+
+    def test_crash_fatal_code_d_erreur_pour_systemd(self):
+        """Erreur hors du cycle (démarrage) : alerte et code de sortie 1, pour que systemd (Restart=on-failure)
+        relance le bot (avant : sortie 0, bot arrêté sans alerte). Ctrl+C : sortie normale."""
+        with mock.patch.object(m, "run", mock.Mock(side_effect=RuntimeError("disque plein"))), \
+             mock.patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit) as cm:
+                m.main()
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("💥 Bot arrêté par une erreur", self.titles())
+        with mock.patch.object(m, "run", mock.Mock(side_effect=KeyboardInterrupt)):
+            m.main()
+
     def test_ranging_mom_bloque_suivi_en_fantome(self):
         ex, ghosts = self.run_loop(-2)
         self.assertEqual(ex.orders, [])
@@ -959,6 +1006,13 @@ class TestSignalDiagnostic(BaseTest):
 
 # ── Utilitaires ──────────────────────────────────────────────────────────────
 class TestUtils(BaseTest):
+    def test_delai_max_des_requetes_hyperliquid(self):
+        """Connexion restée bloquée (coupure Wi-Fi) : erreur au bout de HL_TIMEOUT_S au lieu d'un bot figé
+        sans alerte (le SDK n'a aucun délai par défaut)."""
+        self.assertEqual(m.info.kwargs.get("timeout"), m.HL_TIMEOUT_S)
+        self.assertEqual(m.exchange.kwargs.get("timeout"), m.HL_TIMEOUT_S)
+        self.assertLessEqual(m.HL_TIMEOUT_S, 30)
+
     def test_round_px(self):
         self.assertEqual(m.round_px(2012.345), 2012.3)
         self.assertEqual(m.round_px(0.08201357), 0.082014)
@@ -1227,7 +1281,7 @@ class TestTrend(BaseTest):
         self.assertAlmostEqual(closed[0]["pnl"], -1.51)
         self.assertAlmostEqual(closed[0]["exit"], 80.1)
         self.assertIn("Entrée : $90 → sortie $80.1", dict(self.alerts)["🛑 ETH BUY — SL touché [tendance]"])
-        self.assertEqual(self.eth_calls(ex), [])
+        self.assertEqual(self.eth_calls(ex), [("cancel", "ETH", 5)])   # sans effet : SL déjà exécuté
         ex, _ = self.cycle()
         self.assertEqual(self.eth_calls(ex), [])
         self.assertEqual(len([c for c in ex.calls if c[0] == "open"]), 0)   # les 4 autres déjà ouverts
@@ -1251,7 +1305,7 @@ class TestTrend(BaseTest):
                   "closedPnl": "-1.5", "fee": "0.005", "px": "80", "sz": "0.12"}]
         ex, closed = self.cycle(fills=fills)
         self.assertEqual([p["status"] for p in closed], ["SL touché"])
-        self.assertEqual([c[0] for c in self.eth_calls(ex)], ["open", "sl"])
+        self.assertEqual([c[0] for c in self.eth_calls(ex)], ["cancel", "open", "sl"])
         self.assertNotIn("ETH", m._load_trend()["stopped"])
 
     def test_prix_absent_nouvel_essai_au_cycle_suivant(self):
@@ -1299,6 +1353,105 @@ class TestTrend(BaseTest):
         self.assertIn(("SOL", "fin du mode fantôme"), [(p["symbol"], p["status"]) for p in closed])
         self.assertEqual(sorted(c[1] for c in ex.calls if c[0] == "open"), ["BTC", "DOGE", "ETH", "XRP"])
         self.assertNotIn("SOL", m._load_trend()["positions"])
+
+    # ── Réponses perdues (délai dépassé, 5xx, bot arrêté pendant un ordre) ──
+    def lost_open(self, coin="ETH"):
+        """Hyperliquid dont la réponse à l'ouverture de `coin` se perd (exception après l'envoi)."""
+        ex = TrendExchange()
+        def open_(c, is_buy, qty, **k):
+            if c != coin:
+                return TrendExchange.market_open(ex, c, is_buy, qty, **k)
+            ex.calls.append(("open", c, is_buy, qty))
+            raise requests.exceptions.ReadTimeout("Read timed out. (read timeout=20)")
+        ex.market_open = open_
+        return ex
+
+    def held_now(self, skip=()):
+        """Le compte tel que le bot le suit (positions réelles), sauf les coins `skip`."""
+        return [_held(c, p["qty"] if p["side"] == "BUY" else -p["qty"])
+                for c, p in m._load_trend()["positions"].items() if c not in skip]
+
+    def test_ouverture_sans_reponse_position_reprise_avec_son_sl(self):
+        """Ordre d'ouverture passé mais réponse perdue : au cycle suivant, même après un redémarrage, la
+        position trouvée sur le compte est reprise et reçoit son SL, sans second ordre (avant : prise pour
+        celle d'un autre bot, jamais gérée, sans SL)."""
+        ex, _ = self.cycle(ex=self.lost_open())
+        (_, _, _, qty), = self.eth_calls(ex)                       # ordre parti, pas de SL
+        self.assertNotIn("ETH", m._load_trend()["positions"])
+        self.assertIn("ETH", m.trend_coins())                       # ni adopté par le scalping
+        self.assertIn("n'a pas répondu", dict(self.alerts)["⚠️ Tendance : ETH non ouvert"])
+        self.assertNotIn("ETH", m._load_trend()["stopped"])
+        m._trend = None                                             # redémarrage du bot
+        ex, _ = self.cycle(held=self.held_now() + [_held("ETH", qty)])
+        self.assertEqual([c[0] for c in self.eth_calls(ex)], ["sl"])
+        pos = m._load_trend()["positions"]["ETH"]
+        self.assertEqual((pos["side"], pos["qty"], pos["entry"], pos["sl_oid"], pos["paper"]), ("BUY", qty, 90.0, 21, False))
+        self.assertEqual(pos["sl"], m.round_px(90.0 - m.TREND_SL_ATR * pos["atr"], "ETH"))
+        self.assertEqual(m._load_trend()["opening"], {})
+        self.assertIn("position retrouvée sur le compte", dict(self.alerts)["🟢 LONG ETH ouvert [tendance]"])
+        ex, _ = self.cycle(held=self.held_now())
+        self.assertEqual(self.eth_calls(ex), [])
+
+    def test_ouverture_sans_reponse_non_passee_nouvel_essai_au_cycle_suivant(self):
+        """Réponse perdue et rien sur le compte (l'ordre n'est pas arrivé) : nouvel essai dès le cycle suivant
+        (avant : plus d'essai avant demain)."""
+        self.cycle(ex=self.lost_open())
+        ex, _ = self.cycle(held=self.held_now())
+        self.assertEqual([c[0] for c in self.eth_calls(ex)], ["open", "sl"])
+        self.assertEqual(m._load_trend()["positions"]["ETH"]["sl_oid"], 21)
+        self.assertEqual(m._load_trend()["opening"], {})
+
+    def test_renfort_sans_reponse_la_taille_du_compte_fait_foi(self):
+        """Renfort passé mais réponse perdue (fermeture pas faite) : au cycle suivant le compte montre le
+        renfort, la fermeture part sans second renfort et ses frais sont estimés (avant : second renfort)."""
+        self.real_eth(side="SELL")                                   # 0.12 ETH vendus à 90
+        mids = {c: "100" for c in m.TREND_COINS}
+        mids["ETH"] = "80"
+        fills = [{"coin": "ETH", "dir": "Close Short", "time": time.time() * 1000, "oid": 9,
+                  "closedPnl": "2.56", "fee": "0.009"}]
+        ex, closed = self.cycle(held=[_held("ETH", -0.256)], fills=fills, mids=mids)   # signal LONG : inversion
+        self.assertEqual([c[0] for c in self.eth_calls(ex)], ["close", "cancel", "open", "sl"])
+        self.assertAlmostEqual(closed[0]["top_up"], 0.136)
+        self.assertAlmostEqual(closed[0]["pnl"], 2.56 - 0.005 - 0.009 - m.TREND_FEE * 0.136 * 80, places=4)
+
+    def test_fermeture_sans_reponse_sl_orphelin_annule(self):
+        """Fermeture passée mais réponse perdue : la position reste suivie ; au cycle suivant, absente du
+        compte, sa fermeture est enregistrée et son SL resté en place est annulé (avant : SL orphelin, qui
+        aurait fermé une future position du même sens à l'ancien niveau)."""
+        self.real_eth()
+        ex = TrendExchange()
+        def close_(coin, slippage=0.05):
+            ex.calls.append(("close", coin))
+            raise requests.exceptions.ReadTimeout("Read timed out.")
+        ex.market_close = close_
+        _, closed = self.cycle(ex=ex, closes=self.DOWN, held=[_held("ETH", 0.12)])
+        self.assertEqual(closed, [])
+        self.assertIn("⚠️ Tendance : fermeture ETH échouée", self.titles())
+        fills = [{"coin": "ETH", "dir": "Close Long", "time": time.time() * 1000, "oid": 9,
+                  "closedPnl": "1.2", "fee": "0.005", "px": "100", "sz": "0.12"}]
+        ex, closed = self.cycle(closes=self.DOWN, fills=fills, held=self.held_now(skip=("ETH",)))
+        self.assertEqual([(p["symbol"], round(p["pnl"], 2)) for p in closed], [("ETH", 1.19)])
+        self.assertEqual(self.eth_calls(ex), [("cancel", "ETH", 5)])
+
+    def test_annulation_du_sl_en_echec_reessayee_au_cycle_suivant(self):
+        """Position fermée mais annulation de son SL en échec (réseau) : nouvel essai au cycle suivant, même
+        après un redémarrage (avant : SL orphelin laissé sur Hyperliquid)."""
+        self.real_eth()
+        ex = TrendExchange()
+        ex.cancel = mock.Mock(side_effect=requests.exceptions.ConnectionError("Wi-Fi coupé"))
+        fills = [{"coin": "ETH", "dir": "Close Long", "time": time.time() * 1000, "oid": 9,
+                  "closedPnl": "-1.2", "fee": "0.005", "px": "100", "sz": "0.12"}]
+        _, closed = self.cycle(ex=ex, closes=self.DOWN, held=[_held("ETH", 0.12)], fills=fills)
+        self.assertEqual([p["status"] for p in closed], ["signal inversé"])
+        self.assertEqual(m._load_trend()["cancels"], [["ETH", 5]])
+        m._trend = None                                             # redémarrage du bot
+        stop = {"coin": "ETH", "oid": 5, "isTrigger": True, "reduceOnly": True, "orderType": "Stop Market", "side": "A"}
+        ex, _ = self.cycle(closes=self.DOWN, held=self.held_now(), orders=[stop])
+        self.assertEqual(ex.calls, [("cancel", "ETH", 5)])
+        self.assertEqual(m._load_trend()["cancels"], [])
+        m._load_trend()["cancels"].append(["ETH", 5])               # SL déjà parti entre-temps : rien à refaire
+        ex, _ = self.cycle(closes=self.DOWN, held=self.held_now())
+        self.assertEqual((ex.calls, m._load_trend()["cancels"]), ([], []))
 
     # ── Aucun ordre sous TREND_MIN_NOTIONAL (10,5 $), à son pire prix ──
     def assert_ordres_au_minimum(self, ex, px=100.0):
@@ -1363,8 +1516,8 @@ class TestTrend(BaseTest):
         mids = {c: "100" for c in m.TREND_COINS}
         mids["ETH"] = "80"
         ex = TrendExchange(close_ok=False)
-        for _ in range(2):
-            self.cycle(ex=ex, held=[_held("ETH", -0.256)], mids=mids)
+        for szi in (-0.12, -0.256):                     # compte avant puis après le renfort
+            self.cycle(ex=ex, held=[_held("ETH", szi)], mids=mids)
         self.assertEqual([c[0] for c in self.eth_calls(ex)], ["open", "close", "close"])
         self.assertAlmostEqual(m._load_trend()["positions"]["ETH"]["top_up"], 0.136)
 
