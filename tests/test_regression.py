@@ -964,6 +964,18 @@ class TestRunLoop(BaseTest):
         self.run_with_equity([111.18, 111.18, 61.18])
         self.assertIn("⚡ Flash Crash Détecté", self.titles())
 
+    def test_capital_fictif_du_test_annonce_et_utilise(self):
+        """Mode fantôme avec PAPER_EQUITY=200 : tailles calculées sur 200 $ et capital fictif annoncé au démarrage
+        et dans chaque résumé."""
+        seen = []
+        with mock.patch.object(m, "PAPER_EQUITY", 200.0), mock.patch.object(m, "GHOST_ONLY", True), \
+             mock.patch.object(m, "trend_cycle", lambda wb, us, eq: seen.append(eq) or []):
+            self.run_loop(-2, strategy="trend")
+        self.assertEqual(seen, [200.0, 200.0])
+        self.assertIn("capital fictif du test : **$200**", dict(self.alerts)["🚀 Bot démarré"])
+        hb = [d for t, d in self.alerts if "résumé" in t]
+        self.assertTrue(hb[0].startswith("Mode : **fantôme seul** (aucun ordre réel) · capital fictif **$200**\n"))
+
     def test_erreur_imprevue_le_bot_continue(self):
         """Erreur imprévue au milieu d'un cycle : journalisée, une seule alerte, et les cycles suivants ont
         lieu (avant : bot arrêté ; systemd ne le relançait pas, la sortie semblant normale)."""
@@ -1103,6 +1115,13 @@ class TestDeposits(BaseTest):
         moves, state = self.sync([{"time": 2000, "delta": {"type": "nouveauType", "usdc": "5"}}])
         self.assertEqual((moves, state["initial_balance"], state["ledger_ts"]), ([], 111.55, 2000))
         self.assertIn("« nouveauType » non comptée", sys.stdout.getvalue())
+
+    def test_capital_fictif_du_test_ignore_en_reel(self):
+        with mock.patch.object(m, "PAPER_EQUITY", 200.0):
+            with mock.patch.object(m, "GHOST_ONLY", True):
+                self.assertEqual(m._sizing_equity(111.19), 200.0)
+            with mock.patch.object(m, "GHOST_ONLY", False):
+                self.assertEqual(m._sizing_equity(111.19), 111.19)   # jamais pour un ordre réel
 
     def test_taille_sur_tout_le_solde_ou_le_plafond_du_env(self):
         self.assertEqual(m._sizing_equity(250.0), 250.0)                     # MAX_LIQUIDITY=0 : tout le solde
@@ -1460,6 +1479,34 @@ class TestTrend(BaseTest):
         self.assertIn(("SOL", "fin du mode fantôme"), [(p["symbol"], p["status"]) for p in closed])
         self.assertEqual(sorted(c[1] for c in ex.calls if c[0] == "open"), ["BTC", "DOGE", "ETH", "XRP"])
         self.assertNotIn("SOL", m._load_trend()["positions"])
+
+    # ── Capital fictif du mode fantôme (test) ──
+    def test_capital_fictif_du_test_positions_fantomes_recalculees(self):
+        """Capital fictif de 200 $ : les positions fantômes en cours sont recalculées une seule fois à cette
+        taille (même entrée, même SL, ligne Excel à jour), une position réelle n'est pas touchée ; au passage
+        en réel, le % du capital de leurs fermetures se calcule sur ces 200 $."""
+        self.cycle(ghost=True, per_coin={"SOL": self.DOWN})                    # 111 $ : environ 11 $ par coin
+        before = {c: dict(p) for c, p in m._load_trend()["positions"].items()}
+        self.real_eth()
+        held = [_held("ETH", 0.12)]
+        with mock.patch.object(m, "PAPER_EQUITY", 200.0):
+            for _ in range(2):
+                self.cycle(ghost=True, equity=200.0, per_coin={"SOL": self.DOWN}, held=held)
+        pos = m._load_trend()["positions"]
+        rows = {r[0]: r for r in self.wb["Tendance"].iter_rows(min_row=2, values_only=True)}
+        for c in ("BTC", "SOL", "XRP", "DOGE"):
+            self.assertEqual((pos[c]["entry"], pos[c]["sl"]), (before[c]["entry"], before[c]["sl"]))
+            self.assertAlmostEqual(pos[c]["qty"] * pos[c]["entry"], 20.0, delta=0.11)   # 50 % × 200 $ / 5 coins
+            self.assertAlmostEqual(pos[c]["open_fee"], m.TREND_FEE * pos[c]["qty"] * pos[c]["entry"])
+            self.assertEqual(rows[pos[c]["id"]][5], pos[c]["qty"])
+        self.assertEqual(pos["ETH"]["qty"], 0.12)                                  # réelle : intacte
+        self.assertEqual(self.titles().count("🧪 Test : capital fictif de $200"), 1)
+        self.assertIn("BTC, DOGE, SOL, XRP", dict(self.alerts)["🧪 Test : capital fictif de $200"])
+        _, closed = self.cycle(equity=111.0, per_coin={"SOL": self.DOWN}, held=held)   # passage en réel
+        sol = [p for p in closed if p["symbol"] == "SOL"][0]
+        self.assertEqual(sol["status"], "fin du mode fantôme")
+        self.assertIn(f"P&L : **{sol['pnl'] / 200 * 100:+.2f} %** du capital",
+                      dict(self.alerts)["👻 🛑 SOL SELL — fin du mode fantôme [tendance]"])
 
     # ── Réponses perdues (délai dépassé, 5xx, bot arrêté pendant un ordre) ──
     def lost_open(self, coin="ETH"):

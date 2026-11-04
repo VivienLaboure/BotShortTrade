@@ -55,6 +55,9 @@ VOL_MULTIPLIER    = float(os.getenv("VOL_MULTIPLIER", 1.0))
 # fantôme (backtest d'octobre 2026 : aucun avantage mesurable sur le hasard après frais).
 # Les positions déjà ouvertes restent gérées (SL, trailing, zombie).
 GHOST_ONLY        = os.getenv("GHOST_ONLY", "0") == "1"
+# Capital fictif du mode fantôme (test avant le réel) : positions fantômes calculées comme si le compte
+# avait ce montant (0 = solde réel). Ignoré en réel.
+PAPER_EQUITY      = float(os.getenv("PAPER_EQUITY", 0))
 # Stratégie active : "trend" (tendance journalière, par défaut depuis le 2026-11-02) ou "scalp"
 # (ancien scalping M1/M5 : aucun avantage sur le hasard après frais, cf. tools/backtest.py).
 # Jamais les deux : deux positions sur un même coin fusionneraient sur Hyperliquid.
@@ -845,9 +848,12 @@ def _compute_regime() -> tuple[str, str, float, float]:
     return "RANGING",     "neutral", btc_chg, eth_chg
 
 def _sizing_equity(balance: float) -> float:
-    """Équité sur laquelle la stratégie tendance taille ses positions : tout le solde, relu à chaque cycle
-    (dépôts et gains compris, comme le backtest), ou au plus MAX_LIQUIDITY s'il est fixé dans .env.
-    Avant : capital figé au démarrage, recalé seulement après un écart de plus de 20 %."""
+    """Équité sur laquelle la stratégie tendance taille ses positions : en mode fantôme, le capital fictif
+    PAPER_EQUITY s'il est fixé (test) ; sinon tout le solde, relu à chaque cycle (dépôts et gains compris,
+    comme le backtest), ou au plus MAX_LIQUIDITY s'il est fixé dans .env. Avant : capital figé au
+    démarrage, recalé seulement après un écart de plus de 20 %."""
+    if GHOST_ONLY and PAPER_EQUITY > 0:
+        return PAPER_EQUITY
     return min(balance, _MAX_LIQ_CFG) if _MAX_LIQ_CFG > 0 else balance
 
 def _since_start(balance: float, initial_balance: float) -> str:
@@ -2322,6 +2328,30 @@ def _trend_adopt(wb: Workbook, coin: str, o: dict, p: dict, equity: float) -> di
         _trend_sl_ts = 0.0   # SL pas encore posé : nouvel essai dès ce cycle, puis toutes les 5 min
     return pos
 
+def _trend_rescale_paper(wb: Workbook, positions: dict, equity: float) -> list[str]:
+    """Positions fantômes recalculées pour le capital `equity` (capital fictif du test changé) : même
+    entrée, même SL ; quantité et frais d'ouverture refaits comme à l'ouverture. Retourne les coins."""
+    done = []
+    for coin, pos in sorted(positions.items()):
+        if not pos.get("paper"):
+            continue
+        is_buy = pos["side"] == "BUY"
+        floor  = min(_worst_px(pos["entry"], is_buy, TREND_SLIP_OPEN), _worst_px(pos["sl"], not is_buy, TREND_SLIP_SL))
+        qty    = _trend_qty(coin, pos["entry"], equity, floor)
+        if not qty:
+            continue   # capital trop petit pour le minimum par ordre : taille gardée
+        pos["qty"], pos["open_fee"] = qty, TREND_FEE * qty * pos["entry"]
+        done.append(coin)
+        for row in wb["Tendance"].iter_rows(min_row=2):
+            if str(row[0].value) == str(pos["id"]):
+                row[5].value, row[8].value = qty, round(qty * pos["entry"], 2)
+                break
+    try:
+        _safe_save(wb)
+    except Exception as e:
+        log_error(f"excel tendance (capital du test) : {e}")
+    return done
+
 def _trend_funding(pos: dict) -> float | None:
     """Financement reçu (+) ou payé (−) par la position depuis son ouverture : paiements du compte
     (réelle ; à un jour près, Hyperliquid regroupant les anciens paiements par jour à 00:00 UTC) ou
@@ -2352,7 +2382,8 @@ def _trend_record_close(wb: Workbook, pos: dict, status: str, exit_px: float, pn
     pnl      += funding
     notional  = pos["entry"] * pos["qty"]
     pnl_pct   = pnl / notional * 100 if notional else 0.0
-    cap_pct   = pnl / equity * 100 if equity > 0 else 0.0
+    base      = (_load_trend().get("paper_equity") or equity) if pos.get("paper") else equity   # fantôme : capital fictif
+    cap_pct   = pnl / base * 100 if base > 0 else 0.0
     pos.update(status=status, exit=exit_px, pnl=round(pnl, 4), funding=round(funding, 4), closed_at=now)
     try:
         for row in wb["Tendance"].iter_rows(min_row=2):
@@ -2480,6 +2511,20 @@ def trend_cycle(wb: Workbook, user_state: dict | None, equity: float) -> list[di
     except Exception as e:
         log_error(f"tendance all_mids (nouvel essai au cycle suivant) : {e}")
         return closed
+
+    # Capital fictif du test changé (mode fantôme) : positions fantômes recalculées à cette taille
+    if GHOST_ONLY and state.get("paper_equity", 0) != PAPER_EQUITY:
+        coins = _trend_rescale_paper(wb, positions, equity)
+        state["paper_equity"] = PAPER_EQUITY
+        _save_trend()
+        send_discord_alert(
+            f"🧪 Test : capital fictif de ${PAPER_EQUITY:g}" if PAPER_EQUITY > 0 else "🧪 Test : retour au solde réel",
+            (f"Le mode fantôme calcule ses positions comme si le compte avait **${PAPER_EQUITY:g}** (aucun ordre "
+             f"réel ; ignoré au passage en réel)." if PAPER_EQUITY > 0 else
+             f"Le mode fantôme calcule de nouveau ses positions sur le solde réel (${equity:.2f}).")
+            + (f"\nPositions fantômes en cours recalculées à cette taille (même entrée, même SL) : {', '.join(coins)}"
+               if coins else ""),
+            color=0x9b59b6)
 
     # 0) Ordres restés sans réponse (délai dépassé, bot arrêté pendant l'ordre). Ouverture : position
     #    reprise si elle est sur le compte, sinon nouvel essai plus bas. SL à annuler : nouvel essai.
@@ -2690,7 +2735,8 @@ def run():
     send_discord_alert(
         "🚀 Bot démarré",
         f"Réseau : **{'TESTNET' if HL_TESTNET else 'MAINNET'}**"
-        + (" · **mode fantôme seul (aucun ordre réel)**" if GHOST_ONLY else "") + "\n"
+        + (" · **mode fantôme seul (aucun ordre réel)**" if GHOST_ONLY else "")
+        + (f" · capital fictif du test : **${PAPER_EQUITY:g}**" if GHOST_ONLY and PAPER_EQUITY > 0 else "") + "\n"
         + _strat +
         f"Équité : **${balance:.2f}** · {_since_start(balance, initial_balance)}\n"
         + (f"Positions scalping reprises : {len(open_positions)}\n" if STRATEGY != "trend" or open_positions else "")
@@ -3086,7 +3132,9 @@ def run():
                              f"Fantômes : {_gtxt}")
                 send_discord_alert(
                     f"💓 Bot actif — résumé {HEARTBEAT_HOURS:g}h",
-                    ("Mode : **fantôme seul** (aucun ordre réel)\n" if GHOST_ONLY else "") + _body,
+                    ("Mode : **fantôme seul** (aucun ordre réel)"
+                     + (f" · capital fictif **${PAPER_EQUITY:g}**" if PAPER_EQUITY > 0 else "") + "\n"
+                     if GHOST_ONLY else "") + _body,
                     color=0x2ecc71 if hb_opened else 0x95a5a6)
                 hb_last = time.time()
                 hb_t_closed = []
