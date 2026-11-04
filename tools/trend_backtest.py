@@ -32,6 +32,16 @@ Résultats du 2026-11-03 (2e série, mêmes critères) :
     +50 %/an, Sharpe 1.11, pire baisse −45 %, p=0.003 ; 1re moitié 1.27 (vs 1.18), 2e moitié 0.99 (vs 0.63),
     pire baisse 2e moitié −34 % (vs −41 %). Écart avec LTC : +6.4 %/an, t=2.2.
   - rejetés : décision hebdomadaire (moins bon partout), filtre de funding extrême (moins bon partout).
+Résultats du 2026-11-04 (3e série, techniques documentées chez les traders, mêmes critères) :
+  - exposition selon la volatilité (Harvey et al. 2018) : taille × médiane passée de σ60 / σ60 du jour,
+    bornée à [0.5, 2], même facteur pour les 5 coins. Sharpe 1.16 (vs 1.11), 1re moitié 1.19 (vs 1.27),
+    2e moitié 1.19 (vs 0.99), pire baisse −38 % (vs −45 %). Rejeté : moins bon sur la 1re moitié
+    (exposition moyenne 57 %, pas 50 %) ; à revoir sur des données nouvelles.
+  - stop suiveur « chandelier » (plus haut depuis l'entrée − 3×ATR14) : +40 %/an (vs +50 %), Sharpe 1.21,
+    1re moitié 1.39, 2e moitié 0.98 (vs 0.99), pire baisse −32 % (vs −45 %). Rejeté : moins de gain, et
+    pas mieux sur la 2e moitié.
+  - écartés sans test : carry de funding (aucun marché spot liquide sur Hyperliquid pour couvrir), taille
+    continue selon la force du signal (Carver) : impossible tant que chaque coin est au minimum de 10,5 $.
 """
 from __future__ import annotations
 
