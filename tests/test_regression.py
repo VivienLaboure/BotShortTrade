@@ -1135,9 +1135,9 @@ class TestTrend(BaseTest):
         with mock.patch.dict(m._sym_filters, {"XRP": {"sz_dec": 0, "sz_step": 1}}):
             self.assertEqual(m._trend_qty("XRP", 2.5, 111.0), 5)     # 11.10 $ → 4.44 → arrondi au-dessus
             self.assertEqual(m._trend_qty("XRP", 2.5, 1000.0), 40)   # 100 $ pile
-            self.assertEqual(m._trend_qty("XRP", 2.5, 50.0), 0)      # 10.50 $ > 10 $ par coin → refus
-        # Pire prix d'un ordre à 88 (ex. limite du SL d'un long) : 10,5 $ à ce prix → 0.12 (12 $) au lieu de 0.111
-        self.assertEqual(m._trend_qty("ETH", 100.0, 111.0, 88.0), 0.12)
+            self.assertEqual(m._trend_qty("XRP", 2.5, 50.0), 0)      # 10,5 $ (+1 %) > 10 $ par coin → refus
+        # Pire prix d'un ordre à 88 (ex. limite du SL d'un long) : 10,5 $ + 1 % à ce prix → 0.121 au lieu de 0.111
+        self.assertEqual(m._trend_qty("ETH", 100.0, 111.0, 88.0), 0.121)
         self.assertEqual(m._trend_qty("ETH", 100.0, 111.0, 112.0), 0.111)   # au-dessus du prix : sans effet
 
     # ── Mode fantôme ──
@@ -1186,27 +1186,78 @@ class TestTrend(BaseTest):
         self.assertAlmostEqual(closed[0]["pnl"], 1.2 - 0.005 - 0.005)
         new = m._load_trend()["positions"]["ETH"]
         self.assertEqual((new["side"], new["sl_oid"], new["paper"]), ("SELL", 21, False))
+        self.assertAlmostEqual(new["open_fee"], m.TREND_FEE * new["qty"] * 100)   # absents de la réponse : estimés
 
     def test_sl_reel_touche_pas_de_reouverture_le_meme_jour(self):
+        """SL exécuté en 2 fills : P&L et prix de sortie moyen enregistrés (avant : sortie à 0)."""
         self.real_eth()
         fills = [{"coin": "ETH", "dir": "Close Long", "time": time.time() * 1000, "oid": 9,
-                  "closedPnl": "-1.5", "fee": "0.005"}]
+                  "closedPnl": "-1.0", "fee": "0.003", "px": "80.2", "sz": "0.08"},
+                 {"coin": "ETH", "dir": "Close Long", "time": time.time() * 1000, "oid": 9,
+                  "closedPnl": "-0.5", "fee": "0.002", "px": "79.9", "sz": "0.04"}]
         ex, closed = self.cycle(fills=fills)              # ETH absent du compte : SL exécuté
         self.assertEqual([(p["symbol"], p["status"]) for p in closed], [("ETH", "SL touché")])
         self.assertAlmostEqual(closed[0]["pnl"], -1.51)
+        self.assertAlmostEqual(closed[0]["exit"], 80.1)
+        self.assertIn("Entrée : $90 → sortie $80.1", dict(self.alerts)["🛑 ETH BUY — SL touché [tendance]"])
         self.assertEqual(self.eth_calls(ex), [])
         ex, _ = self.cycle()
         self.assertEqual(self.eth_calls(ex), [])
         self.assertEqual(len([c for c in ex.calls if c[0] == "open"]), 0)   # les 4 autres déjà ouverts
 
     def test_fill_de_fermeture_absent_attend_3_cycles(self):
-        self.real_eth()
+        """Toujours aucun fill après 3 cycles : P&L estimé au prix du SL (avant : 0 $, « Fermé (SL) »)."""
+        pos = self.real_eth()
         for _ in range(2):
             _, closed = self.cycle()
             self.assertEqual(closed, [])
             self.assertIn("ETH", m._load_trend()["positions"])
         _, closed = self.cycle()
-        self.assertEqual([p["symbol"] for p in closed], ["ETH"])
+        self.assertEqual([(p["symbol"], p["status"], p["exit"]) for p in closed], [("ETH", "SL touché", 80.0)])
+        self.assertAlmostEqual(closed[0]["pnl"], 0.12 * (80 - 90) - m.TREND_FEE * 0.12 * 80 - 0.005, places=4)
+
+    def test_sl_d_un_jour_passe_reouverture_sans_attendre(self):
+        """SL exécuté hier pendant un arrêt du bot : la journée d'attente est déjà passée, la position
+        est rouverte dès ce cycle (avant : à plat jusqu'à demain)."""
+        self.real_eth()
+        fills = [{"coin": "ETH", "dir": "Close Long", "time": (time.time() - 86400) * 1000, "oid": 9,
+                  "closedPnl": "-1.5", "fee": "0.005", "px": "80", "sz": "0.12"}]
+        ex, closed = self.cycle(fills=fills)
+        self.assertEqual([p["status"] for p in closed], ["SL touché"])
+        self.assertEqual([c[0] for c in self.eth_calls(ex)], ["open", "sl"])
+        self.assertNotIn("ETH", m._load_trend()["stopped"])
+
+    def test_prix_absent_nouvel_essai_au_cycle_suivant(self):
+        """Prix ETH absent de Hyperliquid un instant : rien ce cycle, ouverture au suivant (avant :
+        « équité insuffisante » et plus d'essai avant demain)."""
+        mids = {c: "100" for c in m.TREND_COINS if c != "ETH"}
+        ex, _ = self.cycle(mids=mids)
+        self.assertEqual(self.eth_calls(ex), [])
+        self.assertNotIn("⚠️ Tendance : ETH non ouvert", self.titles())
+        ex, _ = self.cycle()
+        self.assertEqual([c[0] for c in self.eth_calls(ex)], ["open", "sl"])
+
+    def test_position_enregistree_des_son_ouverture(self):
+        """Bot arrêté au milieu des ouvertures : celles déjà faites sont dans trend_state.json (avant :
+        écrit en fin de cycle seulement → position réelle prise ensuite pour celle d'un autre bot)."""
+        ex = TrendExchange()
+        def open_(coin, *a, **k):
+            if coin == "ETH":
+                raise KeyboardInterrupt
+            return TrendExchange.market_open(ex, coin, *a, **k)
+        ex.market_open = open_
+        with self.assertRaises(KeyboardInterrupt):
+            self.cycle(ex=ex)
+        with open(m.TREND_FILE, encoding="utf-8") as f:
+            self.assertEqual(list(json.load(f)["positions"]), ["BTC"])
+
+    def test_fermeture_sans_fill_visible_pnl_estime(self):
+        """Fermeture faite mais fills pas encore visibles : P&L estimé au prix moyen, frais d'ouverture
+        compris (avant : 0 $)."""
+        self.real_eth(open_fee=m.TREND_FEE * 0.12 * 90)
+        _, closed = self.cycle(closes=self.DOWN, held=[_held("ETH", 0.12)])
+        self.assertEqual([(p["status"], p["exit"]) for p in closed], [("signal inversé", 100.0)])
+        self.assertAlmostEqual(closed[0]["pnl"], 1.2 - m.TREND_FEE * 0.12 * (100 + 90), places=4)
 
     def test_coin_tenu_par_un_autre_bot_jamais_ouvert(self):
         ex, _ = self.cycle(held=[_held("SOL", -0.5)])
@@ -1239,10 +1290,10 @@ class TestTrend(BaseTest):
         self.assert_ordres_au_minimum(ex)
 
     def test_short_ouverture_au_minimum_a_son_pire_prix(self):
-        """Équité de 100 $ (10 $ visés par coin) : la vente d'ouverture d'un short vaut ≥ 10,5 $ même
-        exécutée 2 % sous le prix → 0.108 (avant : minimum de 11 $ au prix moyen → 0.11)."""
+        """Équité de 100 $ (10 $ visés par coin) : la vente d'ouverture d'un short vaut ≥ 10,5 $ (+1 % de
+        marge) même exécutée 2 % sous le prix → 0.109 (avant : minimum de 11 $ au prix moyen → 0.11)."""
         ex, _ = self.cycle(closes=self.DOWN, equity=100.0)
-        self.assertEqual([c[3] for c in ex.calls if c[0] == "open"], [0.108] * 5)
+        self.assertEqual([c[3] for c in ex.calls if c[0] == "open"], [0.109] * 5)
         self.assert_ordres_au_minimum(ex)
 
     def test_short_tres_gagnant_renforce_avant_fermeture(self):
@@ -1265,6 +1316,19 @@ class TestTrend(BaseTest):
         self.assertIn(f"Renforcée de {add:g}", dict(self.alerts)["✅ ETH SELL — signal inversé [tendance]"])
         self.assertEqual(m._load_trend()["positions"]["ETH"]["side"], "BUY")
 
+    def test_renfort_au_minimum_malgre_l_arrondi_du_prix_limite(self):
+        """DOGE à 0.002481 : le SDK arrondit la limite de vente 0.00243138 à 0.002431 (6 décimales). Un renfort
+        visé pile à 10,5 $ (4319) y valait 10.4995 $ (trouvé par tests/test_trend_sim) ; avec 1 % de marge, ≥ 10,5 $."""
+        pos = {"id": "7", "symbol": "DOGE", "side": "SELL", "entry": 0.003, "qty": 3700.0, "sl": 0.0034,
+               "sl_oid": 5, "atr": 0.0001, "open_fee": 0.005, "opened_at": time.time(), "paper": False}
+        ex = TrendExchange()
+        with mock.patch.object(m, "exchange", ex), \
+             mock.patch.dict(m._sym_filters, {"DOGE": {"sz_dec": 0, "sz_step": 1}}):
+            m._trend_top_up(pos, 0.002481)
+        add   = ex.calls[0][3]
+        limit = round(float(f"{0.002481 * (1 - m.TREND_SLIP_OPEN):.5g}"), 6)   # calculée comme le SDK
+        self.assertGreaterEqual(add * limit, m.TREND_MIN_NOTIONAL)
+
     def test_renfort_fait_mais_fermeture_refusee_pas_de_second_renfort(self):
         """Renfort passé, fermeture refusée : au cycle suivant la position (renfort compris) vaut assez,
         on retente la fermeture seule — jamais de renforts en série."""
@@ -1273,9 +1337,9 @@ class TestTrend(BaseTest):
         mids["ETH"] = "80"
         ex = TrendExchange(close_ok=False)
         for _ in range(2):
-            self.cycle(ex=ex, held=[_held("ETH", -0.254)], mids=mids)
+            self.cycle(ex=ex, held=[_held("ETH", -0.256)], mids=mids)
         self.assertEqual([c[0] for c in self.eth_calls(ex)], ["open", "close", "close"])
-        self.assertAlmostEqual(m._load_trend()["positions"]["ETH"]["top_up"], 0.134)
+        self.assertAlmostEqual(m._load_trend()["positions"]["ETH"]["top_up"], 0.136)
 
     # ── Liste des coins (BTC remplace LTC le 2026-11-03) ──
     MIDS6 = {c: "100" for c in ("BTC", "ETH", "SOL", "XRP", "DOGE", "LTC")}
@@ -1385,13 +1449,16 @@ class TestTrend(BaseTest):
         self.assertEqual(m._load_trend()["positions"]["ETH"]["sl_oid"], 21)
 
     def test_reprise_scalping_ignore_les_positions_tendance(self):
-        """Une position tendance n'est ni adoptée par le scalping ni signalée « non reprise »."""
+        """Une position tendance n'est ni adoptée par le scalping ni signalée « non reprise », même si
+        bot_state.json garde une ancienne position scalping du même sens sur ce coin (avant : adoptée)."""
         self.real_eth()
         m._save_trend()
         m._trend = None
-        with mock.patch.object(m, "info", FakeInfo(perp={"assetPositions": [_held("ETH", 0.12)]})):
-            rec, _ = m.recover_open_positions()
-        self.assertEqual(rec, [])
+        for saved in ([], [{"symbol": "ETH", "side": "BUY", "id": "old", "sl": 85.0, "tp": 99.0}]):
+            m.save_positions_state(saved)
+            with mock.patch.object(m, "info", FakeInfo(perp={"assetPositions": [_held("ETH", 0.12)]})):
+                rec, _ = m.recover_open_positions()
+            self.assertEqual(rec, [])
         self.assertEqual(self.titles(), [])
 
 
