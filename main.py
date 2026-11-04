@@ -78,6 +78,7 @@ TRAIL_TRIGGER = 1.5   # activer trailing quand profit ≥ 1.5×ATR
 TRAIL_DIST    = 1.0   # trailing SL à 1×ATR du prix courant
 BE_BUFFER_PCT = 0.10  # breakeven = entrée ± 0.10 % (couvre les frais aller-retour ≈ 0.09 %)
 REGIME_REFRESH_S = 30 * 60   # recalcul du régime de marché (bougies D1)
+LEDGER_REFRESH_S = 10 * 60   # relevé des dépôts / retraits (journal Hyperliquid)
 SL_CHECK_S       = 5 * 60    # vérification que chaque position a bien son stop-loss sur Hyperliquid
 
 # Stratégie tendance (cf. section « Stratégie tendance journalière » et tools/trend_backtest.py)
@@ -843,9 +844,16 @@ def _compute_regime() -> tuple[str, str, float, float]:
         return "BEAR",    "down",    btc_chg, eth_chg
     return "RANGING",     "neutral", btc_chg, eth_chg
 
+def _sizing_equity(balance: float) -> float:
+    """Équité sur laquelle la stratégie tendance taille ses positions : tout le solde, relu à chaque cycle
+    (dépôts et gains compris, comme le backtest), ou au plus MAX_LIQUIDITY s'il est fixé dans .env.
+    Avant : capital figé au démarrage, recalé seulement après un écart de plus de 20 %."""
+    return min(balance, _MAX_LIQ_CFG) if _MAX_LIQ_CFG > 0 else balance
+
 def _since_start(balance: float, initial_balance: float) -> str:
     """« +1.2 % depuis le départ » : équité comparée au solde de référence (bot_state.json)."""
-    return f"{(balance / initial_balance - 1) * 100 if initial_balance > 0 else 0.0:+.1f} % depuis le départ"
+    pct = (balance / initial_balance - 1) * 100 if initial_balance > 0 else 0.0
+    return f"{round(pct, 1) + 0.0:+.1f} % depuis le départ"   # + 0.0 : jamais « -0.0 % »
 
 def load_initial_balance(current_balance: float) -> float:
     if os.path.exists(STATE_FILE):
@@ -860,15 +868,84 @@ def load_initial_balance(current_balance: float) -> float:
     return current_balance
 
 def _save_initial_balance(balance: float):
-    state = {}
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE) as f:
-                state = json.load(f)
-        except Exception:
-            pass
+    state = _read_state()
     state["initial_balance"] = round(balance, 4)
     _state_atomic_write(state)
+
+def _read_state() -> dict:
+    """Contenu de bot_state.json ({} s'il manque ou est illisible)."""
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+# Lignes du journal Hyperliquid sans mouvement de fonds externe (le reste non reconnu est signalé)
+_LEDGER_INTERNAL = {"accountClassTransfer", "liquidation", "rewardsClaim", "spotGenesis"}
+
+def _ledger_flow(d: dict) -> float:
+    """USDC entré (+) ou sorti (−) du compte selon une ligne du journal Hyperliquid : dépôt, retrait,
+    virement depuis ou vers une autre adresse, coffre (vault). 0 pour le reste : passage spot ↔ perp
+    du compte lui-même, autre jeton que l'USDC (hors de l'équité suivie)."""
+    me, kind = WALLET_ADDRESS.lower(), d.get("type")
+    if kind == "deposit":
+        return float(d.get("usdc") or 0)
+    if kind == "withdraw":   # frais (1 $) laissés en perte : inclus ou non dans « usdc », jamais un gain
+        return -float(d.get("usdc") or 0)
+    if kind == "vaultDeposit":
+        return -float(d.get("usdc") or 0)
+    if kind == "vaultWithdraw":
+        return float(d.get("netWithdrawnUsd") or d.get("usdc") or 0)
+    if kind in ("send", "spotTransfer", "internalTransfer", "subAccountTransfer"):
+        if d.get("token", "USDC") != "USDC":
+            return 0.0
+        amount = float(d.get("usdcValue") or d.get("amount") or d.get("usdc") or 0)
+        src, dst = str(d.get("user", "")).lower(), str(d.get("destination", "")).lower()
+        if dst == me and src != me:
+            return amount
+        if src == me and dst != me:
+            return -amount - float(d.get("fee") or 0)
+        return 0.0
+    if kind not in _LEDGER_INTERNAL:
+        log_error(f"journal Hyperliquid : opération « {kind} » non comptée comme dépôt ni retrait")
+    return 0.0
+
+def sync_deposits() -> list[tuple[int, float]]:
+    """Dépôts (+) et retraits (−) de USDC faits depuis le dernier relevé du journal Hyperliquid, ajoutés à
+    la référence du « % depuis le départ » (bot_state.json) : un dépôt n'est pas un gain, ni un retrait
+    une perte. Une alerte par mouvement. Retourne les mouvements (heure en ms, montant) ; aucun si rien
+    de nouveau ou si Hyperliquid ne répond pas (nouvel essai au relevé suivant)."""
+    state = _read_state()
+    if "ledger_ts" not in state:   # premier relevé : les mouvements passés sont déjà dans la référence
+        state["ledger_ts"] = int(time.time() * 1000)
+        _state_atomic_write(state)
+        return []
+    try:
+        rows = info.user_non_funding_ledger_updates(WALLET_ADDRESS, int(state["ledger_ts"]) + 1)
+    except Exception as e:
+        log_error(f"journal des dépôts Hyperliquid (nouvel essai plus tard) : {e}")
+        return []
+    if not rows:
+        return []
+    ref, moves = float(state.get("initial_balance") or 0), []
+    for r in sorted(rows, key=lambda r: r["time"]):
+        flow = _ledger_flow(r.get("delta") or {})
+        if not flow:
+            continue
+        moves.append((int(r["time"]), flow))
+        why = "un dépôt n'est pas un gain" if flow > 0 else "un retrait n'est pas une perte"
+        send_discord_alert(
+            f"💰 Dépôt de ${flow:.2f} reçu" if flow > 0 else f"💸 Retrait de ${-flow:.2f}",
+            ("Utilisé dès les prochaines positions (ouvertures, inversions) ; celles déjà ouvertes gardent "
+             "leur taille." if flow > 0 else "Les prochaines positions seront plus petites.")
+            + f"\nRéférence du « % depuis le départ » : ${ref:.2f} → **${ref + flow:.2f}** ({why}).",
+            color=0x3498db)
+        ref += flow
+    state["ledger_ts"] = max(int(r["time"]) for r in rows)
+    if moves:
+        state["initial_balance"] = round(ref, 4)
+    _state_atomic_write(state)
+    return moves
 
 def _state_atomic_write(state: dict):
     """Écriture atomique de bot_state.json via tmp+replace (même pattern que _safe_save)."""
@@ -879,13 +956,7 @@ def _state_atomic_write(state: dict):
 
 def save_positions_state(positions: list):
     """Persiste les positions ouvertes dans bot_state.json après chaque changement."""
-    state = {}
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE) as f:
-                state = json.load(f)
-        except Exception:
-            pass
+    state = _read_state()
     state["open_positions"] = positions
     _state_atomic_write(state)
 
@@ -2593,6 +2664,8 @@ def run():
     print(f"  {C.DIM}Par trade : {CAPITAL_PCT*100:.0f}% × ${MAX_LIQUIDITY:.2f} = {C.RST}{C.BOLD}${CAPITAL_PER_TRADE:.2f}{C.RST}")
 
     initial_balance = load_initial_balance(balance)
+    initial_balance += sum(f for _, f in sync_deposits())   # dépôts / retraits faits bot arrêté
+    run._ledger_ts = time.time()
     print(f"  {C.DIM}Solde initial (référence % P&L) : ${initial_balance:.2f} USDC{C.RST}")
 
     open_positions, capital_in_use = recover_open_positions()
@@ -2791,7 +2864,7 @@ def run():
             # Stratégie tendance : SL touchés + alignement sur le signal du jour (aucun scan scalping)
             if STRATEGY == "trend":
                 try:
-                    hb_t_closed += trend_cycle(wb, _user_state, min(balance, MAX_LIQUIDITY))
+                    hb_t_closed += trend_cycle(wb, _user_state, _sizing_equity(balance))
                 except Exception as e:
                     log_error(f"tendance : {e}")
                     traceback.print_exc()
@@ -2892,17 +2965,28 @@ def run():
                 print_lessons_summary()
 
             # ── Détection d'anomalies + alertes Discord ───────────────────────────────
-            # 1) Flash crash : équité chute > 5% en 1 cycle (60s)
-            #    Ignoré si des positions viennent de se fermer ce cycle (faux positif
-            #    courant : la marge libérée par un SL/TP n'est pas encore reflétée)
-            if hasattr(run, '_prev_equity') and run._prev_equity > 0 and not closed_this_loop:
-                equity_drop_pct = (run._prev_equity - balance) / run._prev_equity * 100
+            # Dépôts / retraits relevés toutes les 10 min, et tout de suite si l'équité bouge de plus de 5 % :
+            # référence du « % depuis le départ » ajustée (avant : un dépôt comptait comme un gain)
+            prev = run.__dict__.get("_prev_equity", 0.0)
+            moves: list[tuple[int, float]] = []
+            if (prev > 0 and abs(balance - prev) > prev * 0.05) or \
+                    time.time() - run.__dict__.get("_ledger_ts", 0) >= LEDGER_REFRESH_S:
+                run._ledger_ts = time.time()
+                moves = sync_deposits()
+                initial_balance += sum(f for _, f in moves)
+            # 1) Flash crash : équité chute > 5% en 1 cycle (60s), hors retrait fait pendant ce cycle
+            #    (avant : signalé comme un krach). Ignoré si des positions viennent de se fermer ce
+            #    cycle (faux positif courant : la marge libérée par un SL/TP n'est pas encore reflétée)
+            if prev > 0 and not closed_this_loop:
+                since_ms = (run.__dict__.get("_prev_ts", 0) - 60) * 1000
+                moved = sum(f for t, f in moves if t >= since_ms)
+                equity_drop_pct = (prev - (balance - moved)) / prev * 100
                 if equity_drop_pct > 5.0:
-                    msg = (f"Équité: **${run._prev_equity:.2f}** → **${balance:.2f}** "
+                    msg = (f"Équité: **${prev:.2f}** → **${balance:.2f}** "
                            f"(**-{equity_drop_pct:.1f}%** en 1 cycle)")
                     print(f"  {C.BRED}[🔴 FLASH CRASH]{C.RST} {equity_drop_pct:.1f}% en 1 cycle")
                     send_discord_alert("⚡ Flash Crash Détecté", msg, color=0xe74c3c)
-            run._prev_equity = balance
+            run._prev_equity, run._prev_ts = balance, time.time()
 
             # 2) Drawdown non-réalisé > 4% de l'équité
             if len(open_positions) > 0 and balance > 0:
@@ -2985,7 +3069,7 @@ def run():
                         _hb_mids = info.all_mids()
                     except Exception:
                         _hb_mids = None
-                    _body = (trend_heartbeat(wb, _hb_mids, min(balance, MAX_LIQUIDITY), hb_t_closed) + "\n"
+                    _body = (trend_heartbeat(wb, _hb_mids, _sizing_equity(balance), hb_t_closed) + "\n"
                              f"Régime : **{regime}** (BTC {btc_chg:+.1f}% · ETH {eth_chg:+.1f}% 7j)\n"
                              f"Équité : **${balance:.2f}** · {_since_start(balance, initial_balance)}\n"
                              f"Cycles : {hb_cycles}")

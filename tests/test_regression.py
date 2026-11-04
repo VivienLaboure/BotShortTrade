@@ -91,12 +91,14 @@ class FakeInfo:
         self.mids = mids or {"ETH": "2000"}
         self.perp, self.spot, self.fills = perp or {}, spot or {"balances": []}, fills or []
         self.funding, self.rates = [], []   # paiements de financement du compte, taux horaires publics
+        self.ledger = []                     # journal des dépôts, retraits et virements
     def all_mids(self): return self.mids
     def user_state(self, addr): return self.perp
     def spot_user_state(self, addr): return self.spot
     def user_fills(self, addr): return self.fills
     def user_funding_history(self, addr, start): return [f for f in self.funding if f["time"] >= start]
     def funding_history(self, coin, start): return [r for r in self.rates if r["time"] >= start]
+    def user_non_funding_ledger_updates(self, addr, start): return [r for r in self.ledger if r["time"] >= start]
 
 SIG = {"symbol": "ETH", "signal": "buy", "score": 0.8, "atr_m5": 5.0, "price": 2000,
        "conditions": {"mode": "MR", "regime": "RANGING", "rsi": 50, "bbp": 0.3, "vol_ratio": 1.5}}
@@ -790,7 +792,8 @@ class TestRunLoop(BaseTest):
             os.remove(m.GHOST_FILE)
         m._ghosts = None
         m._lessons_cache.clear(); m._lessons_cache_ts = 0.0
-        for attr in ("_sl_check_ts",) + (() if keep_regime else ("_regime_cache", "_regime_ts")):
+        for attr in ("_sl_check_ts", "_prev_equity", "_prev_ts", "_ledger_ts") + \
+                    (() if keep_regime else ("_regime_cache", "_regime_ts")):
             m.run.__dict__.pop(attr, None)
         info = LoopInfo(
             mids={c: "100" for c in m.WATCHLIST + m.TREND_COINS},
@@ -925,6 +928,42 @@ class TestRunLoop(BaseTest):
         self.assertTrue(shown)
         self.assertEqual(set(shown), {"scalp"})
 
+    def run_with_equity(self, equities, ledger_delta=None):
+        """2 cycles en mode tendance fantôme ; get_equity renvoie `equities` (démarrage, cycle 1, cycle 2) et le
+        journal Hyperliquid la ligne `ledger_delta`, datée du relevé. Retourne l'équité passée à trend_cycle."""
+        eqs, seen = iter(equities), []
+        ledger = lambda self_, addr, start: [{"time": start, "delta": ledger_delta}] if ledger_delta else []
+        with mock.patch.object(m, "get_equity", lambda *a: next(eqs)), \
+             mock.patch.object(m, "trend_cycle", lambda wb, us, eq: seen.append(eq) or []), \
+             mock.patch.object(LoopInfo, "user_non_funding_ledger_updates", ledger), \
+             mock.patch.object(m, "GHOST_ONLY", True):
+            self.run_loop(-2, strategy="trend")
+        return seen
+
+    def test_depot_utilise_des_le_cycle_suivant_et_pas_compte_comme_gain(self):
+        """Dépôt de 11.12 $ (+10 %) : tailles calculées sur la nouvelle équité dès le cycle suivant (avant :
+        capital figé au démarrage tant que l'écart restait sous 20 %) ; le dépôt, lu dans le journal
+        Hyperliquid, n'apparaît pas comme un gain dans le « % depuis le départ »."""
+        send = {"type": "send", "user": "0x6b9e773128f453f5c2c60935ee2de2cbc5390a24",
+                "destination": m.WALLET_ADDRESS.lower(), "token": "USDC", "amount": "11.12", "usdcValue": "11.12",
+                "fee": "0.0"}
+        seen = self.run_with_equity([111.18, 111.18, 122.30], send)
+        self.assertEqual(seen, [111.18, 122.30])
+        self.assertIn("💰 Dépôt de $11.12 reçu", self.titles())
+        hb = [d for t, d in self.alerts if "résumé" in t]
+        self.assertIn("Équité : **$122.30** · +0.0 % depuis le départ", hb[-1])
+
+    def test_retrait_pas_signale_comme_krach(self):
+        """Retrait de 50 $ (−45 % en un cycle) : expliqué par le journal Hyperliquid, pas d'alerte « Flash
+        Crash » (avant : alerte) ; une vraie chute sans retrait reste signalée."""
+        withdraw = {"type": "withdraw", "usdc": "50.0", "nonce": 1, "fee": "1.0"}
+        self.run_with_equity([111.18, 111.18, 61.18], withdraw)
+        self.assertNotIn("⚡ Flash Crash Détecté", self.titles())
+        self.assertIn("💸 Retrait de $50.00", self.titles())
+        self.alerts.clear()
+        self.run_with_equity([111.18, 111.18, 61.18])
+        self.assertIn("⚡ Flash Crash Détecté", self.titles())
+
     def test_erreur_imprevue_le_bot_continue(self):
         """Erreur imprévue au milieu d'un cycle : journalisée, une seule alerte, et les cycles suivants ont
         lieu (avant : bot arrêté ; systemd ne le relançait pas, la sortie semblant normale)."""
@@ -1002,6 +1041,74 @@ class TestSignalDiagnostic(BaseTest):
         with mock.patch.object(m, "fetch_candles", fc):
             self.assertIsNone(m.get_signal("ETH"))
         self.assertEqual(m._reject_stats.get("volume M5"), 1)
+
+
+# ── Dépôts et retraits (journal Hyperliquid) ────────────────────────────────
+class TestDeposits(BaseTest):
+    ME, OTHER = m.WALLET_ADDRESS.lower(), "0x6b9e773128f453f5c2c60935ee2de2cbc5390a24"
+
+    def sync(self, ledger, state=None):
+        m._state_atomic_write(state or {"initial_balance": 111.55, "ledger_ts": 1000})
+        info = FakeInfo()
+        info.ledger = ledger
+        with mock.patch.object(m, "info", info):
+            moves = m.sync_deposits()
+        return moves, m._read_state()
+
+    def send(self, t, amount, src=None, dst=None, token="USDC", fee="0.0"):
+        return {"time": t, "delta": {"type": "send", "user": src or self.OTHER, "destination": dst or self.ME,
+                                     "token": token, "amount": amount, "usdcValue": amount, "fee": fee}}
+
+    def test_premier_releve_ne_recompte_pas_les_anciens_depots(self):
+        """Premier relevé : les dépôts passés sont déjà dans la référence (111.55 $), seul le point de départ
+        du journal est noté."""
+        moves, state = self.sync([self.send(5000, "99.8")], {"initial_balance": 111.55})
+        self.assertEqual(moves, [])
+        self.assertEqual(state["initial_balance"], 111.55)
+        self.assertGreater(state["ledger_ts"], 1_700_000_000_000)
+
+    def test_depot_ajoute_a_la_reference_une_seule_fois(self):
+        ledger = [self.send(2000, "90"),
+                  self.send(3000, "5", src=self.ME, dst=self.ME),           # spot → perp du compte : interne
+                  self.send(4000, "7", token="HYPE"),                       # autre jeton : hors équité suivie
+                  {"time": 5000, "delta": {"type": "accountClassTransfer", "usdc": "3", "toPerp": True}}]
+        moves, state = self.sync(ledger)
+        self.assertEqual(moves, [(2000, 90.0)])
+        self.assertEqual((state["initial_balance"], state["ledger_ts"]), (201.55, 5000))
+        self.assertIn("$111.55 → **$201.55** (un dépôt n'est pas un gain)", dict(self.alerts)["💰 Dépôt de $90.00 reçu"])
+        info = FakeInfo()
+        info.ledger = ledger
+        with mock.patch.object(m, "info", info):
+            self.assertEqual(m.sync_deposits(), [])                        # déjà compté
+        self.assertEqual(m._read_state()["initial_balance"], 201.55)
+
+    def test_retrait_et_virement_sortant_retires_de_la_reference(self):
+        ledger = [{"time": 2000, "delta": {"type": "withdraw", "usdc": "50.0", "nonce": 1, "fee": "1.0"}},
+                  self.send(3000, "10", src=self.ME, dst=self.OTHER, fee="1.0"),
+                  {"time": 4000, "delta": {"type": "deposit", "usdc": "20"}}]
+        moves, state = self.sync(ledger)
+        self.assertEqual([f for _, f in moves], [-50.0, -11.0, 20.0])
+        self.assertAlmostEqual(state["initial_balance"], 111.55 - 41)
+        self.assertEqual(self.titles(), ["💸 Retrait de $50.00", "💸 Retrait de $11.00", "💰 Dépôt de $20.00 reçu"])
+
+    def test_journal_indisponible_rien_ne_change(self):
+        m._state_atomic_write({"initial_balance": 111.55, "ledger_ts": 1000})
+        info = FakeInfo()
+        info.user_non_funding_ledger_updates = mock.Mock(side_effect=RuntimeError("502"))
+        with mock.patch.object(m, "info", info):
+            self.assertEqual(m.sync_deposits(), [])
+        self.assertEqual(m._read_state(), {"initial_balance": 111.55, "ledger_ts": 1000})
+
+    def test_operation_inconnue_signalee_dans_le_journal(self):
+        moves, state = self.sync([{"time": 2000, "delta": {"type": "nouveauType", "usdc": "5"}}])
+        self.assertEqual((moves, state["initial_balance"], state["ledger_ts"]), ([], 111.55, 2000))
+        self.assertIn("« nouveauType » non comptée", sys.stdout.getvalue())
+
+    def test_taille_sur_tout_le_solde_ou_le_plafond_du_env(self):
+        self.assertEqual(m._sizing_equity(250.0), 250.0)                     # MAX_LIQUIDITY=0 : tout le solde
+        with mock.patch.object(m, "_MAX_LIQ_CFG", 150.0):
+            self.assertEqual(m._sizing_equity(250.0), 150.0)
+            self.assertEqual(m._sizing_equity(90.0), 90.0)
 
 
 # ── Utilitaires ──────────────────────────────────────────────────────────────
