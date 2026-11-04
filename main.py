@@ -1,6 +1,8 @@
 """
 BotShortTrade – Hyperliquid DEX
-Stratégie : M15 biais → M5 confirm → M1 entrée | SL=1.5×ATR | TP=2.5×ATR | 5× levier
+Stratégie par défaut (STRATEGY=trend) : tendance journalière, vote 14/28/56 j, SL 3×ATR D1
+(cf. section « Stratégie tendance journalière »).
+Ancien scalping (STRATEGY=scalp) : M15 biais → M5 confirm → M1 entrée | SL=1.5×ATR | TP=4×ATR | 5× levier
 """
 import json, math, os, time, traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -57,7 +59,7 @@ GHOST_ONLY        = os.getenv("GHOST_ONLY", "0") == "1"
 # (ancien scalping M1/M5 : aucun avantage sur le hasard après frais, cf. tools/backtest.py).
 # Jamais les deux : deux positions sur un même coin fusionneraient sur Hyperliquid.
 STRATEGY          = os.getenv("STRATEGY", "trend")
-TREND_EXPOSURE    = float(os.getenv("TREND_EXPOSURE", 0.5))   # notionnel total / équité, réparti sur la watchlist
+TREND_EXPOSURE    = float(os.getenv("TREND_EXPOSURE", 0.5))   # notionnel total / équité, réparti sur TREND_COINS
 MAX_TRADES        = int(os.getenv("MAX_TRADES", 0))
 MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", 3.0))   # % du capital
 SESSION_START_UTC  = int(os.getenv("SESSION_START_UTC", 0))         # heure UTC (0 = minuit)
@@ -83,6 +85,7 @@ TREND_LOOKBACKS    = (14, 28, 56)  # LONG si clôture D1 > celle d'il y a N jour
 TREND_SL_ATR       = 3.0        # SL = 3×ATR14 journalier
 TREND_FEE          = 0.000432   # frais taker par côté (P&L des positions fantômes)
 TREND_MIN_NOTIONAL = 11.0       # $ par position (minimum Hyperliquid : 10 $)
+TREND_SL_SLIPPAGE  = 0.10       # prix limite de l'ordre SL : 10 % au-delà du déclenchement
 TREND_COINS        = ["BTC", "ETH", "SOL", "XRP", "DOGE"]   # BTC a remplacé LTC le 2026-11-03
 
 # Mode fantôme : suivi virtuel des signaux NON tradés (filtrés, bloqués par régime, sans slot)
@@ -2043,8 +2046,8 @@ def trend_signal(coin: str) -> tuple[str, float, float] | None:
 
 def _trend_qty(coin: str, price: float, equity: float, floor_px: float | None = None) -> float:
     """Quantité pour TREND_EXPOSURE × équité / nb de coins, arrondie au pas du coin vers le haut,
-    et valant au moins TREND_MIN_NOTIONAL même au prix floor_px (SL d'un long : l'ordre stop doit
-    lui aussi dépasser le minimum Hyperliquid). 0 si l'équité ne permet pas ce minimum."""
+    et valant au moins TREND_MIN_NOTIONAL même au prix floor_px (prix limite du SL d'un long :
+    l'ordre stop doit lui aussi dépasser le minimum Hyperliquid). 0 si l'équité ne permet pas ce minimum."""
     floor_px = min(price, floor_px or price)
     if price <= 0 or floor_px <= 0:
         return 0.0
@@ -2062,7 +2065,7 @@ def _trend_alert_once(coin: str, why: str, title: str, desc: str, color: int = 0
 
 def _place_sl(coin: str, is_buy: bool, qty: float, sl: float):
     """Pose le stop-loss (trigger reduce-only) d'une position ; 2 essais. Retourne l'oid, ou None."""
-    sl_lim = round_px(sl * 0.90, coin) if is_buy else round_px(sl * 1.10, coin)
+    sl_lim = round_px(sl * (1 - TREND_SL_SLIPPAGE if is_buy else 1 + TREND_SL_SLIPPAGE), coin)
     for attempt in range(2):
         try:
             r = exchange.order(coin, not is_buy, qty, limit_px=sl_lim,
@@ -2084,7 +2087,10 @@ def trend_open(wb: Workbook, coin: str, side: str, atr: float, equity: float, mi
     l'ouverture échoue ou si le SL est refusé (la position est alors refermée au marché)."""
     is_buy, sgn = side == "BUY", (1 if side == "BUY" else -1)
     price = float(mids.get(coin) or 0)
-    qty   = _trend_qty(coin, price, equity, price - sgn * TREND_SL_ATR * atr)
+    sl_px = price - sgn * TREND_SL_ATR * atr
+    # Long : son ordre stop (une vente) vaut qty × prix limite, 10 % sous le SL. Hyperliquid peut
+    # contrôler son minimum de 10 $ sur ce prix plutôt que sur le déclenchement : on dimensionne dessus.
+    qty   = _trend_qty(coin, price, equity, sl_px * (1 - TREND_SL_SLIPPAGE) if is_buy else sl_px)
     if not qty:
         raise RuntimeError(f"équité ${equity:.2f} insuffisante pour {TREND_MIN_NOTIONAL:.0f} $ par coin")
     now = time.time()
@@ -2284,7 +2290,8 @@ def trend_cycle(wb: Workbook, user_state: dict | None, equity: float) -> list[di
             if not _trend_try_close(wb, pos, status, mids, equity, closed):
                 continue
             del positions[coin]
-            just_closed.add(coin)
+            if not pos.get("paper"):
+                just_closed.add(coin)   # encore visible sur le compte lu en début de cycle
         if state["stopped"].get(coin) == day:
             continue
         if not GHOST_ONLY and (held_on_account is None or
@@ -2390,8 +2397,8 @@ def run():
         + (" · **mode fantôme seul (aucun ordre réel)**" if GHOST_ONLY else "") + "\n"
         + _strat +
         f"Équité : **${balance:.2f}** · {_since_start(balance, initial_balance)}\n"
-        f"Positions scalping reprises : {len(open_positions)}\n"
-        f"Coins : {', '.join(TREND_COINS if STRATEGY == 'trend' else WATCHLIST)}",
+        + (f"Positions scalping reprises : {len(open_positions)}\n" if STRATEGY != "trend" or open_positions else "")
+        + f"Coins : {', '.join(TREND_COINS if STRATEGY == 'trend' else WATCHLIST)}",
         color=0x3498db)
 
     # Stats du heartbeat Discord — remises à zéro après chaque envoi
@@ -2655,8 +2662,8 @@ def run():
                 except Exception as e:
                     log_error(f"scan fantôme: {e}")
 
-        # Afficher le résumé des leçons toutes les 10 min
-        if now_min % 10 == 0:
+        # Afficher le résumé des leçons du scalping toutes les 10 min (inutile en mode tendance)
+        if STRATEGY != "trend" and now_min % 10 == 0:
             print_lessons_summary()
 
         # ── Détection d'anomalies + alertes Discord ───────────────────────────────

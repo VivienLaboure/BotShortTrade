@@ -11,6 +11,7 @@ Aucun appel réseau, aucun ordre réel, aucun message Discord :
   - exécution dans un dossier temporaire (trades.xlsx, bot_state.json… factices)
 """
 import json, os, sys, tempfile, time, types, unittest
+from datetime import datetime
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -735,6 +736,12 @@ class TestGhostVolume(BaseTest):
 class _StopLoop(Exception):
     pass
 
+class _Minute0(datetime):
+    """Horloge figée à hh:00 : le résumé des leçons (toutes les 10 min) tombe à chaque cycle."""
+    @classmethod
+    def now(cls, tz=None):
+        return datetime.now(tz).replace(minute=0)
+
 class LoopInfo(FakeInfo):
     def meta(self): return {"universe": []}
 
@@ -803,6 +810,7 @@ class TestRunLoop(BaseTest):
         self.assertEqual([(g["symbol"], g["reason"]) for g in ghosts],
                          [("ETH", "fantôme seul (aurait été tradé)")])
         self.assertIn("fantôme seul", dict(self.alerts)["🚀 Bot démarré"])
+        self.assertIn("Positions scalping reprises : 0", dict(self.alerts)["🚀 Bot démarré"])
         hb = [d for t, d in self.alerts if "résumé" in t]
         self.assertTrue(hb and hb[0].startswith("Mode : **fantôme seul**"))
 
@@ -859,11 +867,25 @@ class TestRunLoop(BaseTest):
         self.assertEqual(set(m._load_trend()["positions"]), set(m.TREND_COINS))
         self.assertIn("tendance journalière", dict(self.alerts)["🚀 Bot démarré"])
         self.assertIn("Coins : BTC, ETH, SOL, XRP, DOGE", dict(self.alerts)["🚀 Bot démarré"])
+        self.assertNotIn("Positions scalping", dict(self.alerts)["🚀 Bot démarré"])
         hb = [d for t, d in self.alerts if "résumé" in t]
         self.assertTrue(hb and "Tendance : BTC LONG +0.0 %" in hb[0])
         self.assertIn("Équité : **$111.18** · +0.0 % depuis le départ", dict(self.alerts)["🚀 Bot démarré"])
         self.assertIn("Latent : **+0.00 %** du capital", hb[0])
         self.assertIn("Équité : **$111.18** · +0.0 % depuis le départ", hb[0])
+
+    def test_resume_des_lecons_du_scalping_absent_en_mode_tendance(self):
+        """Le bloc « Leçons actives » (patterns du scalping, ~3 300 lignes de journal par jour) n'est
+        plus affiché en mode tendance ; le mode scalping le garde."""
+        shown = []
+        with mock.patch.object(m, "datetime", _Minute0), \
+             mock.patch.object(m, "print_lessons_summary", lambda: shown.append(m.STRATEGY)):
+            with mock.patch.object(m, "GHOST_ONLY", True):
+                self.run_loop(-2, strategy="trend", trend_closes=TestTrend.UP)
+            self.assertEqual(shown, [])
+            self.run_loop(-2)
+        self.assertTrue(shown)
+        self.assertEqual(set(shown), {"scalp"})
 
     def test_ranging_mom_bloque_suivi_en_fantome(self):
         ex, ghosts = self.run_loop(-2)
@@ -1022,6 +1044,7 @@ class TrendExchange:
     """Hyperliquid simulé : journalise ouvertures, SL, fermetures et annulations."""
     def __init__(self, avg_px=100.0, sl=None, close_ok=True):
         self.avg_px, self.close_ok, self.sl, self.calls = avg_px, close_ok, sl or [_ok(21)], []
+        self.stops = []   # (coin, qté, prix limite) de chaque ordre stop
     def update_leverage(self, *a, **k): return {"status": "ok"}
     def market_open(self, coin, is_buy, qty, px=None, slippage=0.02):
         self.calls.append(("open", coin, is_buy, qty))
@@ -1030,6 +1053,7 @@ class TrendExchange:
     def order(self, coin, is_buy, qty, limit_px, order_type, reduce_only):
         trig = order_type["trigger"]
         self.calls.append((trig["tpsl"], coin, is_buy, trig["triggerPx"]))
+        self.stops.append((coin, qty, limit_px))
         return self.sl.pop(0) if len(self.sl) > 1 else self.sl[0]
     def market_close(self, coin, slippage=0.05):
         self.calls.append(("close", coin))
@@ -1188,6 +1212,23 @@ class TestTrend(BaseTest):
         ex, _ = self.cycle(held=[_held("SOL", -0.5)])
         self.assertEqual(sorted(c[1] for c in ex.calls if c[0] == "open"), ["BTC", "DOGE", "ETH", "XRP"])
         self.assertNotIn("SOL", m._load_trend()["positions"])
+
+    def test_passage_en_reel_n_ouvre_pas_un_coin_tenu_par_un_autre_bot(self):
+        """Fin du mode fantôme : SOL fantôme est fermé, mais SOL est tenu sur le compte par un autre
+        bot (BotCopyTrade) → pas de SOL réel, qui fusionnerait avec sa position (avant : ouvert)."""
+        self.cycle(ghost=True)
+        ex, closed = self.cycle(held=[_held("SOL", -0.5)])
+        self.assertIn(("SOL", "fin du mode fantôme"), [(p["symbol"], p["status"]) for p in closed])
+        self.assertEqual(sorted(c[1] for c in ex.calls if c[0] == "open"), ["BTC", "DOGE", "ETH", "XRP"])
+        self.assertNotIn("SOL", m._load_trend()["positions"])
+
+    def test_sl_d_un_long_vaut_le_minimum_meme_a_son_prix_limite(self):
+        """L'ordre stop d'un long (vente, prix limite 10 % sous le SL) vaut au moins 11 $ à ce prix
+        limite, au cas où Hyperliquid y contrôle son minimum de 10 $ (avant : 0.126 × 78.66 = 9.91 $)."""
+        ex, _ = self.cycle()
+        self.assertEqual(len(ex.stops), 5)
+        for coin, qty, limit_px in ex.stops:
+            self.assertGreaterEqual(qty * limit_px, m.TREND_MIN_NOTIONAL, coin)
 
     # ── Liste des coins (BTC remplace LTC le 2026-11-03) ──
     MIDS6 = {c: "100" for c in ("BTC", "ETH", "SOL", "XRP", "DOGE", "LTC")}
