@@ -763,6 +763,16 @@ def get_signal(coin: str) -> dict | None:
         return None
 
 # ── Balance (affichage uniquement) ───────────────────────────────────────────
+_unified: bool | None = None   # compte en mode Unified Hyperliquid ? (réglage du compte, lu une fois)
+
+def _unified_account() -> bool:
+    """Mode Unified Hyperliquid (le USDC spot sert de marge perp) ? Lu une fois par démarrage ; lève une
+    exception si l'API ne répond pas (rien n'est mémorisé : nouvel essai au prochain appel)."""
+    global _unified
+    if _unified is None:
+        _unified = info.query_user_abstraction_state(WALLET_ADDRESS) == "unifiedAccount"
+    return _unified
+
 def get_equity(cached_state: dict | None = None) -> float:
     """Lève une exception si l'API ne répond pas (502/504…) : l'appelant garde alors le
     solde précédent. Ne jamais remplacer une partie manquante par 0 (faux "-100 %")."""
@@ -770,21 +780,20 @@ def get_equity(cached_state: dict | None = None) -> float:
     cross        = user_state.get("crossMarginSummary") or user_state.get("marginSummary")
     if not cross:
         raise ValueError("user_state sans marginSummary")
-    margin_used  = float(cross.get("totalMarginUsed") or 0)
     acv          = float(cross.get("accountValue") or 0)   # perp : marge engagée + P&L latent (+ libre)
 
-    # Mode Unified Hyperliquid : le USDC Spot sert aussi de marge perp et son "hold"
-    # contient déjà la marge des positions (comptée aussi dans accountValue) → on retire
-    # ce recouvrement pour ne pas la compter deux fois. Compte classique : hold ≈ 0.
-    spot_usdc = spot_hold = 0.0
+    spot_usdc = 0.0
     spot_state = info.spot_user_state(WALLET_ADDRESS)   # en échec → exception propagée
     for b in spot_state.get("balances", []):
         if b["coin"] == "USDC":
             spot_usdc = float(b.get("total") or 0)
-            spot_hold = float(b.get("hold") or 0)
             break
 
-    total = acv + spot_usdc - min(spot_hold, margin_used)
+    # Mode Unified : le USDC spot sert de marge perp, et son total contient déjà la marge ET le P&L latent
+    # des positions ; c'est la valeur du compte donnée par Hyperliquid (endpoint portfolio, relevés du 06/11).
+    # Avant : accountValue perp moins la marge ajouté en plus → P&L latent compté environ 2,2 fois.
+    # Compte classique : perp et spot sont séparés → somme des deux.
+    total = spot_usdc if _unified_account() else acv + spot_usdc
     return total if total > 0 else 0.0
 
 def account_coins(user_state: dict | None) -> set[str]:

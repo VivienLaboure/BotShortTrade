@@ -87,14 +87,16 @@ class FakeExchange:
     def cancel(self, *a, **k): return {"status": "ok"}
 
 class FakeInfo:
-    def __init__(self, mids=None, perp=None, spot=None, fills=None):
+    def __init__(self, mids=None, perp=None, spot=None, fills=None, abstraction="unifiedAccount"):
         self.mids = mids or {"ETH": "2000"}
         self.perp, self.spot, self.fills = perp or {}, spot or {"balances": []}, fills or []
         self.funding, self.rates = [], []   # paiements de financement du compte, taux horaires publics
         self.ledger = []                     # journal des dépôts, retraits et virements
+        self.abstraction = abstraction       # mode du compte (celui du bot : Unified)
     def all_mids(self): return self.mids
     def user_state(self, addr): return self.perp
     def spot_user_state(self, addr): return self.spot
+    def query_user_abstraction_state(self, addr): return self.abstraction
     def user_fills(self, addr): return self.fills
     def user_funding_history(self, addr, start): return [f for f in self.funding if f["time"] >= start]
     def funding_history(self, coin, start): return [r for r in self.rates if r["time"] >= start]
@@ -110,6 +112,7 @@ class BaseTest(unittest.TestCase):
             if os.path.exists(f):
                 os.remove(f)
         m._trend = None; m._trend_sig.clear(); m._trend_alerted.clear(); m._trend_sl_ts = 0.0
+        m._unified = None
         self.alerts = []
         self._p = [
             mock.patch.object(m, "send_discord_alert",
@@ -240,16 +243,36 @@ class TestExcel(BaseTest):
 
 # ── Équité ───────────────────────────────────────────────────────────────────
 class TestEquity(BaseTest):
-    def eq(self, perp, spot):
-        with mock.patch.object(m, "info", FakeInfo(spot=spot)):
+    def eq(self, perp, spot, abstraction="unifiedAccount"):
+        with mock.patch.object(m, "info", FakeInfo(spot=spot, abstraction=abstraction)):
             return m.get_equity(perp)
 
     def test_unified_marge_pas_comptee_deux_fois(self):
-        # Valeurs réelles relevées le 2026-10-16 avec 1 position DOGE ouverte
+        # Valeurs réelles relevées le 2026-10-16 avec 1 position DOGE ouverte : le total spot contient la marge
         perp = {"withdrawable": "0.0", "crossMarginSummary":
                 {"accountValue": "16.556911", "totalMarginUsed": "16.68719"}}
         spot = {"balances": [{"coin": "USDC", "total": "111.343455", "hold": "16.68719"}]}
-        self.assertAlmostEqual(self.eq(perp, spot), 111.21, places=2)
+        self.assertAlmostEqual(self.eq(perp, spot), 111.343455, places=6)
+
+    def test_unified_pnl_latent_pas_compte_deux_fois(self):
+        """06/11, 5 shorts ouverts, P&L latent +0.41 $ : Hyperliquid (endpoint portfolio) donnait 211.3697 $,
+        le total spot ; le bot affichait 211.87 $ (P&L latent compté environ 2,2 fois)."""
+        perp = {"withdrawable": "0.497491", "crossMarginSummary":
+                {"accountValue": "21.880433", "totalNtlPos": "106.88072", "totalRawUsd": "128.761153",
+                 "totalMarginUsed": "21.376143"}}
+        spot = {"balances": [{"coin": "USDC", "total": "211.3697", "hold": "21.376143"}]}
+        self.assertAlmostEqual(self.eq(perp, spot), 211.3697, places=6)
+
+    def test_mode_du_compte_lu_une_fois(self):
+        info = FakeInfo(spot={"balances": [{"coin": "USDC", "total": "100", "hold": "0"}]})
+        info.query_user_abstraction_state = mock.Mock(side_effect=[Exception("(502, 'Bad Gateway')"),
+                                                                   "unifiedAccount"])
+        perp = {"crossMarginSummary": {"accountValue": "0.0", "totalMarginUsed": "0.0"}}
+        with mock.patch.object(m, "info", info):
+            with self.assertRaises(Exception):          # l'appelant garde le solde précédent
+                m.get_equity(perp)
+            self.assertEqual([m.get_equity(perp) for _ in range(3)], [100.0] * 3)
+        self.assertEqual(info.query_user_abstraction_state.call_count, 2)
 
     def test_unified_sans_position(self):
         perp = {"withdrawable": "0.0", "crossMarginSummary":
@@ -260,12 +283,12 @@ class TestEquity(BaseTest):
     def test_compte_classique_perp_seul(self):
         perp = {"withdrawable": "80", "crossMarginSummary":
                 {"accountValue": "100", "totalMarginUsed": "20"}}
-        self.assertAlmostEqual(self.eq(perp, {"balances": []}), 100.0)
+        self.assertAlmostEqual(self.eq(perp, {"balances": []}, "default"), 100.0)
 
     def test_compte_classique_perp_plus_spot(self):
         perp = {"crossMarginSummary": {"accountValue": "100", "totalMarginUsed": "20"}}
         spot = {"balances": [{"coin": "USDC", "total": "50", "hold": "0"}]}
-        self.assertAlmostEqual(self.eq(perp, spot), 150.0)
+        self.assertAlmostEqual(self.eq(perp, spot, "default"), 150.0)
 
     def test_spot_indisponible_leve_au_lieu_de_zero(self):
         """25/10 : 504 sur spot_user_state → équité lue $0.00 → faux flash crash -100 %."""
