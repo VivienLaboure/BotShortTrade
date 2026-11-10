@@ -1592,9 +1592,10 @@ class TestTrend(BaseTest):
         self.assertAlmostEqual(closed[0]["pnl"], 2.56 - 0.005 - 0.009 - m.TREND_FEE * 0.136 * 80, places=4)
 
     def test_fermeture_sans_reponse_sl_orphelin_annule(self):
-        """Fermeture passée mais réponse perdue : la position reste suivie ; au cycle suivant, absente du
-        compte, sa fermeture est enregistrée et son SL resté en place est annulé (avant : SL orphelin, qui
-        aurait fermé une future position du même sens à l'ancien niveau)."""
+        """Fermeture passée mais réponse perdue : la position reste suivie ; au cycle suivant, même après un
+        redémarrage, absente du compte, sa fermeture est enregistrée avec son vrai motif, son SL resté en place
+        est annulé (avant : SL orphelin, qui aurait fermé une future position du même sens à l'ancien niveau)
+        et la position inverse s'ouvre aussitôt (avant : « Fermé (SL) », à plat jusqu'au lendemain)."""
         self.real_eth()
         ex = TrendExchange()
         def close_(coin, slippage=0.05):
@@ -1603,12 +1604,35 @@ class TestTrend(BaseTest):
         ex.market_close = close_
         _, closed = self.cycle(ex=ex, closes=self.DOWN, held=[_held("ETH", 0.12)])
         self.assertEqual(closed, [])
-        self.assertIn("⚠️ Tendance : fermeture ETH échouée", self.titles())
+        self.assertIn("n'a pas répondu", dict(self.alerts)["⚠️ Tendance : fermeture ETH sans réponse"])
+        m._trend = None                                             # redémarrage du bot
         fills = [{"coin": "ETH", "dir": "Close Long", "time": time.time() * 1000, "oid": 9,
                   "closedPnl": "1.2", "fee": "0.005", "px": "100", "sz": "0.12"}]
         ex, closed = self.cycle(closes=self.DOWN, fills=fills, held=self.held_now(skip=("ETH",)))
-        self.assertEqual([(p["symbol"], round(p["pnl"], 2)) for p in closed], [("ETH", 1.19)])
+        self.assertEqual([(p["symbol"], p["status"], round(p["pnl"], 2)) for p in closed],
+                         [("ETH", "signal inversé", 1.19)])
+        self.assertEqual([c[0] for c in self.eth_calls(ex)], ["cancel", "open", "sl"])
+        self.assertEqual(self.eth_calls(ex)[0], ("cancel", "ETH", 5))
+        self.assertEqual(m._load_trend()["positions"]["ETH"]["side"], "SELL")
+        self.assertNotIn("ETH", m._load_trend()["stopped"])
+
+    def test_fermeture_sans_reponse_non_passee_un_sl_ensuite_reste_un_sl(self):
+        """Réponse perdue mais ordre jamais arrivé (position toujours sur le compte), puis signal revenu : un
+        SL touché ensuite est enregistré comme un SL (à plat jusqu'à demain), pas comme cette fermeture."""
+        self.real_eth()
+        ex = TrendExchange()
+        ex.market_close = mock.Mock(side_effect=requests.exceptions.ConnectionError("Wi-Fi coupé"))
+        self.cycle(ex=ex, per_coin={"ETH": self.DOWN}, held=[_held("ETH", 0.12)])
+        m._trend_sig.clear()                                         # le lendemain : signal revenu LONG
+        ex, _ = self.cycle(held=self.held_now())
+        self.assertEqual(self.eth_calls(ex), [])
+        self.assertNotIn("closing", m._load_trend()["positions"]["ETH"])
+        fills = [{"coin": "ETH", "dir": "Close Long", "time": time.time() * 1000, "oid": 5,
+                  "closedPnl": "-1.2", "fee": "0.005", "px": "80", "sz": "0.12"}]
+        ex, closed = self.cycle(fills=fills, held=self.held_now(skip=("ETH",)))
+        self.assertEqual([p["status"] for p in closed], ["SL touché"])
         self.assertEqual(self.eth_calls(ex), [("cancel", "ETH", 5)])
+        self.assertIn("ETH", m._load_trend()["stopped"])
 
     def test_annulation_du_sl_en_echec_reessayee_au_cycle_suivant(self):
         """Position fermée mais annulation de son SL en échec (réseau) : nouvel essai au cycle suivant, même
@@ -1891,6 +1915,7 @@ class TestTrend(BaseTest):
         self.assertEqual([c[0] for c in self.eth_calls(ex)], ["close"])
         self.assertEqual(closed, [])
         self.assertEqual(m._load_trend()["positions"]["ETH"]["side"], "BUY")
+        self.assertNotIn("closing", m._load_trend()["positions"]["ETH"])   # refus net : rien à vérifier ensuite
         self.assertIn("⚠️ Tendance : fermeture ETH échouée", self.titles())
 
     def test_sl_tendance_manquant_repose(self):

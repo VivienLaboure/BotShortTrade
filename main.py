@@ -2474,9 +2474,15 @@ def trend_close(wb: Workbook, pos: dict, status: str, mids: dict, equity: float)
     if pos.get("paper"):
         return _trend_record_close(wb, pos, status, exit_px, _paper_pnl(pos, exit_px or pos["entry"]), equity)
     _trend_top_up(pos, exit_px)
+    # Noté AVANT l'ordre : réponse perdue (délai dépassé, 5xx) → au cycle suivant, une position absente
+    # du compte a été fermée par cet ordre, pas par son SL (avant : « SL touché », à plat jusqu'à demain)
+    pos["closing"] = status
+    _save_trend()
     r  = exchange.market_close(coin, slippage=TREND_SLIP_CLOSE)
     st = ((r or {}).get("response") or {}).get("data", {}).get("statuses", [{}])
     if r is not None and (r.get("status") != "ok" or (st and "error" in st[0])):
+        del pos["closing"]   # refus net : la position est toujours là
+        _save_trend()
         raise RuntimeError(f"fermeture refusée : {r}")
     _trend_cancel_sl(coin, pos.get("sl_oid"))
     time.sleep(1)   # propagation des fills
@@ -2499,9 +2505,14 @@ def _trend_try_close(wb: Workbook, pos: dict, status: str, mids: dict, equity: f
         return True
     except Exception as e:
         log_error(f"fermeture tendance {pos['symbol']}: {e}")
-        _trend_alert_once(pos["symbol"], "close", f"⚠️ Tendance : fermeture {pos['symbol']} échouée",
-                          f"La position reste ouverte avec son SL ; nouvel essai à chaque cycle.\n"
-                          f"Erreur : `{str(e)[:300]}`")
+        if pos.get("closing"):   # ordre peut-être passé
+            _trend_alert_once(pos["symbol"], "close", f"⚠️ Tendance : fermeture {pos['symbol']} sans réponse",
+                              f"Hyperliquid n'a pas répondu : la fermeture est vérifiée au cycle suivant "
+                              f"(la position garde son SL d'ici là).\nErreur : `{str(e)[:300]}`")
+        else:
+            _trend_alert_once(pos["symbol"], "close", f"⚠️ Tendance : fermeture {pos['symbol']} échouée",
+                              f"La position reste ouverte avec son SL ; nouvel essai à chaque cycle.\n"
+                              f"Erreur : `{str(e)[:300]}`")
         return False
 
 def trend_cycle(wb: Workbook, user_state: dict | None, equity: float) -> list[dict]:
@@ -2567,6 +2578,8 @@ def trend_cycle(wb: Workbook, user_state: dict | None, equity: float) -> list[di
             continue
         if held_on_account is None or coin in held_on_account:
             pos.pop("_missing", None)
+            if held_on_account is not None:
+                pos.pop("closing", None)   # fermeture sans réponse pas passée : nouvel essai plus bas
             # Renfort passé sans réponse : la taille du compte fait foi (sinon second renfort inutile)
             extra = round(abs(float(acct[coin]["szi"])) - pos["qty"], 9) if coin in acct else 0.0
             if extra > pos.get("top_up", 0.0) + 1e-9:
@@ -2579,20 +2592,25 @@ def trend_cycle(wb: Workbook, user_state: dict | None, equity: float) -> list[di
             res = _trend_fill_result(pos, info.user_fills(WALLET_ADDRESS))
         except Exception as e:
             log_error(f"fills tendance {coin}: {e}")
+        why = pos.get("closing")   # fermée par notre ordre resté sans réponse (motif de cette fermeture)
         if not res:
             # Fills pas encore propagés ou erreur API passagère : on attend 3 cycles
             pos["_missing"] = pos.get("_missing", 0) + 1
             if pos["_missing"] < 3:
                 continue
-            log_error(f"tendance {coin} : absente du compte sans fill de fermeture, P&L estimé au SL")
-            res = (_paper_pnl(pos, pos["sl"]) - pos.get("top_up_fee", 0.0), pos["sl"], time.time())
+            px = (float(mids.get(coin) or 0) if why else 0.0) or pos["sl"]
+            log_error(f"tendance {coin} : absente du compte sans fill de fermeture, P&L estimé à ${px:.6g}")
+            res = (_paper_pnl(pos, px) - pos.get("top_up_fee", 0.0), px, time.time())
         pnl, exit_px, exit_ts = res
-        closed.append(_trend_record_close(wb, pos, "SL touché" if pnl < 0 else "Fermé (SL)", exit_px, pnl, equity))
+        closed.append(_trend_record_close(wb, pos, why or ("SL touché" if pnl < 0 else "Fermé (SL)"),
+                                          exit_px, pnl, equity))
         del positions[coin]
         # Fermée par autre chose que son SL (fermeture restée sans réponse, à la main) : SL orphelin annulé.
         # Après un vrai SL, Hyperliquid répond simplement « déjà exécuté ».
         _trend_cancel_sl(coin, pos.get("sl_oid"))
-        if _utc_day(exit_ts) == day:   # SL d'un jour passé (bot arrêté à ce moment) : rien à attendre
+        # Après un SL : à plat jusqu'à demain, sauf SL d'un jour passé (bot arrêté à ce moment). Après
+        # notre fermeture : aucune attente, la nouvelle position s'ouvre plus bas dans ce cycle.
+        if not why and _utc_day(exit_ts) == day:
             state["stopped"][coin] = day
         _save_trend()
 
