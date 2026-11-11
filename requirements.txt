@@ -1,5 +1,7 @@
-python-dotenv
-hyperliquid-python-sdk
-eth-account
-openpyxl
-requests
+# Versions installées et vérifiées avec le bot (2026-11-11). Changer une version : relancer les tests
+# (python3 -m unittest discover -s tests) avant de redémarrer le service.
+python-dotenv==1.2.2
+hyperliquid-python-sdk==0.24.0
+eth-account==0.13.7
+openpyxl==3.1.5
+requests==2.34.2
