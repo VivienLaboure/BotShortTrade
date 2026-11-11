@@ -15,9 +15,6 @@ class TestStatus(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="bst_status_")
 
-    def test_stats(self):
-        self.assertEqual(S.stats([1.0, -1.0, 2.0, 2.0]), "n=   4  WR= 75%  moy=+1.000%  t=+1.4")
-
     def test_read_events_filtre_par_date_et_ignore_lignes_cassees(self):
         p = os.path.join(self.dir, "ev.jsonl")
         with open(p, "w", encoding="utf-8") as f:
@@ -27,27 +24,6 @@ class TestStatus(unittest.TestCase):
         ev = S.read_events(p, datetime(2026, 10, 28, tzinfo=timezone.utc))
         self.assertEqual([e["title"] for e in ev], ["récent"])
         self.assertEqual(S.read_events(os.path.join(self.dir, "absent"), datetime.now(timezone.utc)), [])
-
-    def test_bilan_fantomes_separe_aurait_ete_trade(self):
-        wb = Workbook(); wb.active.title = "Trades"
-        ws = wb.create_sheet("Fantômes")
-        ws.append(["ID", "Ouvert (UTC)", "Symbole", "Côté", "Mode", "Régime", "Score", "Raison",
-                   "Entrée", "SL", "TP", "Statut", "Sortie", "P&L %", "Fermé (UTC)"])
-        row = lambda side, mode, reason, pnl, closed, st="TP": \
-            ["G", "", "ETH/USDT", side, mode, "BULL", 1, reason, 1, 1, 1, st, 1, pnl, closed]
-        ws.append(row("BUY", "BBO", "fantôme seul (aurait été tradé)", 0.5, "2026-10-28 08:00"))
-        ws.append(row("BUY", "BBO", "BBO bloqué RANGING", -0.2, "2026-10-28 08:00"))
-        ws.append(row("SELL", "MOM", "fantôme seul (aurait été tradé)", 0.3, "2026-10-01 08:00"))  # trop vieux
-        ws.append(row("SELL", "MOM", "x", None, None, "Ouvert"))
-        wb.save(os.path.join(self.dir, "trades.xlsx"))
-        out = []
-        with mock.patch.object(S, "ROOT", self.dir), \
-             mock.patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))):
-            S.ghost_report("2026-10-27 16:09")
-        txt = "\n".join(out)
-        self.assertIn("clos depuis 2026-10-27 16:09 UTC : 2 · encore ouverts : 1", txt)
-        self.assertIn("aurait été tradé (stratégie actuelle) :  n=   1  WR=100%  moy=+0.500%", txt)
-        self.assertIn("filtrés / bloqués :  n=   1  WR=  0%  moy=-0.200%", txt)
 
     def test_bilan_tendance(self):
         with open(os.path.join(self.dir, "trend_state.json"), "w") as f:
@@ -73,18 +49,15 @@ class TestStatus(unittest.TestCase):
         self.assertIn("Fermées (fantôme) : 2 · gagnantes 1 · P&L $+1.00 · moy +4.00 % du notionnel", txt)
         self.assertNotIn("Fermées (réel)", txt)
 
-    def test_fantomes_du_scalping_seulement_avec_option(self):
-        """Scalping désactivé depuis le 2026-11-02 : son bilan n'encombre plus le statut, sauf --scalp."""
-        def run(*args):
-            out = []
-            with mock.patch.object(S, "ROOT", self.dir), mock.patch.object(S, "sh", lambda cmd: ""), \
-                 mock.patch("sys.argv", ["status.py", *args]), \
-                 mock.patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))):
-                S.main()
-            return "\n".join(out)
-        self.assertNotIn("Fantômes du scalping", run())
-        self.assertIn("Stratégie tendance", run())
-        self.assertIn("Fantômes du scalping", run("--scalp"))
+    def test_statut_complet(self):
+        out = []
+        with mock.patch.object(S, "ROOT", self.dir), mock.patch.object(S, "sh", lambda cmd: ""), \
+             mock.patch("sys.argv", ["status.py"]), \
+             mock.patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))):
+            S.main()
+        txt = "\n".join(out)
+        self.assertIn("Stratégie tendance", txt)
+        self.assertIn("Positions en cours : 0", txt)
 
 
 if __name__ == "__main__":

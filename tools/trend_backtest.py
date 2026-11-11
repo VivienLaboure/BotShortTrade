@@ -66,16 +66,45 @@ Résultats du 2026-11-04 (5e série, diversification multi-actifs comme les fond
 """
 from __future__ import annotations
 
-import argparse, json, math, os, random, statistics, sys, time, urllib.request
+import argparse, contextlib, io, json, math, os, random, statistics, sys, tempfile, time, types, urllib.request
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from backtest import CACHE_DIR, load_bot   # import isolé de main.py (aucun ordre, .env jamais lu)
+ROOT       = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CACHE_DIR  = os.path.join(ROOT, "backtest_data")
 
 FEE        = 0.000432
 BINANCE    = "https://data-api.binance.vision/api/v3/klines"
 BYBIT_FUND = "https://api.bybit.com/v5/market/funding/history"
 DAY_MS     = 86_400_000
 
+
+def load_bot():
+    """Importe main.py (paramètres et coins de la stratégie) sans .env, sans SDK réel, dans un dossier temporaire :
+    aucun ordre possible."""
+    if "main" in sys.modules:          # déjà importé (ex. par tests/) → réutiliser
+        return sys.modules["main"]
+    dotenv = types.ModuleType("dotenv"); dotenv.load_dotenv = lambda *a, **k: None
+    sys.modules["dotenv"] = dotenv
+    os.environ.update({"HL_PRIVATE_KEY": "0x" + "11" * 32, "HL_TESTNET": "1", "DISCORD_WEBHOOK_URL": ""})
+    class _Stub:
+        def __init__(self, *a, **k): pass
+    for name, attr in (("hyperliquid.info", "Info"), ("hyperliquid.exchange", "Exchange")):
+        mod = types.ModuleType(name); setattr(mod, attr, _Stub); sys.modules[name] = mod
+    sys.modules.setdefault("hyperliquid", types.ModuleType("hyperliquid"))
+    try:
+        import hyperliquid.utils.constants  # noqa: F401  (constantes seules, sans réseau)
+    except Exception:
+        u = types.ModuleType("hyperliquid.utils"); c = types.ModuleType("hyperliquid.utils.constants")
+        c.TESTNET_API_URL = c.MAINNET_API_URL = "http://stub"; u.constants = c
+        sys.modules["hyperliquid.utils"] = u; sys.modules["hyperliquid.utils.constants"] = c
+    cwd = os.getcwd()
+    os.chdir(tempfile.mkdtemp(prefix="bst_backtest_"))
+    sys.path.insert(0, ROOT)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            import main
+    finally:
+        os.chdir(cwd)
+    return main
 
 def _get(url: str):
     for attempt in range(4):

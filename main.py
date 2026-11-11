@@ -1,11 +1,11 @@
 """
 BotShortTrade – Hyperliquid DEX
-Stratégie par défaut (STRATEGY=trend) : tendance journalière, vote 14/28/56 j, SL 3×ATR D1
-(cf. section « Stratégie tendance journalière »).
-Ancien scalping (STRATEGY=scalp) : M15 biais → M5 confirm → M1 entrée | SL=1.5×ATR | TP=4×ATR | 5× levier
+Stratégie tendance journalière sur BTC, ETH, SOL, XRP et DOGE : vote 14/28/56 j, SL 3×ATR D1
+(cf. section « Stratégie tendance journalière » et tools/trend_backtest.py).
+L'ancien scalping M1 (aucun avantage sur le hasard après frais) a été retiré le 2026-11-11 ; il reste
+dans l'historique git (étiquette scalping-final).
 """
 import json, math, os, sys, time, traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import requests
@@ -46,43 +46,22 @@ load_dotenv()
 
 HL_PRIVATE_KEY    = os.environ["HL_PRIVATE_KEY"]
 HL_TESTNET        = os.getenv("HL_TESTNET", "1") == "1"
-_MAX_LIQ_CFG  = float(os.getenv("MAX_LIQUIDITY", 0))  # 0 = auto (solde réel)
-CAPITAL_PCT       = float(os.getenv("CAPITAL_PCT", 0.10))
-LEVERAGE          = int(os.getenv("LEVERAGE", 5))
-MIN_MOVE_PCT      = float(os.getenv("MIN_MOVE_PCT", 0.0002))
-VOL_MULTIPLIER    = float(os.getenv("VOL_MULTIPLIER", 1.0))
-# Mode fantôme seul : aucun ordre réel, les signaux qui auraient été tradés sont suivis en
-# fantôme (backtest d'octobre 2026 : aucun avantage mesurable sur le hasard après frais).
-# Les positions déjà ouvertes restent gérées (SL, trailing, zombie).
+_MAX_LIQ_CFG      = float(os.getenv("MAX_LIQUIDITY", 0))   # plafond de l'équité servant aux tailles (0 = tout le solde)
+LEVERAGE          = int(os.getenv("LEVERAGE", 5))          # levier croisé réglé avant chaque ouverture
+# Mode fantôme : aucun ordre réel, positions tendance suivies au prix moyen (validation de la mécanique)
 GHOST_ONLY        = os.getenv("GHOST_ONLY", "0") == "1"
 # Capital fictif du mode fantôme (test avant le réel) : positions fantômes calculées comme si le compte
 # avait ce montant (0 = solde réel). Ignoré en réel.
 PAPER_EQUITY      = float(os.getenv("PAPER_EQUITY", 0))
-# Stratégie active : "trend" (tendance journalière, par défaut depuis le 2026-11-02) ou "scalp"
-# (ancien scalping M1/M5 : aucun avantage sur le hasard après frais, cf. tools/backtest.py).
-# Jamais les deux : deux positions sur un même coin fusionneraient sur Hyperliquid.
-STRATEGY          = os.getenv("STRATEGY", "trend")
 TREND_EXPOSURE    = float(os.getenv("TREND_EXPOSURE", 0.5))   # notionnel total / équité, réparti sur TREND_COINS
-MAX_TRADES        = int(os.getenv("MAX_TRADES", 0))
-MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", 3.0))   # % du capital
-SESSION_START_UTC  = int(os.getenv("SESSION_START_UTC", 0))         # heure UTC (0 = minuit)
-SESSION_END_UTC    = int(os.getenv("SESSION_END_UTC", 24))          # heure UTC (24 = H24)
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")          # webhook Discord (alertes anomalies)
 EVENTS_FILE = "discord_events.jsonl"   # copie locale de chaque message Discord (relue par tools/status.py)
 HEARTBEAT_HOURS    = float(os.getenv("HEARTBEAT_HOURS", 6))          # résumé Discord périodique (0 = désactivé)
 
-# Initialisées au démarrage dans run() depuis le solde réel
-MAX_LIQUIDITY     = _MAX_LIQ_CFG if _MAX_LIQ_CFG > 0 else 100.0  # placeholder
-CAPITAL_PER_TRADE = MAX_LIQUIDITY * CAPITAL_PCT
-
-ATR_SL_MULT   = 1.5
-ATR_TP_MULT   = 4.0   # R:R ~2.7:1 (TP = 4×ATR, SL = 1.5×ATR)
-TRAIL_TRIGGER = 1.5   # activer trailing quand profit ≥ 1.5×ATR
-TRAIL_DIST    = 1.0   # trailing SL à 1×ATR du prix courant
-BE_BUFFER_PCT = 0.10  # breakeven = entrée ± 0.10 % (couvre les frais aller-retour ≈ 0.09 %)
-REGIME_REFRESH_S = 30 * 60   # recalcul du régime de marché (bougies D1)
+LOOP_SECONDS     = 60        # un cycle par minute
 LEDGER_REFRESH_S = 10 * 60   # relevé des dépôts / retraits (journal Hyperliquid)
 SL_CHECK_S       = 5 * 60    # vérification que chaque position a bien son stop-loss sur Hyperliquid
+STARTUP_RETRY_S  = 30        # équité illisible au démarrage : nouvel essai après ce délai
 
 # Stratégie tendance (cf. section « Stratégie tendance journalière » et tools/trend_backtest.py)
 TREND_LOOKBACKS    = (14, 28, 56)  # LONG si clôture D1 > celle d'il y a N jours pour 2 horizons sur 3
@@ -95,15 +74,6 @@ TREND_SLIP_OPEN    = 0.02       # prix limite d'un ordre au marché : 2 % (ouver
 TREND_SLIP_CLOSE   = 0.05       # … 5 % (fermeture)
 TREND_SLIP_SL      = 0.10       # … 10 % au-delà du déclenchement (stop-loss)
 TREND_COINS        = ["BTC", "ETH", "SOL", "XRP", "DOGE"]   # BTC a remplacé LTC le 2026-11-03
-
-# Mode fantôme : suivi virtuel des signaux NON tradés (filtrés, bloqués par régime, sans slot)
-GHOST_FILE      = "ghosts.json"
-GHOST_MAX_HOURS = 6.0    # un fantôme non résolu est clos au prix courant après 6h (cf. zombie)
-GHOST_FEE_PCT   = 0.09   # frais taker aller-retour estimés, déduits du P&L virtuel
-GHOST_WEIGHT    = 0.5    # poids d'un résultat fantôme vs un vrai trade dans l'apprentissage
-GHOST_VOL_MIN   = 0.8    # MR rejeté par le seul volume M5 avec ratio ≥ 0.8 → fantôme "MRv"
-                         # (mesure ce que rapporterait un VOL_MULTIPLIER plus bas ; jamais appris)
-LESSON_DECAY    = 0.97   # oubli progressif : chaque nouveau résultat × 0.97 sur l'ancien (demi-vie ≈ 23)
 
 # ── Connexion Hyperliquid ──────────────────────────────────────────────────────
 _account       = Account.from_key(HL_PRIVATE_KEY)
@@ -121,17 +91,9 @@ print(f"  Réseau : {_net_color}{'TESTNET' if HL_TESTNET else 'MAINNET'}{C.RST}"
 if GHOST_ONLY:
     print(f"  Mode   : {C.BYLW}FANTÔME SEUL — aucun ordre réel (GHOST_ONLY=1){C.RST}")
 
-# ── Symboles ───────────────────────────────────────────────────────────────────
-WATCHLIST = ["ETH", "LTC", "DOGE", "XRP", "SOL"]   # BTC retiré : 0W/15L −$12.83 historique
-SYM_LABEL   = {c: f"{c}/USDT" for c in WATCHLIST + TREND_COINS}
-SYM_BYBIT   = {c: f"{c}USDT" for c in WATCHLIST + TREND_COINS}   # format Bybit
-
-INTERVAL_M1  = "1m"
-INTERVAL_M5  = "5m"
-INTERVAL_M15 = "15m"
+# ── Bougies journalières (Bybit, sans clé API) ─────────────────────────────────
 INTERVAL_D1  = "1D"
-_BYBIT_IV    = {"1m": "1", "5m": "5", "15m": "15", "1D": "D"}  # Bybit interval codes
-
+_BYBIT_IV    = {"1D": "D"}   # code d'intervalle Bybit
 BYBIT_KLINE  = "https://api.bybit.com/v5/market/kline"
 
 # ── Filtres instruments ────────────────────────────────────────────────────────
@@ -142,19 +104,14 @@ def _flt(coin: str) -> dict:
     return _sym_filters.get(coin, {"sz_dec": 3, "sz_step": 0.001})
 
 def init_exchange_info() -> bool:
-    """Charge le pas de taille (szDecimals) de chaque coin ; False si Hyperliquid ne répond pas."""
+    """Charge le pas de taille (szDecimals) de tous les coins de Hyperliquid : une position sur un coin
+    retiré de TREND_COINS doit encore pouvoir être renforcée puis fermée. False si Hyperliquid ne répond pas."""
     global _sym_filters, _sym_filters_ok
     try:
         meta = info.meta()
         for item in meta.get("universe", []):
-            coin = item.get("name", "")
-            if coin in set(WATCHLIST) | set(TREND_COINS):
-                sz_dec = int(item.get("szDecimals", 3))
-                _sym_filters[coin] = {
-                    "sz_dec":  sz_dec,
-                    "sz_step": 10 ** (-sz_dec),
-                    "max_lev": int(item.get("maxLeverage", 50)),
-                }
+            sz_dec = int(item.get("szDecimals", 3))
+            _sym_filters[item.get("name", "")] = {"sz_dec": sz_dec, "sz_step": 10 ** (-sz_dec)}
         print(f"  Exchange info : {len(_sym_filters)} symboles chargés")
         _sym_filters_ok = True
     except Exception as e:
@@ -162,30 +119,17 @@ def init_exchange_info() -> bool:
         _sym_filters_ok = False
     return _sym_filters_ok
 
-# ── Excel ──────────────────────────────────────────────────────────────────────
+# ── Excel (trades.xlsx) ────────────────────────────────────────────────────────
+# Onglet « Tendance » : une ligne par position. Les onglets de l'ancien scalping (« Trades »,
+# « Fantômes ») restent dans le fichier comme historique, sans être modifiés.
 EXCEL_FILE = "trades.xlsx"
-STATE_FILE = "bot_state.json"
-COL_HEADERS = [
-    "ID Ordre", "Date/Heure", "Symbole", "Côté", "Qté", "Prix entrée",
-    "SL", "TP", "ATR M5", "Notionnel $", "P&L TP $", "P&L SL $",
-    "Prix actuel", "Statut", "P&L final $",
-    "Mode", "Régime", "Score",   # ajoutés en fin pour garder les index existants (analyze_weekly)
-    "Fermé (UTC)",               # date de fermeture → P&L du jour (col. 19)
-]
+STATE_FILE = "bot_state.json"   # référence du « % depuis le départ » et dernier relevé des dépôts
 
 _FILLS = {
     "header": PatternFill("solid", fgColor="1F3864"),
-    "buy":    PatternFill("solid", fgColor="D9EAD3"),
-    "sell":   PatternFill("solid", fgColor="FCE5CD"),
-    "tp":     PatternFill("solid", fgColor="B6D7A8"),
-    "sl":     PatternFill("solid", fgColor="EA9999"),
-    "open":   PatternFill("solid", fgColor="FFF2CC"),
+    "tp":     PatternFill("solid", fgColor="B6D7A8"),   # position fermée en gain
+    "sl":     PatternFill("solid", fgColor="EA9999"),   # position fermée en perte
 }
-
-GHOST_HEADERS = [
-    "ID", "Ouvert (UTC)", "Symbole", "Côté", "Mode", "Régime", "Score", "Raison",
-    "Entrée", "SL", "TP", "Statut", "Sortie", "P&L %", "Fermé (UTC)",
-]
 
 TREND_HEADERS = [
     "ID", "Ouvert (UTC)", "Symbole", "Côté", "Mode", "Qté", "Entrée", "SL",
@@ -207,34 +151,17 @@ def _ensure_sheet(wb: Workbook, name: str, headers: list[str]) -> bool:
     ws.column_dimensions["A"].width = 24
     return True
 
-def _ensure_extra_sheets(wb: Workbook) -> bool:
-    """Crée les feuilles 'Fantômes' (scalping) et 'Tendance' si absentes. True si une est créée."""
-    created = _ensure_sheet(wb, "Fantômes", GHOST_HEADERS)
-    if created:
-        wb["Fantômes"].column_dimensions["H"].width = 22
-    return _ensure_sheet(wb, "Tendance", TREND_HEADERS) or created
-
 def _safe_save(wb: Workbook):
     tmp = EXCEL_FILE + ".tmp"
     wb.save(tmp)
     os.replace(tmp, EXCEL_FILE)
 
 def init_excel() -> Workbook:
+    """trades.xlsx, avec son onglet « Tendance » (créé s'il manque)."""
     if os.path.exists(EXCEL_FILE):
         try:
             wb = openpyxl.load_workbook(EXCEL_FILE)
-            ws = wb["Trades"]
-            # Migration : ajoute les en-têtes manquants d'un fichier créé avec moins de colonnes
-            created = _ensure_extra_sheets(wb)
-            if ws.max_column < len(COL_HEADERS):
-                for c in range(ws.max_column + 1, len(COL_HEADERS) + 1):
-                    cell = ws.cell(1, c, COL_HEADERS[c - 1])
-                    cell.fill = _FILLS["header"]
-                    cell.font = Font(bold=True, color="FFFFFF")
-                    cell.alignment = Alignment(horizontal="center")
-                    ws.column_dimensions[get_column_letter(c)].width = 14
-                created = True
-            if created:
+            if _ensure_sheet(wb, "Tendance", TREND_HEADERS):
                 _safe_save(wb)
             return wb
         except Exception as e:
@@ -249,226 +176,21 @@ def init_excel() -> Workbook:
                                f"Copie gardée sous `{bad}` ; un nouveau fichier est créé. Les positions "
                                f"et les SL ne sont pas touchés.\nErreur : `{str(e)[:300]}`", color=0xf39c12)
     wb = Workbook()
-    ws = wb.active
-    ws.title = "Trades"
-    ws.append(COL_HEADERS)
-    for c in range(1, len(COL_HEADERS) + 1):
-        cell = ws.cell(1, c)
-        cell.fill = _FILLS["header"]
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.alignment = Alignment(horizontal="center")
-    ws.column_dimensions["A"].width = 22
-    ws.column_dimensions["B"].width = 18
-    for i in range(3, len(COL_HEADERS) + 1):
-        ws.column_dimensions[get_column_letter(i)].width = 14
-    _ensure_extra_sheets(wb)
+    wb.remove(wb.active)   # feuille vide créée par défaut
+    _ensure_sheet(wb, "Tendance", TREND_HEADERS)
     _safe_save(wb)
     return wb
-
-def _find_row(ws, order_id: str) -> int | None:
-    for row in ws.iter_rows(min_row=2, values_only=False):
-        if str(row[0].value) == str(order_id):
-            return row[0].row
-    return None
-
-def log_order(wb: Workbook, order_id, coin, side, qty, entry, sl, tp, atr, notional, pnl_tp, pnl_sl,
-              mode: str = "", regime: str = "", score: float | None = None):
-    ws = wb["Trades"]
-    fill = _FILLS["buy"] if side == "BUY" else _FILLS["sell"]
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-    row = [order_id, ts, SYM_LABEL[coin], side, qty, entry, sl, tp, round(atr, 6),
-           notional, pnl_tp, pnl_sl, entry, "Ordre placé", "", mode, regime, score]
-    ws.append(row)
-    for cell in ws[ws.max_row]:
-        cell.fill = fill
-    _safe_save(wb)
-
-def update_order_live(wb: Workbook, order_id, current_px):
-    ws = wb["Trades"]
-    r = _find_row(ws, order_id)
-    if r:
-        ws.cell(r, 13).value = round(current_px, 6)
-        _safe_save(wb)
-
-def update_order_status(wb: Workbook, order_id, status: str, pnl: float | None = None):
-    ws = wb["Trades"]
-    r = _find_row(ws, order_id)
-    if not r:
-        return
-    ws.cell(r, 14).value = status
-    if pnl is not None:
-        ws.cell(r, 15).value = round(pnl, 2)
-        ws.cell(r, 19).value = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-    fill = _FILLS["tp"] if "TP" in status else (_FILLS["sl"] if "SL" in status else _FILLS["open"])
-    for c in range(1, len(COL_HEADERS) + 1):
-        ws.cell(r, c).fill = fill
-    _safe_save(wb)
-
-# ── Journalisation ────────────────────────────────────────────────────────────
-_scan_log:  list[dict] = []
-_last_scan: list[dict] = []   # snapshot du dernier scan complet (pour le dashboard)
-_reject_stats: dict[str, int] = {}   # 1er filtre bloquant par symbole scanné sans signal (heartbeat)
-_ghost_candidates: list[dict] = []   # signaux bloqués dans get_signal (MOM/BBO hors régime) → mode fantôme
-
-# ── Apprentissage des erreurs ──────────────────────────────────────────────────
-LESSONS_FILE    = "lessons.json"
-_current_regime = "RANGING"   # mis à jour dans run() avant chaque scan
-
-# Cache en mémoire pour lessons.json — évite 7 lectures JSON par cycle (1 par coin + dashboard)
-_lessons_cache:    dict  = {}
-_lessons_cache_ts: float = 0.0
-_LESSONS_CACHE_TTL = 300.0  # 5 min — les leçons changent rarement
-
-def _load_lessons() -> dict:
-    global _lessons_cache, _lessons_cache_ts
-    now = time.time()
-    if now - _lessons_cache_ts > _LESSONS_CACHE_TTL or not _lessons_cache:
-        try:
-            with open(LESSONS_FILE, encoding="utf-8") as f:
-                _lessons_cache = json.load(f)
-            _lessons_cache_ts = now
-        except Exception:
-            _lessons_cache = {"buckets": {}}
-    return _lessons_cache
-
-def _save_lessons(data: dict):
-    global _lessons_cache, _lessons_cache_ts
-    data["updated_at"] = datetime.now(timezone.utc).isoformat()
-    tmp = LESSONS_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, LESSONS_FILE)
-    # Invalider le cache pour que le prochain _load_lessons() lise la version fraîche
-    _lessons_cache    = data
-    _lessons_cache_ts = time.time()
-
-def _lesson_buckets(coin: str, side: str, rsi: float, bbp: float,
-                    regime: str, mode: str) -> list[str]:
-    """Retourne les clés de bucket statistiques pour un trade donné."""
-    s = side.lower()
-    # Bucket RSI selon direction et mode
-    if s == "buy" and mode == "BBO":
-        rsi_tag = "rsi50-62" if rsi < 62 else ("rsi62-70" if rsi < 70 else "rsi70-75")
-    elif s == "buy":
-        rsi_tag = "rsi<45" if rsi < 45 else ("rsi45-55" if rsi < 55 else "rsi55-70")
-    elif mode == "MOM":
-        rsi_tag = "rsi<20" if rsi < 20 else "rsi20-35"
-    else:  # SELL MR
-        rsi_tag = "rsi35-50" if rsi < 50 else "rsi50-65"
-    # Bucket BBP selon direction et mode
-    if s == "buy" and mode == "BBO":
-        bbp_tag = "bbp0.85-1.0" if bbp < 1.0 else "bbp>1.0"
-    elif s == "buy":
-        bbp_tag = "bbp<0.20" if bbp < 0.20 else "bbp0.20-0.40"
-    elif mode == "MOM":
-        bbp_tag = "bbp<0.20" if bbp < 0.20 else "bbp0.20-0.35"
-    else:  # SELL MR
-        bbp_tag = "bbp>0.80" if bbp > 0.80 else "bbp0.65-0.80"
-    return [
-        f"{rsi_tag}|{s}|{mode}",      # ex: "rsi45-55|buy|MR"
-        f"{bbp_tag}|{s}|{mode}",      # ex: "bbp0.20-0.40|buy|MR"
-        f"regime_{regime}|{s}|{mode}", # ex: "regime_RANGING|buy|MR"
-        f"coin_{coin}|{s}",            # ex: "coin_AVAX|buy"
-    ]
-
-def _bucket_stats(b: dict) -> tuple[float, float]:
-    """(nb effectif de trades, win rate) d'un bucket — fantômes pondérés par GHOST_WEIGHT."""
-    w = b.get("w", 0) + GHOST_WEIGHT * b.get("gw", 0)
-    n = w + b.get("l", 0) + GHOST_WEIGHT * b.get("gl", 0)
-    return n, (w / n if n else 0.5)
-
-def record_lesson(position: dict, outcome: str, pnl: float, ghost: bool = False):
-    """Enregistre le résultat d'un trade (réel : pnl en $, fantôme : pnl en %) dans les buckets.
-    Oubli progressif : les compteurs existants sont multipliés par LESSON_DECAY à chaque
-    nouveau résultat → les trades récents pèsent plus que les anciens."""
-    cond = position.get("conditions")
-    if not cond:
-        return
-    data    = _load_lessons()
-    buckets = data.setdefault("buckets", {})
-    keys    = _lesson_buckets(
-        position["symbol"], position["side"],
-        cond.get("rsi", 50.0), cond.get("bbp", 0.5),
-        cond.get("regime", "RANGING"), cond.get("mode", "MR")
-    )
-    win = pnl > 0   # P&L net : un TRAIL/breakeven fermé à perte (frais) n'est pas une victoire
-    for k in keys:
-        b = buckets.setdefault(k, {"w": 0, "l": 0, "pnl": 0.0})
-        for f in ("w", "l", "gw", "gl"):
-            if f in b:
-                b[f] = round(b[f] * LESSON_DECAY, 4)
-        if ghost:
-            f = "gw" if win else "gl"
-            b[f] = round(b.get(f, 0) + 1, 4)
-            b["gpnl_pct"] = round(b.get("gpnl_pct", 0.0) + pnl, 3)
-        else:
-            f = "w" if win else "l"
-            b[f] = round(b[f] + 1, 4)
-            b["pnl"] = round(b["pnl"] + pnl, 2)
-    _save_lessons(data)
-    # Afficher une alerte si un bucket devient clairement mauvais (même seuil MIN_SAMPLES que la pénalité)
-    if not win:
-        for k in keys:
-            n, wr = _bucket_stats(buckets[k])
-            if n >= 5 and wr < 0.35:
-                print(f"  {C.BYLW}[LEÇON]{C.RST} Pattern risqué détecté : {C.BOLD}{k}{C.RST} "
-                      f"WR={wr*100:.0f}% (n={n:.1f})")
-
-def get_penalty(coin: str, side: str, rsi: float, bbp: float,
-                regime: str, mode: str) -> float:
-    """Ajustement de score appris : > 0 = pénalité (historique mauvais), < 0 = bonus (bon).
-    Réels + fantômes (pondérés), avec oubli progressif (cf. record_lesson)."""
-    MIN_SAMPLES = 5   # n effectif minimum dans le bucket
-    data    = _load_lessons()
-    buckets = data.get("buckets", {})
-    keys    = _lesson_buckets(coin, side, rsi, bbp, regime, mode)
-    penalty = 0.0
-    for k in keys:
-        b = buckets.get(k)
-        if not b:
-            continue
-        n, wr = _bucket_stats(b)
-        if n < MIN_SAMPLES:
-            continue
-        if wr < 0.40:
-            penalty += (0.40 - wr) * 0.5   # win_rate=20% → +0.10 | 30% → +0.05
-        elif wr > 0.60:
-            penalty -= (wr - 0.60) * 0.5   # win_rate=80% → bonus 0.10
-    return round(max(-0.15, min(penalty, 0.25)), 3)   # bonus max 0.15, pénalité max 0.25
-
-def print_lessons_summary():
-    """Affiche les patterns actuellement pénalisés (si assez de données)."""
-    data    = _load_lessons()
-    buckets = data.get("buckets", {})
-    MIN_SAMPLES = 5
-    active = [(k, v, *_bucket_stats(v)) for k, v in buckets.items()]
-    active = [a for a in active if a[2] >= MIN_SAMPLES and (a[3] < 0.40 or a[3] > 0.60)]
-    if not active:
-        return
-    print(f"\n  {C.BYLW}── Leçons actives ({len(active)} patterns pénalisés/favorisés) ──{C.RST}")
-    for k, v, n, wr in sorted(active, key=lambda a: a[3]):
-        if wr < 0.40:
-            tag = f"{C.BRED}▸ {k}{C.RST}  pénalité=−{min((0.40 - wr) * 0.5, 0.25):.3f}"
-        else:
-            tag = f"{C.BGRN}▸ {k}{C.RST}  bonus=+{min((wr - 0.60) * 0.5, 0.15):.3f}"
-        print(f"    {tag}  WR={wr*100:.0f}% (n={n:.1f}, dont fantômes {v.get('gw', 0) + v.get('gl', 0):.1f})  "
-              f"P&L réel={_cp(v.get('pnl', 0))}${v.get('pnl', 0):+.2f}{C.RST}")
 
 def log_error(msg: str):
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     print(f"  {C.BRED}[ERR {ts}]{C.RST} {msg}")
 
-def log_scan(coin: str, tf: str, signal: str | None, score: float, details: str):
-    _scan_log.append({"ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
-                      "coin": coin, "tf": tf, "signal": signal,
-                      "score": score, "details": details})
-
 # ── Bougies — données Bybit public (sans clé API) ────────────────────────────
 def fetch_candles(coin: str, interval: str, count: int, drop_incomplete: bool = True) -> list[dict]:
-    symbol   = SYM_BYBIT.get(coin, f"{coin}USDT")   # BTC hors watchlist mais utilisé pour le régime
+    symbol   = f"{coin}USDT"
     iv       = _BYBIT_IV[interval]
     last_err: Exception | None = None
-    for attempt in range(3):   # 2 retries (rate limit Bybit ponctuel : 15 requêtes simultanées)
+    for attempt in range(3):   # 2 retries (limite de débit ou panne passagère de Bybit)
         try:
             resp = requests.get(BYBIT_KLINE, params={
                 "category": "linear",
@@ -497,26 +219,10 @@ def fetch_candles(coin: str, interval: str, count: int, drop_incomplete: bool = 
                 time.sleep(0.5 + attempt)   # 0.5 s puis 1.5 s avant de réessayer
     raise last_err  # type: ignore[misc]
 
-# ── Indicateurs ───────────────────────────────────────────────────────────────
-def _ema(closes: list[float], n: int) -> list[float]:
-    """EMA initialisée sur la SMA des n premières valeurs (standard Bloomberg/TradingView).
-    Évite la dérive des 20-30 premières bougies qu'on obtient en seedant sur closes[0]."""
-    if len(closes) < n:
-        # Pas assez de données — seed minimal
-        k = 2 / (n + 1)
-        ema = [closes[0]]
-        for p in closes[1:]:
-            ema.append(p * k + ema[-1] * (1 - k))
-        return ema
-    k = 2 / (n + 1)
-    ema = [sum(closes[:n]) / n]   # seed = SMA(n) — convergence quasi-immédiate
-    for p in closes[n:]:
-        ema.append(p * k + ema[-1] * (1 - k))
-    return ema
-
+# ── Indicateur ────────────────────────────────────────────────────────────────
 def _atr(candles: list[dict], n: int = 14) -> float:
-    """ATR de Wilder initialisé sur la SMA des n premières TR (même logique que _ema).
-    Un ATR mal initialisé fausse directement les niveaux SL/TP."""
+    """ATR de Wilder initialisé sur la SMA des n premières TR (convergence immédiate).
+    Un ATR mal initialisé fausse directement le niveau du SL."""
     trs = []
     for i in range(1, len(candles)):
         c  = candles[i]
@@ -532,237 +238,7 @@ def _atr(candles: list[dict], n: int = 14) -> float:
         atr = tr * k + atr * (1 - k)
     return atr
 
-def _rsi(closes: list[float], n: int = 5) -> float:
-    if len(closes) < n + 1:
-        return 50.0
-    gains, losses = [], []
-    for i in range(-n, 0):
-        d = closes[i] - closes[i - 1]
-        gains.append(max(d, 0))
-        losses.append(max(-d, 0))
-    ag, al = sum(gains) / n, sum(losses) / n
-    if al == 0:
-        return 100.0
-    return 100 - 100 / (1 + ag / al)
-
-def _vwap(candles: list[dict]) -> float:
-    num = sum(((c["h"] + c["l"] + c["c"]) / 3) * c["v"] for c in candles)
-    den = sum(c["v"] for c in candles)
-    return num / den if den else 0.0
-
-def _bb(closes: list[float], n: int = 20, k: float = 2.0) -> tuple[float, float, float, float]:
-    """
-    Bollinger Bands sur les n dernières closes.
-    Retourne (upper, middle, lower, bbp) où :
-      bbp = (close - lower) / (upper - lower)
-      bbp < 0  → prix sous la bande basse  (extrême oversold)
-      0..0.5   → moitié basse de la range
-      0.5..1   → moitié haute de la range
-      bbp > 1  → prix au-dessus de la bande haute (extrême overbought)
-    """
-    window = closes[-n:]
-    mid    = sum(window) / len(window)
-    var    = sum((p - mid) ** 2 for p in window) / len(window)
-    std    = var ** 0.5
-    upper  = mid + k * std
-    lower  = mid - k * std
-    bbp    = (closes[-1] - lower) / (upper - lower) if upper != lower else 0.5
-    return upper, mid, lower, round(bbp, 3)
-
-def _avg_vol(candles: list[dict], n: int = 20) -> float:
-    vols = [c["v"] for c in candles[-n:]]
-    return sum(vols) / len(vols) if vols else 0.0
-
-# ── Signal multi-timeframe ────────────────────────────────────────────────────
-# Scores par mode (vol = ratio volume M5 plafonné à 3) — partagés par les signaux réels et fantômes
-def _score_mr_buy(rsi1: float, bbp5: float, vol: float) -> float:
-    return round((70 - rsi1) / 40 * 0.25 + vol * 0.4 + (0.35 - bbp5) / 0.35 * 0.15 + 0.2, 3)
-
-def _score_mr_sell(rsi1: float, bbp5: float, vol: float) -> float:
-    return round((rsi1 - 35) / 30 * 0.25 + vol * 0.4 + (bbp5 - 0.65) / 0.35 * 0.15 + 0.2, 3)
-
-def _score_mom(rsi1: float, bbp5: float, vol: float) -> float:
-    return round(vol * 0.5 + max(0.0, (35 - rsi1) / 35) * 0.25 + max(0.0, (0.35 - bbp5) / 0.35) * 0.25, 3)
-
-def _score_bbo(rsi5: float, bbp5: float, vol: float) -> float:
-    return round(vol * 0.50 + max(0.0, (85 - rsi5) / 40) * 0.30 + min(1.0, (bbp5 - 0.75) / 0.50) * 0.20, 3)
-
-def get_signal(coin: str) -> dict | None:
-    try:
-        c15 = fetch_candles(coin, INTERVAL_M15, 50)
-        c5  = fetch_candles(coin, INTERVAL_M5,  50)
-        c1  = fetch_candles(coin, INTERVAL_M1,  30)
-        if len(c15) < 25 or len(c5) < 20 or len(c1) < 16:
-            return None
-
-        # M15 biais (EMA20 — plus stable que EMA8 pour filtrer la tendance)
-        ema20_15 = _ema([c["c"] for c in c15], 20)
-        bias_up = c15[-1]["c"] > ema20_15[-1]
-        bias_dn = c15[-1]["c"] < ema20_15[-1]
-
-        # M5 confirmation (VWAP + EMA8 + ATR + Bollinger Bands)
-        closes5 = [c["c"] for c in c5]
-        ema8_5  = _ema(closes5, 8)
-        vwap5   = _vwap(c5)
-        atr5    = _atr(c5, 14)
-        last5   = closes5[-1]
-        move_pct = abs(last5 - closes5[-2]) / closes5[-2] if closes5[-2] else 0
-        _, _, _, bbp5 = _bb(closes5, n=20, k=2.0)
-
-        confirm_long  = last5 > ema8_5[-1] and last5 > vwap5
-        confirm_short = last5 < ema8_5[-1] and last5 < vwap5
-        # MR BUY (lower BB) : rebond court-terme → EMA8 suffit, VWAP non requis
-        confirm_long_mr  = last5 > ema8_5[-1]
-
-        avg_vol5 = _avg_vol(c5, 50)   # 50 bougies ≈ 4h → baseline plus stable que 20 (1h40)
-        vol_ok   = c5[-1]["v"] >= avg_vol5 * VOL_MULTIPLIER
-        move_ok  = move_pct >= MIN_MOVE_PCT
-
-        # BBP : prix dans la zone basse pour BUY, haute pour SELL
-        # 0.35 = tiers bas strict (tiers inférieur)  |  0.65 = tiers haut
-        bb_long_ok  = bbp5 <= 0.35   # seuil strict — plus oversold = rebond plus probable
-        bb_short_ok = bbp5 >= 0.65
-
-        # M5 RSI (stable — pour BBO breakout, évite les spikes M1)
-        rsi5 = _rsi(closes5, 14)
-
-        # M1 entrée (RSI14 + volume)
-        closes1  = [c["c"] for c in c1]
-        rsi1     = _rsi(closes1, 14)
-        avg_vol1 = _avg_vol(c1)
-        vol1_ok  = c1[-1]["v"] >= avg_vol1   # M1 : seuil simple — le M5 filtre déjà à ×1.2
-
-        # Confirmation directionnelle M5 :
-        # MR (mean-reversion) : 2 bougies suffisent — la consolidation génère des candles mixtes
-        # MOM (momentum)      : 3 bougies requises — signal de force, pas de compromis
-        bars2_bull = all(c5[-i]["c"] > c5[-i]["o"] for i in range(1, 3))
-        bars2_bear = all(c5[-i]["c"] < c5[-i]["o"] for i in range(1, 3))
-        bars3_bull = all(c5[-i]["c"] > c5[-i]["o"] for i in range(1, 4))
-        bars3_bear = all(c5[-i]["c"] < c5[-i]["o"] for i in range(1, 4))
-
-        signal    = None
-        score     = 0.0
-        mode      = ""
-        vol_ratio        = c5[-1]["v"] / avg_vol5 if avg_vol5 else 1.0
-        vol_ratio_capped = min(vol_ratio, 3.0)  # spike >3× ignoré pour le score — évite les faux signaux sur panique
-
-        base_mr_long = vol_ok and move_ok and vol1_ok and bars2_bull   # BUY MR  : 2 bougies
-        base_mr_sht  = vol_ok and move_ok and vol1_ok and bars2_bear   # SELL MR : 2 bougies
-        base_mom_sht = vol_ok and move_ok and vol1_ok and bars3_bear   # SELL MOM: 3 bougies
-
-        # Conditions MOM / BBO hors filtre de régime : si le régime les bloque,
-        # le signal est quand même suivi en fantôme (pour savoir s'il aurait gagné)
-        mom_cond = bias_dn and confirm_short and base_mom_sht and rsi1 <= 35 and bbp5 <= 0.35
-        bbo_cond = (bias_up and confirm_long and vol_ok and move_ok and 45 <= rsi5 <= 85
-                    and bbp5 >= 0.75)
-
-        # ── BUY mean-reversion : RSI en zone neutre, prix bas de la bande ──────
-        # bb_long_ok = bbp5 <= 0.35 (tiers inférieur strict — plus oversold que 0.40)
-        if bias_up and confirm_long_mr and base_mr_long and 30 <= rsi1 <= 70 and bb_long_ok:
-            signal, mode = "buy", "MR"
-            score = _score_mr_buy(rsi1, bbp5, vol_ratio_capped)
-
-        # ── SELL mean-reversion : RSI neutre, prix haut de la bande ─────────────
-        # confirm_short_mr supprimé — était toujours True (bb_short_ok est déjà requis)
-        elif bias_dn and base_mr_sht and 35 <= rsi1 <= 65 and bb_short_ok:
-            signal, mode = "sell", "MR"
-            score = _score_mr_sell(rsi1, bbp5, vol_ratio_capped)
-
-        # ── SELL momentum : crash/tendance forte — prix sous la bande basse ─────
-        # RSI extrême (<= 35) + prix cassant sous la BB + toute la structure baissière
-        # Bloqué en RANGING : 40% WR, −$10.42 historique (rebonds fréquents en range)
-        elif mom_cond and _current_regime != "RANGING":
-            signal, mode = "sell", "MOM"
-            score = _score_mom(rsi1, bbp5, vol_ratio_capped)   # RSI plus bas = momentum plus fort
-
-        # ── BUY breakout : cassure haussière au-dessus de la BB haute ────────────
-        # BULL uniquement : 69% WR, +$34.75 historique
-        # RANGING bloqué  : 44% WR, −$11.62 (les cassures en range échouent trop souvent)
-        # Utilise rsi5 (M5, 14 périodes) — stable pendant les pompes, contrairement à rsi1
-        # qui monte à 90+ en quelques minutes M1 et bloque tous les signaux de breakout.
-        elif bbo_cond and _current_regime == "BULL":
-            signal, mode = "buy", "BBO"
-            score = _score_bbo(rsi5, bbp5, vol_ratio_capped)   # cassure plus forte = mieux
-
-        bars3_str = ("3×↑" if bars3_bull else ("3×↓" if bars3_bear else
-                     ("2×↑" if bars2_bull else ("2×↓" if bars2_bear else "✗"))))
-        details = (f"M15={'↑' if bias_up else '↓'} M5={'↑' if confirm_long_mr else '↓'} "
-                   f"RSI={rsi1:.1f} BBP={bbp5:.2f} vol={c5[-1]['v']:.2f}/{avg_vol5:.2f} {bars3_str}"
-                   + (f" [{mode}]" if mode else ""))
-
-        # Signal bloqué par le régime → candidat fantôme (jamais tradé)
-        if not signal and (mom_cond or bbo_cond):
-            if mom_cond:
-                g_side, g_mode, g_score = "sell", "MOM", _score_mom(rsi1, bbp5, vol_ratio_capped)
-            else:
-                g_side, g_mode, g_score = "buy", "BBO", _score_bbo(rsi5, bbp5, vol_ratio_capped)
-            _ghost_candidates.append({
-                "symbol": coin, "signal": g_side, "score": g_score, "atr_m5": atr5, "price": last5,
-                "conditions": {"rsi": round(rsi1, 1), "bbp": round(bbp5, 3),
-                               "vol_ratio": round(vol_ratio, 2),
-                               "regime": _current_regime, "mode": g_mode},
-                "ghost_reason": f"{g_mode} bloqué {_current_regime}",
-            })
-
-        # MR rejeté uniquement par le volume M5 (de justesse) → fantôme "MRv" (observation seule)
-        mr_buy_nv  = (bias_up and confirm_long_mr and move_ok and vol1_ok and bars2_bull
-                      and 30 <= rsi1 <= 70 and bb_long_ok)
-        mr_sell_nv = (bias_dn and move_ok and vol1_ok and bars2_bear
-                      and 35 <= rsi1 <= 65 and bb_short_ok)
-        if (not signal and not vol_ok and vol_ratio >= GHOST_VOL_MIN
-                and (mr_buy_nv or mr_sell_nv)):
-            if mr_buy_nv:
-                g_side, g_score = "buy", _score_mr_buy(rsi1, bbp5, vol_ratio_capped)
-            else:
-                g_side, g_score = "sell", _score_mr_sell(rsi1, bbp5, vol_ratio_capped)
-            _ghost_candidates.append({
-                "symbol": coin, "signal": g_side, "score": g_score, "atr_m5": atr5,
-                "price": last5,
-                "conditions": {"rsi": round(rsi1, 1), "bbp": round(bbp5, 3),
-                               "vol_ratio": round(vol_ratio, 2),
-                               "regime": _current_regime, "mode": "MRv"},
-                "ghost_reason": f"MR volume ×{vol_ratio:.2f}<{VOL_MULTIPLIER:g}",
-            })
-
-        if signal:
-            # Appliquer l'ajustement appris (pénalité si historique mauvais, bonus s'il est bon)
-            penalty = get_penalty(coin, signal, rsi1, bbp5, _current_regime, mode)
-            if penalty:
-                old_score = score
-                score = max(0.0, round(score - penalty, 3))
-                details += f" ⚠pén−{penalty}" if penalty > 0 else f" ✓bonus+{-penalty}"
-                log_scan(coin, "M15/M5/M1", signal, score,
-                         details + f" [score {old_score:.3f}→{score:.3f} après leçon]")
-            else:
-                log_scan(coin, "M15/M5/M1", signal, score, details)
-            return {
-                "symbol": coin, "signal": signal, "score": score,
-                "atr_m5": atr5, "price": last5,
-                "conditions": {
-                    "rsi": round(rsi1, 1), "bbp": round(bbp5, 3),
-                    "vol_ratio": round(vol_ratio, 2),
-                    "regime": _current_regime, "mode": mode,
-                }
-            }
-
-        # Diagnostic : premier filtre qui a empêché un signal (agrégé dans le heartbeat)
-        _why = ("volume M5"   if not vol_ok else
-                "mouvement"   if not move_ok else
-                "volume M1"   if not vol1_ok else
-                "bougies M5"  if not (bars2_bull or bars2_bear) else
-                f"MOM bloqué {_current_regime}" if mom_cond else
-                f"BBO bloqué {_current_regime}" if bbo_cond else
-                "biais/RSI/BBP")
-        _reject_stats[_why] = _reject_stats.get(_why, 0) + 1
-
-        log_scan(coin, "M15/M5/M1", signal, score, details)
-        return None
-
-    except Exception as e:
-        log_error(f"Signal {coin}: {e}")
-        return None
-
-# ── Balance (affichage uniquement) ───────────────────────────────────────────
+# ── Équité du compte ──────────────────────────────────────────────────────────
 _unified: bool | None = None   # compte en mode Unified Hyperliquid ? (réglage du compte, lu une fois)
 
 def _unified_account() -> bool:
@@ -795,66 +271,6 @@ def get_equity(cached_state: dict | None = None) -> float:
     # Compte classique : perp et spot sont séparés → somme des deux.
     total = spot_usdc if _unified_account() else acv + spot_usdc
     return total if total > 0 else 0.0
-
-def account_coins(user_state: dict | None) -> set[str]:
-    """Coins ayant une position ouverte sur le compte (nos trades ET ceux de BotCopyTrade,
-    qui partage le wallet)."""
-    return {ap["position"]["coin"] for ap in (user_state or {}).get("assetPositions", [])
-            if abs(float(ap["position"].get("szi") or 0)) > 0}
-
-def get_unrealized_pnl(cached_state: dict | None = None, coins: set[str] | None = None) -> float:
-    """P&L latent ; coins = nos positions seulement (exclut celles de BotCopyTrade)."""
-    try:
-        state = cached_state if cached_state is not None else info.user_state(WALLET_ADDRESS)
-        return sum(float(p["position"]["unrealizedPnl"]) for p in state.get("assetPositions", [])
-                   if coins is None or p["position"]["coin"] in coins)
-    except Exception:
-        return 0.0
-
-def get_market_regime() -> tuple[str, str, float, float]:
-    """
-    Analyse BTC et ETH sur 7 jours — 4 régimes (inspiré de tbot) :
-      BULL      : moyenne BTC/ETH > +5%            → trade normal, favorise BUY
-      BEAR      : moyenne BTC/ETH < -5%            → aucun nouveau trade
-      RANGING   : moyenne dans ±5%                 → exige score élevé
-      DIVERGING : l'un monte, l'autre descend      → aucun nouveau trade (marché incohérent)
-
-    Confirmation court-terme (3j) : si BULL sur 7j mais recul > -2% sur 3j → RANGING
-    (évite les signaux BBO breakout pendant les pullbacks d'un bull market)
-
-    Retourne (regime, bias, btc_chg_pct, eth_chg_pct) ; RANGING si les données sont indisponibles.
-    """
-    try:
-        return _compute_regime()
-    except Exception:
-        return "RANGING", "neutral", 0.0, 0.0   # safe default
-
-def _compute_regime() -> tuple[str, str, float, float]:
-    """Cf. get_market_regime ; lève une exception si les bougies D1 sont indisponibles."""
-    btc = fetch_candles("BTC", INTERVAL_D1, 8)
-    eth = fetch_candles("ETH", INTERVAL_D1, 8)
-    btc_chg = (btc[-1]["c"] - btc[0]["c"]) / btc[0]["c"] * 100
-    eth_chg = (eth[-1]["c"] - eth[0]["c"]) / eth[0]["c"] * 100
-
-    # DIVERGING : BTC et ETH se contredisent (>3% d'écart et dans des sens opposés)
-    if btc_chg > 3 and eth_chg < -3:
-        return "DIVERGING", "neutral", btc_chg, eth_chg
-    if btc_chg < -3 and eth_chg > 3:
-        return "DIVERGING", "neutral", btc_chg, eth_chg
-
-    avg_chg = (btc_chg + eth_chg) / 2
-
-    if avg_chg > 5:
-        # Confirmation court-terme : vérifier que le BULL n'est pas en pullback 3j
-        btc_3d = (btc[-1]["c"] - btc[-4]["c"]) / btc[-4]["c"] * 100 if len(btc) >= 4 else 0.0
-        eth_3d = (eth[-1]["c"] - eth[-4]["c"]) / eth[-4]["c"] * 100 if len(eth) >= 4 else 0.0
-        if (btc_3d + eth_3d) / 2 < -2.0:
-            # Pullback court-terme dans un bull market → traiter comme RANGING
-            return "RANGING", "neutral", btc_chg, eth_chg
-        return "BULL",    "up",      btc_chg, eth_chg
-    if avg_chg < -5:
-        return "BEAR",    "down",    btc_chg, eth_chg
-    return "RANGING",     "neutral", btc_chg, eth_chg
 
 def _sizing_equity(balance: float) -> float:
     """Équité sur laquelle la stratégie tendance taille ses positions : en mode fantôme, le capital fictif
@@ -969,56 +385,6 @@ def _state_atomic_write(state: dict):
         json.dump(state, f, indent=2)
     os.replace(tmp, STATE_FILE)
 
-def save_positions_state(positions: list):
-    """Persiste les positions ouvertes dans bot_state.json après chaque changement."""
-    state = _read_state()
-    state["open_positions"] = positions
-    _state_atomic_write(state)
-
-def load_positions_state() -> dict[str, dict]:
-    """Charge l'état enrichi des positions depuis bot_state.json.
-    Retourne {coin: position_dict} pour enrichir la reprise depuis l'API."""
-    if not os.path.exists(STATE_FILE):
-        return {}
-    try:
-        with open(STATE_FILE) as f:
-            state = json.load(f)
-        saved = state.get("open_positions", [])
-        return {p["symbol"]: p for p in saved if "symbol" in p}
-    except Exception:
-        return {}
-
-# ── Scan parallèle ────────────────────────────────────────────────────────────
-def scan_all(open_coins: set[str]) -> list[dict]:
-    candidates = [c for c in WATCHLIST if c not in open_coins]
-    results = []
-    with ThreadPoolExecutor(max_workers=max(1, len(candidates))) as ex:
-        futs = {ex.submit(get_signal, c): c for c in candidates}
-        for fut in as_completed(futs):
-            sig = fut.result()
-            if sig:
-                results.append(sig)
-    return results
-
-def best_signal(sigs: list[dict]) -> dict | None:
-    return max(sigs, key=lambda s: s["score"]) if sigs else None
-
-# ── Taille de position ─────────────────────────────────────────────────────────
-def _size_mult(score: float) -> float:
-    """Multiplicateur de capital selon la qualité du signal.
-    Score ≥ 1.5 → +15% (signal fort)  |  Score < 0.9 → -15% (signal marginal)."""
-    if score >= 1.5: return 1.15
-    if score >= 0.9: return 1.0
-    return 0.85
-
-def calc_qty(coin: str, price: float, size_mult: float = 1.0) -> float:
-    f = _flt(coin)
-    notional = CAPITAL_PER_TRADE * LEVERAGE * size_mult
-    sz = notional / price
-    factor = 10 ** f["sz_dec"]
-    sz = math.floor(sz * factor) / factor
-    return max(f["sz_step"], sz)
-
 def round_px(price: float, coin: str | None = None) -> float:
     """Prix accepté par Hyperliquid (perps) : 5 chiffres significatifs au plus et au plus
     6 − szDecimals décimales (un prix entier est toujours valide). Avant : décimales fixes
@@ -1074,214 +440,6 @@ def send_discord_alert(title: str, description: str, color: int = 0xe74c3c):
         except Exception:
             return  # Ne jamais crasher le bot à cause de Discord
 
-
-# ── Passer un ordre ───────────────────────────────────────────────────────────
-def place_order(sig: dict, wb: Workbook) -> dict:
-    coin   = sig["symbol"]
-    atr    = sig["atr_m5"]
-    is_buy = sig["signal"] == "buy"
-    side   = "BUY" if is_buy else "SELL"
-
-    set_leverage(coin)
-
-    all_mids = info.all_mids()
-    price = float(all_mids.get(coin, 0))
-    if not price:
-        raise RuntimeError(f"Prix indisponible: {coin}")
-
-    smult = _size_mult(sig.get("score", 1.0))
-    qty   = calc_qty(coin, price, smult)
-
-    _sc    = C.BGRN if is_buy else C.BRED
-    _smtag = f" {C.BYLW}({smult*100:.0f}%){C.RST}" if smult != 1.0 else ""
-    print(f"  {_sc}[{side}]{C.RST} {C.BOLD}{coin}{C.RST} {qty}{_smtag} @ ~${price:.6g}  {LEVERAGE}x")
-
-    # Ouverture de la position au marché
-    result = exchange.market_open(coin, is_buy, qty, px=None, slippage=0.02)
-    if result.get("status") != "ok":
-        raise RuntimeError(f"Ordre refusé {coin}: {result}")
-
-    statuses  = result["response"]["data"]["statuses"]
-    fill      = statuses[0].get("filled") or statuses[0].get("resting") or {}
-    order_id  = str(fill.get("oid", f"hl-{coin}-{int(time.time())}"))
-    entry_px  = float(fill.get("avgPx") or price)
-    open_fee  = round(float(fill.get("fee", 0)), 4)
-
-    print(f"  {C.BGRN}[OK]{C.RST} oid={order_id}  entrée=${entry_px:.6g}  frais=${open_fee}")
-
-    # SL/TP calculés sur le prix réellement exécuté (pas le mid d'avant l'ordre) :
-    # le slippage autorisé (2%) dépasse largement la distance SL (1.5×ATR M5 ≈ 0.3-0.5%)
-    if is_buy:
-        sl = round_px(entry_px - ATR_SL_MULT * atr, coin)
-        tp = round_px(entry_px + ATR_TP_MULT * atr, coin)
-    else:
-        sl = round_px(entry_px + ATR_SL_MULT * atr, coin)
-        tp = round_px(entry_px - ATR_TP_MULT * atr, coin)
-
-    # Ordres SL / TP (trigger reduce-only)
-    close_buy = not is_buy
-    sl_lim = round_px(sl * 0.90, coin) if is_buy else round_px(sl * 1.10, coin)
-    tp_lim = round_px(tp * 1.10, coin) if is_buy else round_px(tp * 0.90, coin)
-    sl_oid = None
-    sl_ok  = False
-
-    for label, trig_px, lim_px, tpsl in [
-        ("SL", sl, sl_lim, "sl"),
-        ("TP", tp, tp_lim, "tp"),
-    ]:
-        err = None
-        for attempt in range(2 if label == "SL" else 1):   # SL : 1 retry (protection obligatoire)
-            try:
-                r = exchange.order(
-                    coin, close_buy, qty,
-                    limit_px=lim_px,
-                    order_type={"trigger": {"triggerPx": float(trig_px), "isMarket": True, "tpsl": tpsl}},
-                    reduce_only=True,
-                )
-                st = (r.get("response") or {}).get("data", {}).get("statuses", [{}])
-                if r.get("status") == "ok" and "error" not in st[0]:
-                    _lc = C.RED if label == "SL" else C.GRN
-                    print(f"  {_lc}[{label}]{C.RST} ${trig_px:.6g} → OK")
-                    if label == "SL":
-                        sl_ok  = True
-                        sl_oid = (st[0].get("resting") or st[0].get("filled") or {}).get("oid")
-                    err = None
-                    break
-                err = r
-            except Exception as e:
-                err = e
-            print(f"  {C.BRED}[{label}] REJETÉ (essai {attempt + 1}){C.RST} : {err}")
-            if attempt == 0 and label == "SL":
-                time.sleep(1)
-
-        if label == "SL" and not sl_ok:
-            # Position ouverte sans stop avec levier : on la ferme immédiatement
-            log_error(f"SL impossible {coin} — fermeture d'urgence : {err}")
-            closed = False
-            try:
-                rc = exchange.market_close(coin, slippage=0.05)
-                closed = rc is not None and rc.get("status") == "ok"
-            except Exception as e:
-                log_error(f"market_close urgence {coin}: {e}")
-            if closed:
-                send_discord_alert(
-                    f"🛑 {coin} fermé — SL refusé",
-                    f"Le stop-loss a été refusé 2× par Hyperliquid ; position fermée au marché.\n"
-                    f"Erreur : `{str(err)[:300]}`",
-                    color=0xe67e22)
-                raise RuntimeError(f"SL refusé pour {coin}, position fermée d'urgence")
-            send_discord_alert(
-                f"🚨 {coin} OUVERT SANS STOP-LOSS",
-                f"SL refusé ET fermeture d'urgence échouée. **Intervention manuelle requise.**\n"
-                f"Erreur SL : `{str(err)[:300]}`",
-                color=0xff0000)
-            break   # on renvoie quand même la position pour qu'elle soit suivie (zombie/trailing)
-        if label == "TP" and err is not None:
-            send_discord_alert(f"⚠️ TP refusé {coin}",
-                               f"Position protégée par le SL mais sans TP.\nErreur : `{str(err)[:300]}`",
-                               color=0xf39c12)
-
-    notional = round(qty * entry_px, 2)
-    pnl_tp   = round(abs(tp - entry_px) * qty, 2)
-    pnl_sl   = round(-abs(sl - entry_px) * qty, 2)
-
-    _cond = sig.get("conditions", {})
-    log_order(wb, order_id, coin, side, qty, entry_px, sl, tp, atr, notional, pnl_tp, pnl_sl,
-              mode=_cond.get("mode", ""), regime=_cond.get("regime", ""), score=sig.get("score"))
-
-    # Notification Discord — ouverture de trade (après notional calculé)
-    _ds     = "🟢 LONG" if is_buy else "🔴 SHORT"
-    _mode   = sig.get("conditions", {}).get("mode", "?")
-    _sl_pct = abs(sl - entry_px) / entry_px * 100 if entry_px else 0
-    _tp_pct = abs(tp - entry_px) / entry_px * 100 if entry_px else 0
-    send_discord_alert(
-        f"{_ds} {coin} ouvert [{_mode}]",
-        f"Entrée: **${entry_px:.6g}** | SL: **-{_sl_pct:.2f}%** | TP: **+{_tp_pct:.2f}%**\n"
-        f"Score: **{sig.get('score', 0):.3f}** | Notionnel: **${notional}** | {LEVERAGE}x levier",
-        color=0x2ecc71 if is_buy else 0xe74c3c,
-    )
-
-    return {"id": order_id, "symbol": coin, "side": side,
-            "entry": entry_px, "qty": qty, "sl": sl, "tp": tp,
-            "sl_oid": sl_oid, "atr": atr, "open_fee": open_fee,
-            "conditions": sig.get("conditions", {}),
-            "opened_at": time.time()}
-
-# ── Trailing stop ────────────────────────────────────────────────────────────
-def trail_sl(position: dict, current_price: float):
-    """
-    Deux phases de protection automatique :
-      Phase 0 — Breakeven   : dès 1×ATR de profit → SL à entrée ± 0.10 % (frais couverts)
-      Phase 1 — Trailing    : dès 1.5×ATR de profit → SL suit le prix à 1×ATR (TRAIL_DIST)
-    """
-    coin   = position["symbol"]
-    is_buy = position["side"] == "BUY"
-    entry  = position["entry"]
-    atr    = position.get("atr", entry * 0.002)
-    sl     = position["sl"]
-    sl_oid = position.get("sl_oid")
-
-    if atr <= 0:
-        return
-
-    profit_atr = ((current_price - entry) / atr) if is_buy else ((entry - current_price) / atr)
-
-    # Cible SL selon la phase
-    if profit_atr >= TRAIL_TRIGGER:
-        # Phase trailing : SL à TRAIL_DIST×ATR du prix courant
-        new_sl = round_px(current_price - TRAIL_DIST * atr, coin) if is_buy \
-                 else round_px(current_price + TRAIL_DIST * atr, coin)
-        phase_label = f"TRAIL (profit={profit_atr:.1f}×ATR)"
-    elif profit_atr >= 1.0:
-        # Phase breakeven : SL juste au-delà de l'entrée pour couvrir les frais aller-retour
-        # (au prix d'entrée exact, une sortie au SL perdait quand même ≈ 0.09 % de frais).
-        # Plafonné à 0.5×ATR sous/au-dessus du prix courant pour ne pas déclencher immédiatement.
-        if is_buy:
-            new_sl = round_px(min(entry * (1 + BE_BUFFER_PCT / 100), current_price - 0.5 * atr), coin)
-        else:
-            new_sl = round_px(max(entry * (1 - BE_BUFFER_PCT / 100), current_price + 0.5 * atr), coin)
-        phase_label = f"BREAKEVEN (profit={profit_atr:.1f}×ATR)"
-    else:
-        return  # Pas encore assez en profit
-
-    # N'avancer le SL que dans le sens favorable
-    if (is_buy and new_sl <= sl) or (not is_buy and new_sl >= sl):
-        return
-
-    # Placer le nouveau SL AVANT d'annuler l'ancien : si le nouveau est refusé,
-    # l'ancien reste actif (sinon la position se retrouvait sans aucun stop)
-    # Slippage max 2% pour le trailing/breakeven SL (protège un profit, pas une perte).
-    # Contrairement au SL initial (10%), on ne veut pas remplir à n'importe quel prix :
-    # un BUY trail à $103 avec limite à $92.70 (10%) ne remplit pas si crash à $93 → perte.
-    close_buy = not is_buy
-    sl_lim = round_px(new_sl * 0.98, coin) if is_buy else round_px(new_sl * 1.02, coin)
-    try:
-        r = exchange.order(
-            coin, close_buy, position["qty"],
-            limit_px=sl_lim,
-            order_type={"trigger": {"triggerPx": float(new_sl), "isMarket": True, "tpsl": "sl"}},
-            reduce_only=True,
-        )
-        st = (r.get("response") or {}).get("data", {}).get("statuses", [{}])
-        if r.get("status") != "ok" or "error" in st[0]:
-            print(f"  {C.BYLW}[TRAIL]{C.RST} rejeté (ancien SL conservé) : {r}")
-            return
-    except Exception as e:
-        print(f"  {C.BYLW}[TRAIL]{C.RST} erreur (ancien SL conservé) : {e}")
-        return
-
-    if sl_oid:
-        try:
-            exchange.cancel(coin, int(sl_oid))
-        except Exception as e:
-            print(f"  {C.BYLW}[TRAIL]{C.RST} annulation ancien SL : {e}")
-    position["sl_oid"]  = (st[0].get("resting") or st[0].get("filled") or {}).get("oid")
-    position["sl"]      = new_sl
-    position["trailed"] = True   # flag pour classifier "TRAIL touché" à la fermeture
-    arrow = "↑" if is_buy else "↓"
-    tag   = "TRAIL" if profit_atr >= TRAIL_TRIGGER else "BKEVEN"
-    print(f"  {C.BCYN}[{tag} {arrow}]{C.RST} {coin} SL={new_sl:.6g} ({phase_label})")
-
 # ── Surveillance des stop-loss ───────────────────────────────────────────────
 def ensure_sl_orders(open_positions: list) -> int:
     """Vérifie que chaque position suivie a bien un ordre stop-loss actif sur Hyperliquid
@@ -1329,10 +487,10 @@ def ensure_sl_orders(open_positions: list) -> int:
                                f"Erreur : `{str(e)[:300]}`", color=0xff0000)
     return replaced
 
-# ── Fermeture forcée (zombie) ─────────────────────────────────────────────────
+# ── Fills de fermeture (P&L réel d'une position fermée) ───────────────────────
 def _closing_fills(position: dict, fills: list) -> list:
     """Fills de l'ordre de fermeture le plus récent de la position ([] si aucun). Un ordre de
-    fermeture (SL/TP/market) est souvent exécuté en plusieurs fills partiels : tous ceux de cet
+    fermeture (SL ou au marché) est souvent exécuté en plusieurs fills partiels : tous ceux de cet
     ordre (même oid), pas seulement le dernier."""
     coin    = position["symbol"]
     since   = (position.get("opened_at") or 0) * 1000 - 5000   # marge horloge 5 s
@@ -1357,753 +515,6 @@ def _closing_pnl(position: dict, fills: list) -> tuple[float, float, float] | No
     open_fee = (sum(float(f.get("fee", 0)) for f in opening) if opening
                 else position.get("open_fee") or close_fee)   # estimé = frais de sortie (même taux taker)
     return gross, open_fee, close_fee
-
-def force_close_zombie(wb: Workbook, position: dict) -> float | None:
-    """Ferme de force une position zombie (>6h en drawdown) via market_close, PUIS annule
-    le SL (avant : SL annulé d'abord → si la fermeture échouait, position sans stop et
-    plus suivie). Retourne le P&L, ou None si la fermeture a échoué (SL conservé)."""
-    coin   = position["symbol"]
-    sl_oid = position.get("sl_oid")
-
-    # Fermeture au marché (SDK Hyperliquid). None = plus de position (déjà fermée par SL/TP)
-    try:
-        r = exchange.market_close(coin, slippage=0.05)
-        if r is not None and r.get("status") != "ok":
-            raise RuntimeError(r)
-        st = ((r or {}).get("response") or {}).get("data", {}).get("statuses", [{}])
-        if st and "error" in st[0]:
-            raise RuntimeError(st[0]["error"])
-        print(f"  {C.BRED}[ZOMBIE]{C.RST} {C.BOLD}{coin}{C.RST} order envoyé")
-    except Exception as e:
-        log_error(f"zombie market_close {coin}: {e}")
-        send_discord_alert(f"⚠️ Zombie {coin} : fermeture échouée",
-                           f"La position reste ouverte avec son SL. Nouvel essai au prochain cycle.\n"
-                           f"Erreur : `{str(e)[:300]}`", color=0xf39c12)
-        return None
-
-    # Position fermée : le SL (reduce-only) n'a plus d'objet
-    if sl_oid:
-        try:
-            exchange.cancel(coin, int(sl_oid))
-        except Exception as e:
-            print(f"  {C.BYLW}[ZOMBIE]{C.RST} annulation SL : {e}")
-
-    # Récupérer le P&L depuis les fills (courte pause pour la propagation)
-    time.sleep(1)
-    pnl = 0.0
-    try:
-        fills   = info.user_fills(WALLET_ADDRESS)
-        res     = _closing_pnl(position, fills)
-        if res:
-            gross, open_fee, close_fee = res
-            pnl = round(gross - open_fee - close_fee, 2)
-    except Exception:
-        pass
-
-    result = "Zombie (fermé)"
-    _rc = C.BGRN if pnl >= 0 else C.BRED
-    print(f"  {_rc}[{result}]{C.RST} {C.BOLD}{coin}{C.RST}  P&L={_cp(pnl)}${pnl:.2f}{C.RST}")
-
-    # Notification Discord
-    _entry   = position.get("entry", 0)
-    _qty     = position.get("qty", 0)
-    _cap     = _entry * _qty / LEVERAGE if _entry and _qty else 0
-    _pnl_pct = pnl / _cap * 100 if _cap > 0 else 0
-    _pnl_s   = f"+{_pnl_pct:.2f}%" if pnl >= 0 else f"{_pnl_pct:.2f}%"
-    send_discord_alert(
-        f"🧟 {coin} — Zombie fermé automatiquement",
-        f"P&L: **{_pnl_s}** | Ouvert depuis >6h en drawdown\nEntrée: **${_entry:.6g}**",
-        color=0xe67e22,
-    )
-
-    record_lesson(position, result, pnl)
-    update_order_status(wb, position["id"], result, pnl)
-    return pnl
-
-# ── Suivi de position ─────────────────────────────────────────────────────────
-def check_position(wb: Workbook, position: dict,
-                   cached_state: dict | None = None,
-                   cached_mids: dict | None = None) -> str | None:
-    """Vérifie l'état d'une position ouverte. cached_state/mids évitent des appels API redondants
-    quand plusieurs positions sont vérifiées dans le même cycle."""
-    coin = position["symbol"]
-    try:
-        user_state = cached_state if cached_state is not None else info.user_state(WALLET_ADDRESS)
-        asset_pos  = user_state.get("assetPositions", [])
-        pos = next(
-            (p["position"] for p in asset_pos
-             if p["position"]["coin"] == coin and abs(float(p["position"]["szi"])) > 0),
-            None
-        )
-
-        if pos:
-            position.pop("_missing", None)
-            mids  = cached_mids if cached_mids is not None else info.all_mids()
-            price = float(mids.get(coin, position["entry"]))
-            pnl   = float(pos.get("unrealizedPnl", 0))
-            pct   = (price - position["entry"]) / position["entry"] * 100
-            if position["side"] == "SELL":
-                pct = -pct
-            _pc = _cp(pnl)
-            print(f"  {C.DIM}[SUIVI]{C.RST} {C.BOLD}{coin}{C.RST} ${price:.6g} ({pct:+.2f}%)  P&L={_pc}${pnl:.2f}{C.RST}")
-            update_order_live(wb, position["id"], price)
-            trail_sl(position, price)
-            return None
-
-        # Position absente — chercher la fermeture dans les fills
-        pnl, result = 0.0, "Fermé (inconnu)"
-        try:
-            fills   = info.user_fills(WALLET_ADDRESS)
-            res     = _closing_pnl(position, fills)
-            if not res:
-                # Aucun fill de fermeture : fills pas encore propagés, ou position absente
-                # par erreur API passagère → on attend jusqu'à 3 cycles avant de conclure
-                position["_missing"] = position.get("_missing", 0) + 1
-                if position["_missing"] < 3:
-                    print(f"  {C.BYLW}[SUIVI]{C.RST} {coin} absente sans fill de fermeture "
-                          f"({position['_missing']}/3) — vérification au prochain cycle")
-                    return None
-            if res:
-                gross, open_fee, close_fee = res
-                pnl = round(gross - open_fee - close_fee, 2)
-                # Trailing stop activé et perte ≤ frais : c'est une protection réussie, pas un SL
-                if position.get("trailed") and pnl >= -(open_fee + close_fee) - 0.01:
-                    result = "TRAIL touché"
-                elif pnl >= 0:
-                    result = "TP touché"
-                else:
-                    result = "SL touché"
-                print(f"  {C.DIM}[FRAIS] ouv=${open_fee:.4f}  ferm=${close_fee:.4f}  net=${pnl:.2f}{C.RST}")
-        except Exception:
-            pass
-
-        _rc = C.BGRN if "TP" in result else C.BRED
-        print(f"  {_rc}[{result}]{C.RST} {C.BOLD}{coin}{C.RST}  P&L={_cp(pnl)}${pnl:.2f}{C.RST}")
-
-        # Notification Discord — fermeture de trade
-        _emoji  = "✅" if pnl >= 0 else "🛑"
-        _entry  = position.get("entry", 0)
-        _qty    = position.get("qty", 0)
-        _cap    = _entry * _qty / LEVERAGE if _entry and _qty else 0
-        _pnl_pct = pnl / _cap * 100 if _cap > 0 else 0
-        _pnl_s  = f"+{_pnl_pct:.2f}%" if pnl >= 0 else f"{_pnl_pct:.2f}%"
-        send_discord_alert(
-            f"{_emoji} {coin} — {result}",
-            f"P&L: **{_pnl_s}** | Entrée: **${_entry:.6g}**",
-            color=0x2ecc71 if pnl >= 0 else 0xe74c3c,
-        )
-
-        record_lesson(position, result, pnl)   # apprendre des succès et des erreurs
-        update_order_status(wb, position["id"], result, pnl)
-        return result
-
-    except Exception as e:
-        log_error(f"check_position {coin}: {e}")
-        return None
-
-# ── Récupération positions à la reprise ──────────────────────────────────────
-def recover_open_positions() -> tuple[list, float]:
-    # Charger l'état enrichi du dernier run (sl_oid, atr, sl, tp, open_fee)
-    saved_state = load_positions_state()
-
-    try:
-        user_state = info.user_state(WALLET_ADDRESS)
-        asset_pos  = user_state.get("assetPositions", [])
-    except Exception as e:
-        log_error(f"recover: {e}")
-        return [], 0.0
-
-    open_pos = [p["position"] for p in asset_pos
-                if p["position"]["coin"] in set(WATCHLIST)
-                and abs(float(p["position"]["szi"])) > 0]
-    if not open_pos:
-        return [], 0.0
-
-    recovered, capital_used = [], 0.0
-    for p in open_pos:
-        coin  = p["coin"]
-        size  = float(p["szi"])
-        side  = "BUY" if size > 0 else "SELL"
-        entry = float(p.get("entryPx") or 0)
-        qty   = abs(size)
-
-        # État sauvegardé (sl_oid, atr réel, sl/tp précis, opened_at, conditions, trailed)
-        saved = saved_state.get(coin, {})
-        if coin in trend_coins():
-            continue   # position de la stratégie tendance (trend_state.json), suivie par trend_cycle
-        if saved.get("side") != side:
-            # Wallet partagé avec BotCopyTrade : une position absente de notre état
-            # n'est pas à nous → ne pas l'adopter (sinon SL posé / fermeture zombie sur la copie)
-            print(f"  {C.BYLW}[REPRISE]{C.RST} {coin} {side} @ ${entry:.6g} inconnue de "
-                  f"{STATE_FILE} → ignorée (BotCopyTrade ?)")
-            send_discord_alert(
-                "⚠️ Position non reprise",
-                f"{coin} {side} @ {entry:.6g} est ouverte sur le compte mais absente de "
-                f"{STATE_FILE} : laissée à BotCopyTrade. Si elle appartient à BotShortTrade, "
-                f"elle n'est plus suivie (son SL/TP sur Hyperliquid reste actif).",
-                color=0xf39c12)
-            continue
-        # Valeurs de repli (ATR ≈ 0.2 % du prix) si un champ manque dans un ancien état
-        atr = saved.get("atr", entry * 0.002)
-        sgn = 1 if side == "BUY" else -1
-        # opened_at, conditions, trailed : essentiels pour zombie-detection, leçons, TRAIL
-        position = {"id": saved.get("id", f"recovered-{coin}"), "symbol": coin, "side": side,
-                    "entry": entry, "qty": qty,
-                    "sl": saved.get("sl", entry - sgn * ATR_SL_MULT * atr),
-                    "tp": saved.get("tp", entry + sgn * ATR_TP_MULT * atr),
-                    "sl_oid": saved.get("sl_oid"), "atr": atr, "open_fee": saved.get("open_fee", 0.0),
-                    "opened_at": saved.get("opened_at", time.time()),
-                    "conditions": saved.get("conditions", {}), "trailed": saved.get("trailed", False)}
-        recovered.append(position)
-        capital_used += CAPITAL_PER_TRADE
-
-        _sc  = C.BGRN if side == "BUY" else C.BRED
-        print(f"  {C.BCYN}[REPRISE]{C.RST} {coin} {_sc}{side}{C.RST} @ ${entry:.6g}")
-
-    return recovered, capital_used
-
-def reconcile_zombie_orders(wb: Workbook, open_positions: list) -> None:
-    ws = wb["Trades"]
-    open_ids = {str(p["id"]) for p in open_positions}
-    for row in ws.iter_rows(min_row=2, values_only=False):
-        if str(row[13].value) == "Ordre placé" and str(row[0].value) not in open_ids:
-            row[13].value = "Fermé (inconnu)"
-            for cell in row:
-                cell.fill = _FILLS["sl"]
-    _safe_save(wb)
-
-# ── Affichage scan ────────────────────────────────────────────────────────────
-# ── P&L portefeuille ──────────────────────────────────────────────────────────
-def calc_daily_pnl(wb: Workbook) -> float:
-    """P&L des trades fermés aujourd'hui (minuit UTC), selon la date de FERMETURE
-    (avant : date d'ouverture → un trade ouvert la veille et fermé aujourd'hui échappait
-    à la limite de perte du jour). Anciennes lignes sans date de fermeture : date d'ouverture."""
-    ws = wb["Trades"]
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    daily = 0.0
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        pnl = row[14]
-        if pnl is None or pnl == "":
-            continue
-        closed = row[18] if len(row) > 18 else None
-        date_str = str(closed or row[1] or "")
-        if date_str.startswith(today):
-            try:
-                daily += float(pnl)
-            except (ValueError, TypeError):
-                pass
-    return round(daily, 2)
-
-def calc_portfolio_pnl(wb: Workbook) -> tuple[float, float]:
-    ws = wb["Trades"]
-    now = datetime.now(timezone.utc)
-    total, weekly = 0.0, 0.0
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        pnl = row[14]   # colonne O — P&L final $
-        if pnl is None or pnl == "":
-            continue
-        try:
-            pnl = float(pnl)
-        except (ValueError, TypeError):
-            continue
-        total += pnl
-        date_str = str(row[1] or "")   # colonne B — Date/Heure
-        try:
-            trade_dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
-            if (now - trade_dt).days < 7:
-                weekly += pnl
-        except ValueError:
-            pass
-    return round(total, 2), round(weekly, 2)
-
-def _print_scan_summary():
-    global _last_scan
-    if not _scan_log:
-        return
-    print(f"\n  {C.DIM}── Scan ({len(_scan_log)} symboles) ──{C.RST}")
-    for e in _scan_log:
-        sig = e["signal"] or "–"
-        _sc = C.BGRN if sig == "buy" else (C.BRED if sig == "sell" else C.DIM)
-        print(f"    {C.BOLD}{e['coin']:5s}{C.RST} {_sc}{sig:4s}{C.RST}  score={e['score']:.3f}  {C.DIM}{e['details']}{C.RST}")
-    _last_scan = list(_scan_log)   # snapshot pour le dashboard
-    _scan_log.clear()
-
-# ── Génération du dashboard HTML ──────────────────────────────────────────────
-def write_dashboard(wb: Workbook, open_positions: list, balance: float,
-                    initial_balance: float, pnl_total: float, pnl_week: float,
-                    unrealized: float, avail_capital: float,
-                    regime: str, btc_chg: float, eth_chg: float,
-                    pnl_today: float = 0.0):
-    try:
-        ws = wb["Trades"]
-        rows = [r for r in ws.iter_rows(min_row=2, values_only=True) if r[14] is not None and r[14] != ""]
-        wins   = [r for r in rows if float(r[14] or 0) > 0]
-        losses = [r for r in rows if float(r[14] or 0) < 0]
-        total_trades = len(rows)
-        win_rate     = len(wins) / total_trades * 100 if total_trades else 0.0
-        gross_profit = sum(float(r[14]) for r in wins)
-        gross_loss   = abs(sum(float(r[14]) for r in losses))
-        profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else 0.0
-        net_pnl  = pnl_total + unrealized
-        net_pct  = net_pnl / initial_balance * 100 if initial_balance > 0 else 0.0
-        now_str  = datetime.now(timezone.utc).strftime("%d/%m/%Y à %H:%M:%S UTC")
-
-        def _pct_col(v): return "green" if v >= 0 else "red"
-        def _val_col(v): return "green" if v > 0 else ("red" if v < 0 else "white")
-        def _fmt(v):     return f"+${v:.2f}" if v > 0 else f"-${abs(v):.2f}"
-
-        regime_color = {"BULL": "#4ade80", "BEAR": "#f87171", "DIVERGING": "#f87171", "RANGING": "#fbbf24"}.get(regime, "#e0e0e0")
-
-        # ── Positions ouvertes ─────────────────────────────────────────────────
-        pos_rows = ""
-        for p in open_positions:
-            side_badge = f'<span class="buy-badge">BUY</span>' if p["side"] == "BUY" else f'<span class="sell-badge">SELL</span>'
-            entry = p.get("entry", 0)
-            sl    = p.get("sl", 0)
-            tp    = p.get("tp")   # positions tendance : pas de TP (sortie à l'inversion du signal)
-            status = ("Tendance · fantôme" if p.get("paper") else "Tendance") if "paper" in p else "Ouvert"
-            pos_rows += f"""
-            <tr>
-              <td><span class="coin-badge">{p['symbol']}/USD</span></td>
-              <td>{side_badge}</td>
-              <td>${entry:.4f}</td>
-              <td>${sl:.4f}</td>
-              <td>{f"${tp:.4f}" if tp else "—"}</td>
-              <td><span class="pending-badge">{status}</span></td>
-            </tr>"""
-        if not pos_rows:
-            pos_rows = '<tr><td colspan="6" style="text-align:center;color:#555">Aucune position ouverte</td></tr>'
-
-        # ── Dernier scan ───────────────────────────────────────────────────────
-        scan_rows = ""
-        for e in _last_scan:
-            sig = e.get("signal") or "–"
-            if sig == "buy":
-                sig_badge = '<span class="buy-badge">BUY</span>'
-            elif sig == "sell":
-                sig_badge = '<span class="sell-badge">SELL</span>'
-            else:
-                sig_badge = '<span class="flat-badge">FLAT</span>'
-            score = e.get("score", 0.0)
-            details = e.get("details", "")
-            ts = e.get("ts", "")
-            scan_rows += f"""
-            <tr>
-              <td><span class="coin-badge">{e['coin']}/USD</span></td>
-              <td>{sig_badge}</td>
-              <td style="font-size:0.85em;color:#aaa">{score:.3f}</td>
-              <td style="font-size:0.82em;color:#666">{details}</td>
-              <td style="font-size:0.82em;color:#555">{ts}</td>
-            </tr>"""
-        if not scan_rows:
-            scan_rows = '<tr><td colspan="5" style="text-align:center;color:#555">En attente du prochain scan…</td></tr>'
-
-        # ── Historique trades ──────────────────────────────────────────────────
-        all_rows_sorted = list(reversed(rows))[:40]
-        cumul = pnl_total
-        trade_rows = ""
-        running_total = 0.0
-        for r in reversed(all_rows_sorted):
-            running_total += float(r[14] or 0)
-        cumul_run = running_total
-        for r in all_rows_sorted:
-            pnl_val  = float(r[14] or 0)
-            cumul_run -= pnl_val   # we go reverse so subtract
-            pnl_pct  = pnl_val / initial_balance * 100 if initial_balance > 0 else 0
-            cumul_display = cumul_run + pnl_val   # cumul at this trade
-            pnl_cls  = "gain" if pnl_val > 0 else "loss"
-            cum_cls  = "gain" if cumul_display >= 0 else "loss"
-            side_badge = f'<span class="buy-badge">BUY</span>' if str(r[3]).upper() == "BUY" else f'<span class="sell-badge">SELL</span>'
-            status = str(r[13] or "")
-            if "TP" in status.upper():
-                st_badge = '<span class="tp-badge">TP ✓</span>'
-            elif "SL" in status.upper():
-                st_badge = '<span class="sl-badge">SL ✗</span>'
-            elif "TRAIL" in status.upper():
-                st_badge = '<span class="tp-badge">Trail ✓</span>'
-            else:
-                st_badge = f'<span class="pending-badge">{status}</span>'
-            entry_px = r[5] or 0
-            trade_rows += f"""
-            <tr>
-              <td style="font-size:0.82em;color:#777">{r[1] or ""}</td>
-              <td><span class="coin-badge">{r[2] or ""}</span></td>
-              <td>{side_badge}</td>
-              <td>${float(entry_px):.4f}</td>
-              <td class="{pnl_cls}"><strong>{_fmt(pnl_val)}</strong> <span style="opacity:.7;font-size:.82em">({pnl_pct:+.2f}%)</span></td>
-              <td>{st_badge}</td>
-            </tr>"""
-        if not trade_rows:
-            trade_rows = '<tr><td colspan="6" style="text-align:center;color:#555">Aucun trade fermé encore</td></tr>'
-
-        # ── Leçons apprises ────────────────────────────────────────────────────
-        # Mêmes statistiques que get_penalty : réels + fantômes pondérés, avec oubli progressif
-        # (avant : fantômes ignorés → "0 (apprentissage…)" affiché sur des patterns pénalisés)
-        MIN_SAMPLES = 5
-        les_data = _load_lessons().get("buckets", {})
-        all_buckets = sorted(((k, v, *_bucket_stats(v)) for k, v in les_data.items()),
-                             key=lambda x: x[3])
-        lessons_rows = ""
-        for k, v, n, wr in all_buckets[:20]:
-            adj = 0.0
-            if n >= MIN_SAMPLES and wr < 0.40:
-                adj = round(min((0.40 - wr) * 0.5, 0.25), 3)
-            elif n >= MIN_SAMPLES and wr > 0.60:
-                adj = -round(min((wr - 0.60) * 0.5, 0.15), 3)
-            wr_color = "#f87171" if wr < 0.35 else ("#fbbf24" if wr < 0.50 else "#4ade80")
-            pen_str  = (f'<span style="color:#f87171;font-weight:600">−{adj}</span>' if adj > 0 else
-                        f'<span style="color:#4ade80;font-weight:600">+{-adj}</span>' if adj < 0 else
-                        '<span style="color:#555">0 (apprentissage…)</span>')
-            pnl_v    = v.get("pnl", 0.0)
-            pnl_cls  = "gain" if pnl_v > 0 else "loss"
-            n_ghost  = v.get("gw", 0) + v.get("gl", 0)
-            lessons_rows += f"""
-            <tr>
-              <td style="font-family:monospace;font-size:0.85em;color:#ccc">{k}</td>
-              <td style="font-weight:700;color:{wr_color}">{wr*100:.0f}%</td>
-              <td style="color:#888">n={n:.1f} (réels {v.get('w', 0) + v.get('l', 0):.1f} · fantômes {n_ghost:.1f})</td>
-              <td class="{pnl_cls}">{_fmt(pnl_v)}</td>
-              <td>{pen_str}</td>
-            </tr>"""
-        if not lessons_rows:
-            lessons_rows = '<tr><td colspan="5" style="text-align:center;color:#555">Aucune leçon encore — les données s\'accumulent après les premiers trades</td></tr>'
-
-        html = f"""<!DOCTYPE html>
-<html lang="fr">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="refresh" content="15">
-  <title>Bot Crypto — Dashboard</title>
-  <style>
-    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-    body {{ font-family: 'Segoe UI', sans-serif; background: #0f1117; color: #e0e0e0; padding: 24px; }}
-    h1 {{ font-size: 1.6em; color: #fff; margin-bottom: 4px; }}
-    .subtitle {{ color: #888; font-size: 0.9em; margin-bottom: 28px; }}
-    .cards {{ display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 32px; }}
-    .card {{ background: #1a1d27; border-radius: 12px; padding: 20px 24px; flex: 1; min-width: 140px; border: 1px solid #2a2d3a; }}
-    .card .label {{ font-size: 0.78em; color: #888; text-transform: uppercase; letter-spacing: .05em; }}
-    .card .value {{ font-size: 2em; font-weight: 700; margin-top: 6px; }}
-    .card .sub {{ font-size: 0.82em; color: #888; margin-top: 3px; }}
-    .value.green {{ color: #4ade80; }} .value.red {{ color: #f87171; }}
-    .value.white {{ color: #fff; }}  .value.yellow {{ color: #fbbf24; }}
-    .section {{ margin-bottom: 32px; }}
-    .section h2 {{ font-size: 1.05em; color: #aaa; margin-bottom: 12px; border-bottom: 1px solid #2a2d3a; padding-bottom: 8px; }}
-    .regime-bar {{ display:inline-flex; align-items:center; gap:10px; background:#1a1d27; border-radius:8px; padding:10px 18px; border:1px solid #2a2d3a; margin-bottom:20px; }}
-    .regime-dot {{ width:10px; height:10px; border-radius:50%; background:{regime_color}; }}
-    .regime-name {{ font-weight:700; color:{regime_color}; font-size:1.05em; }}
-    table {{ width: 100%; border-collapse: collapse; background: #1a1d27; border-radius: 10px; overflow: hidden; }}
-    th {{ background: #12151f; color: #888; font-size: 0.78em; text-transform: uppercase; padding: 10px 14px; text-align: left; letter-spacing: .05em; }}
-    td {{ padding: 10px 14px; border-top: 1px solid #2a2d3a; font-size: 0.9em; }}
-    tr:hover td {{ background: #20243a; }}
-    .gain {{ color: #4ade80; font-weight: 600; }} .loss {{ color: #f87171; font-weight: 600; }}
-    .coin-badge    {{ background:#2a2d3a; color:#e0e0e0; padding:2px 8px; border-radius:20px; font-size:0.82em; font-weight:600; }}
-    .buy-badge     {{ background:#14532d; color:#4ade80; padding:2px 10px; border-radius:20px; font-size:0.82em; font-weight:700; }}
-    .sell-badge    {{ background:#450a0a; color:#f87171; padding:2px 10px; border-radius:20px; font-size:0.82em; font-weight:700; }}
-    .flat-badge    {{ background:#292524; color:#a8a29e; padding:2px 10px; border-radius:20px; font-size:0.82em; }}
-    .tp-badge      {{ background:#14532d; color:#4ade80; padding:2px 10px; border-radius:20px; font-size:0.82em; }}
-    .sl-badge      {{ background:#450a0a; color:#f87171; padding:2px 10px; border-radius:20px; font-size:0.82em; }}
-    .pending-badge {{ background:#1c1917; color:#fbbf24; padding:2px 10px; border-radius:20px; font-size:0.82em; }}
-    .footer {{ color: #444; font-size: 0.78em; margin-top: 24px; text-align: center; }}
-    /* ── Tooltips ─────────────────────────────────────────── */
-    [data-tip]          {{ cursor: help; }}
-    .label [data-tip]   {{ border-bottom: 1px dotted #555; padding-bottom: 1px; }}
-    th[data-tip]        {{ cursor: help; }}
-    #_tip {{
-      position: fixed;
-      background: #161b2e;
-      color: #d4daf0;
-      font-size: 1em;
-      line-height: 1.65;
-      padding: 11px 15px;
-      border-radius: 9px;
-      border: 1px solid #2e3350;
-      max-width: 320px;
-      z-index: 9999;
-      box-shadow: 0 6px 28px rgba(0,0,0,.8);
-      pointer-events: none;
-      display: none;
-      white-space: normal;
-      text-transform: none;
-      letter-spacing: 0;
-      font-weight: 400;
-    }}
-  </style>
-</head>
-<body>
-  <h1>📊 Bot Crypto — Dashboard</h1>
-  <p class="subtitle">Mis à jour le {now_str} · Rafraîchissement auto toutes les 15s · {'⚠️ MAINNET (argent réel)' if not HL_TESTNET else '🟡 TESTNET (simulation)'}</p>
-
-  <div class="cards">
-    <div class="card">
-      <div class="label"><span data-tip="Valeur totale du compte (perp + USDC spot). Sert de base pour calculer la taille des positions. Réf = capital initial au démarrage du bot.">Équité</span></div>
-      <div class="value white">${balance:.2f}</div>
-      <div class="sub">Réf: ${initial_balance:.2f}</div>
-    </div>
-    <div class="card">
-      <div class="label"><span data-tip="Capital libre pour ouvrir de nouvelles positions = Équité − capital engagé dans les positions ouvertes.">Dispo</span></div>
-      <div class="value {'red' if avail_capital <= 0 else 'yellow' if avail_capital < CAPITAL_PER_TRADE * 2 else 'white'}">${avail_capital:.2f}</div>
-      <div class="sub">{len(open_positions)} position(s) ouverte(s)</div>
-    </div>
-    <div class="card">
-      <div class="label"><span data-tip="Profit/Perte net depuis le démarrage : gains réalisés (trades fermés) + non-réalisés (positions en cours). Exprimé en % du capital initial.">P&amp;L Net</span></div>
-      <div class="value {_val_col(net_pnl)}">{_fmt(net_pnl)}</div>
-      <div class="sub">{net_pct:+.2f}% du capital initial</div>
-    </div>
-    <div class="card">
-      <div class="label"><span data-tip="Gains réalisés sur les 7 derniers jours (trades fermés uniquement, hors positions ouvertes).">P&amp;L 7 jours</span></div>
-      <div class="value {_val_col(pnl_week)}">{_fmt(pnl_week)}</div>
-    </div>
-    <div class="card">
-      <div class="label"><span data-tip="Gains réalisés aujourd'hui (depuis minuit UTC). Sert aussi de limite de perte journalière.">Aujourd'hui</span></div>
-      <div class="value {_val_col(pnl_today)}">{_fmt(pnl_today)}</div>
-    </div>
-    <div class="card">
-      <div class="label"><span data-tip="Nombre total de positions clôturées (TP = Take Profit touché, SL = Stop Loss touché). W = gagnants, L = perdants.">Trades fermés</span></div>
-      <div class="value white">{total_trades}</div>
-      <div class="sub">{len(wins)}W / {len(losses)}L</div>
-    </div>
-    <div class="card">
-      <div class="label"><span data-tip="Pourcentage de trades fermés avec un profit. 84%+ = excellent. Le bot vise >70% grâce aux filtres RSI, BBP et volume.">Win Rate</span></div>
-      <div class="value {'green' if win_rate >= 50 else 'red'}">{win_rate:.1f}%</div>
-    </div>
-    <div class="card">
-      <div class="label"><span data-tip="Gains bruts / Pertes brutes. >2 = très rentable, >1 = rentable, <1 = perte nette. Idéalement >3 pour un scalper.">Profit Factor</span></div>
-      <div class="value {'green' if profit_factor >= 1.5 else 'yellow' if profit_factor >= 1 else 'red'}">{profit_factor:.2f}</div>
-    </div>
-  </div>
-
-  <div class="section">
-    <h2>🌍 Régime de marché</h2>
-    <div class="regime-bar">
-      <div class="regime-dot"></div>
-      <span class="regime-name" data-tip="BULL = BTC+ETH en hausse sur 7j → signaux BUY prioritaires (+ SELL MR score>0.75). BEAR = baissiers → SELL MOM. RANGING = lateral → Mean-Reversion. DIVERGING = BTC et ETH en directions opposées.">{regime}</span>
-      <span style="color:#666;font-size:.9em">BTC {btc_chg:+.1f}% · ETH {eth_chg:+.1f}% (7j)</span>
-    </div>
-  </div>
-
-  <div class="section">
-    <h2>📂 Positions ouvertes</h2>
-    <table>
-      <thead>
-        <tr><th>Crypto</th><th>Direction</th><th data-tip="Prix d'ouverture de la position.">Entrée</th><th data-tip="Niveau de prix qui déclenche la fermeture automatique pour limiter la perte. Calculé à 1.5×ATR sous/sur l'entrée.">Stop Loss</th><th data-tip="Prix cible pour clôturer avec profit. Calculé à 4×ATR (ratio gain/risque ≈ 2.7). Le prix doit l'atteindre pour clôturer.">Take Profit</th><th>Statut</th></tr>
-      </thead>
-      <tbody>{pos_rows}</tbody>
-    </table>
-  </div>
-
-  <div class="section">
-    <h2>🔍 Dernier scan du marché</h2>
-    <table>
-      <thead>
-        <tr><th>Crypto</th><th data-tip="BUY = signal d'achat détecté · SELL = signal de vente · FLAT = aucun signal ce cycle">Signal</th><th data-tip="Force du signal de 0 à ~2. Plus c'est élevé, plus le bot est confiant dans l'entrée.">Score</th><th data-tip="M15/M5 = tendance haussière (↑) ou baissière (↓) sur 15min et 5min. RSI = momentum 14 périodes (>70 suracheté, <30 survendu). BBP = position dans les Bollinger Bands (0=bord bas, 1=bord haut, négatif=sous la bande). vol = volume actuel / volume moyen (✗=insuffisant, Nx↓=en déclin)">Détails</th><th>Heure</th></tr>
-      </thead>
-      <tbody>{scan_rows}</tbody>
-    </table>
-  </div>
-
-  <div class="section">
-    <h2>🧠 Leçons apprises (patterns pénalisés)</h2>
-    <table>
-      <thead>
-        <tr><th data-tip="Catégorie de trade apprise par le bot. Ex: coin_AVAX|buy = achats AVAX · rsi70-75|buy|BBO = breakout avec RSI 70-75 · bbp&gt;1.0 = prix au-dessus de la Bollinger haute · regime_BULL = trade en régime BULL">Pattern</th><th data-tip="Taux de réussite du pattern. Rouge &lt;35% (dangereux), orange &lt;50% (faible), vert &ge;50% (bon).">Win Rate</th><th data-tip="Nombre effectif de résultats : trades réels + fantômes (poids 0.5), les anciens comptant de moins en moins.">Échantillon</th><th>P&amp;L réel cumulé</th><th data-tip="Malus (rouge) sur le score si WR &lt;40 %, bonus (vert) si WR &gt;60 %, dès 5 résultats effectifs. Malus max 0.25, bonus max 0.15.">Ajustement score</th></tr>
-      </thead>
-      <tbody>{lessons_rows}</tbody>
-    </table>
-  </div>
-
-  <div class="section">
-    <h2>📋 Historique des trades (40 derniers)</h2>
-    <table>
-      <thead>
-        <tr><th>Date</th><th>Crypto</th><th>Direction</th><th>Prix entrée</th><th>P&amp;L</th><th>Statut</th></tr>
-      </thead>
-      <tbody>{trade_rows}</tbody>
-    </table>
-  </div>
-
-  <p class="footer">BotShortTrade · Hyperliquid DEX · Wallet {WALLET_ADDRESS[:6]}…{WALLET_ADDRESS[-4:]}</p>
-<script>
-(function(){{
-  var tip=document.createElement('div'); tip.id='_tip';
-  document.body.appendChild(tip);
-  function show(e){{
-    var txt=this.getAttribute('data-tip');
-    if(!txt)return;
-    tip.textContent=txt;
-    tip.style.display='block';
-    move(e);
-  }}
-  function move(e){{
-    var m=16, w=tip.offsetWidth, h=tip.offsetHeight;
-    var vw=window.innerWidth, vh=window.innerHeight;
-    var x=e.clientX+m, y=e.clientY-h-m;
-    if(x+w>vw-10) x=e.clientX-w-m;
-    if(y<10) y=e.clientY+m;
-    if(x<10) x=10;
-    tip.style.left=x+'px'; tip.style.top=y+'px';
-  }}
-  function hide(){{ tip.style.display='none'; }}
-  document.querySelectorAll('[data-tip]').forEach(function(el){{
-    el.addEventListener('mouseenter',show);
-    el.addEventListener('mousemove',move);
-    el.addEventListener('mouseleave',hide);
-  }});
-}})();
-</script>
-</body>
-</html>"""
-
-        with open("dashboard.html", "w", encoding="utf-8") as f:
-            f.write(html)
-    except Exception as e:
-        log_error(f"write_dashboard: {e}")
-
-
-# ── Boucle principale ─────────────────────────────────────────────────────────
-# ── Mode fantôme ─────────────────────────────────────────────────────────────
-# Chaque signal NON tradé (score trop bas, filtré/bloqué par le régime, pas de slot)
-# est suivi virtuellement avec le même SL/TP qu'un vrai trade. Son résultat alimente
-# l'apprentissage (poids GHOST_WEIGHT) et la feuille Excel « Fantômes ».
-_ghosts: list[dict] | None = None   # chargé à la demande depuis GHOST_FILE
-
-def _load_ghosts() -> list[dict]:
-    global _ghosts
-    if _ghosts is None:
-        try:
-            with open(GHOST_FILE, encoding="utf-8") as f:
-                _ghosts = json.load(f).get("open", [])
-        except Exception:
-            _ghosts = []
-    return _ghosts
-
-def _save_ghosts():
-    tmp = GHOST_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"open": _load_ghosts()}, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, GHOST_FILE)
-
-def ghost_open(wb: Workbook, sig: dict, reason: str) -> dict | None:
-    """Ouvre un fantôme pour un signal non tradé. Un seul fantôme ouvert par
-    (symbole, côté, mode) : un signal qui persiste plusieurs minutes ne compte qu'une fois."""
-    ghosts = _load_ghosts()
-    coin   = sig["symbol"]
-    mode   = sig.get("conditions", {}).get("mode", "?")
-    if any(g["symbol"] == coin and g["side"] == sig["signal"] and g["mode"] == mode for g in ghosts):
-        return None
-    entry, atr = float(sig["price"]), float(sig["atr_m5"])
-    if entry <= 0 or atr <= 0:
-        return None
-    is_buy = sig["signal"] == "buy"
-    now    = time.time()
-    g = {
-        "id": f"G{int(now * 1000)}-{coin}", "symbol": coin, "side": sig["signal"], "mode": mode,
-        "regime": sig.get("conditions", {}).get("regime", _current_regime),
-        "score": sig.get("score", 0.0), "reason": reason, "entry": entry,
-        "sl": entry - ATR_SL_MULT * atr if is_buy else entry + ATR_SL_MULT * atr,
-        "tp": entry + ATR_TP_MULT * atr if is_buy else entry - ATR_TP_MULT * atr,
-        "conditions": sig.get("conditions", {}),
-        "opened_at": now,
-        # Bougies M1 déjà examinées : on part de la minute en cours
-        "checked_ts": int(now // 60) * 60 * 1000 - 1,
-    }
-    ghosts.append(g)
-    _save_ghosts()
-    try:
-        ws = wb["Fantômes"]
-        ws.append([g["id"], datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d %H:%M"),
-                   SYM_LABEL.get(coin, coin), g["side"].upper(), mode, g["regime"], g["score"],
-                   reason, round(entry, 6), round(g["sl"], 6), round(g["tp"], 6), "Ouvert", None, None, None])
-        _safe_save(wb)
-    except Exception as e:
-        log_error(f"ghost excel {coin}: {e}")
-    return g
-
-def _ghost_resolve(g: dict, candles: list[dict], now: float | None = None) -> tuple[str, float] | None:
-    """Parcourt les bougies M1 postérieures à g['checked_ts'].
-    Retourne (statut, prix de sortie) si SL/TP touché ou délai dépassé, sinon None.
-    SL et TP dans la même bougie → SL (hypothèse prudente)."""
-    is_buy = g["side"] == "buy"
-    for c in candles:
-        if c["ts"] <= g["checked_ts"]:
-            continue
-        g["checked_ts"] = c["ts"]
-        if is_buy:
-            if c["l"] <= g["sl"]: return "SL", g["sl"]
-            if c["h"] >= g["tp"]: return "TP", g["tp"]
-        else:
-            if c["h"] >= g["sl"]: return "SL", g["sl"]
-            if c["l"] <= g["tp"]: return "TP", g["tp"]
-    now = now if now is not None else time.time()
-    if now - g["opened_at"] >= GHOST_MAX_HOURS * 3600 and candles:
-        return "Délai", candles[-1]["c"]
-    return None
-
-def _ghost_pnl_pct(g: dict, exit_px: float) -> float:
-    move = (exit_px - g["entry"]) / g["entry"] * 100
-    return round((move if g["side"] == "buy" else -move) - GHOST_FEE_PCT, 3)
-
-def _ghost_by_type(closed: list[dict]) -> str:
-    """Résumé heartbeat des fantômes clos par côté/mode : "SELL MOM ✓2/5 moy -0.10%"."""
-    by: dict[str, list[float]] = {}
-    for g in closed:
-        by.setdefault(f"{g['side'].upper()} {g['mode']}", []).append(g["pnl_pct"])
-    return " · ".join(f"{k} ✓{sum(p > 0 for p in v)}/{len(v)} moy {sum(v) / len(v):+.2f}%"
-                      for k, v in sorted(by.items()))
-
-def ghost_update(wb: Workbook) -> list[dict]:
-    """Résout les fantômes ouverts (1 fetch M1 par symbole). Retourne les fantômes clos."""
-    ghosts = _load_ghosts()
-    if not ghosts:
-        return []
-    closed = []
-    now = time.time()
-    for coin in {g["symbol"] for g in ghosts}:
-        group = [g for g in ghosts if g["symbol"] == coin]
-        since = min(g["checked_ts"] for g in group)
-        n = int(min(200, max(3, (now * 1000 - since) / 60000 + 2)))
-        try:
-            candles = fetch_candles(coin, INTERVAL_M1, n)
-        except Exception as e:
-            log_error(f"ghost candles {coin}: {e}")
-            continue
-        for g in group:
-            res = _ghost_resolve(g, candles, now)
-            if not res:
-                continue
-            status, exit_px = res
-            g.update(status=status, exit=exit_px, pnl_pct=_ghost_pnl_pct(g, exit_px), closed_at=now)
-            closed.append(g)
-    if closed:
-        for g in closed:
-            ghosts.remove(g)
-            if g["mode"] != "MRv":   # MRv = étude du filtre volume, ne doit pas biaiser le vrai MR
-                record_lesson({"symbol": g["symbol"], "side": g["side"].upper(),
-                               "conditions": g["conditions"]}, g["status"], g["pnl_pct"], ghost=True)
-            try:
-                ws = wb["Fantômes"]
-                for row in ws.iter_rows(min_row=2):
-                    if row[0].value == g["id"]:
-                        row[11].value = g["status"]
-                        row[12].value = round(g["exit"], 6)
-                        row[13].value = g["pnl_pct"]
-                        row[14].value = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d %H:%M")
-                        fill = _FILLS["tp"] if g["pnl_pct"] > 0 else _FILLS["sl"]
-                        for cell in row:
-                            cell.fill = fill
-                        break
-            except Exception as e:
-                log_error(f"ghost excel close {g['symbol']}: {e}")
-            print(f"  {C.DIM}[FANTÔME {g['status']}] {g['symbol']} {g['side'].upper()} [{g['mode']}] "
-                  f"{g['reason']} → {g['pnl_pct']:+.2f}%{C.RST}")
-        _save_ghosts()
-        try:
-            _safe_save(wb)
-        except Exception as e:
-            log_error(f"ghost excel save: {e}")
-    else:
-        _save_ghosts()   # checked_ts avancé
-    return closed
 
 # ── Stratégie tendance journalière ───────────────────────────────────────────
 # Momentum de série temporelle : chaque jour, pour chaque coin, LONG si la clôture D1 est
@@ -2149,12 +560,6 @@ def _save_trend():
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(_load_trend(), f, indent=2)
     os.replace(tmp, TREND_FILE)
-
-def trend_coins() -> set[str]:
-    """Coins tenus en réel par la stratégie tendance (à ne pas adopter par le scalping), y compris
-    ceux d'une ouverture restée sans réponse."""
-    state = _load_trend()
-    return {c for c, p in state["positions"].items() if not p.get("paper")} | set(state["opening"])
 
 def _hl_d1(coin: str, count: int) -> list[dict]:
     """Les `count` dernières bougies D1 closes de Hyperliquid, au format de fetch_candles. Secours
@@ -2282,7 +687,7 @@ def trend_open(wb: Workbook, coin: str, side: str, atr: float, equity: float, mi
     if not GHOST_ONLY:
         pos["sl_oid"] = _place_sl(coin, is_buy, qty, sl)
         if pos["sl_oid"] is None:
-            # Position sans stop : on la referme tout de suite (comme place_order)
+            # Position sans stop : on la referme tout de suite
             try:
                 rc = exchange.market_close(coin, slippage=TREND_SLIP_CLOSE)
                 closed = rc is not None and rc.get("status") == "ok"
@@ -2305,7 +710,7 @@ def _trend_log_open(wb: Workbook, pos: dict, equity: float, note: str = ""):
     notional = round(qty * entry, 2)
     try:
         wb["Tendance"].append([pos["id"], datetime.fromtimestamp(pos["opened_at"], timezone.utc).strftime("%Y-%m-%d %H:%M"),
-                               SYM_LABEL[coin], side, "Fantôme" if paper else "Réel", qty,
+                               f"{coin}/USDT", side, "Fantôme" if paper else "Réel", qty,
                                round(entry, 6), sl, notional, "Ouvert", None, None, None, None])
         _safe_save(wb)
     except Exception as e:
@@ -2706,6 +1111,48 @@ def trend_heartbeat(wb: Workbook, mids: dict | None, equity: float, closed: list
             f"Bilan {mode.lower()} depuis le début : **{pct(sum(done) + mode_lt):+.2f} %** du capital "
             f"({len(done)} fermée{'s' if len(done) > 1 else ''}, {wins} gagnante{'s' if wins > 1 else ''})")
 
+# ── Tableau de bord (dashboard.html) ──────────────────────────────────────────
+def write_dashboard(wb: Workbook, user_state: dict | None, balance: float, initial_balance: float):
+    """Page locale régénérée à chaque cycle et rafraîchie toutes les 15 s dans le navigateur : équité,
+    positions tendance avec leur P&L latent lu sur le compte, bilan des positions fermées (avant : page de
+    l'ancien scalping, régime, scans et leçons). Une erreur est journalisée sans arrêter le bot."""
+    try:
+        upnl = {ap["position"]["coin"]: float(ap["position"].get("unrealizedPnl") or 0)
+                for ap in (user_state or {}).get("assetPositions", [])}
+        mode = "Fantôme" if GHOST_ONLY else "Réel"
+        done = [r[11] for r in wb["Tendance"].iter_rows(min_row=2, values_only=True)
+                if r[4] == mode and r[11] is not None]
+        pct  = lambda usd: usd / balance * 100 if balance > 0 else 0.0
+        col  = lambda v: "#4ade80" if v > 0 else ("#f87171" if v < 0 else "#e5e7eb")
+        rows = ""
+        for coin, p in sorted(_load_trend()["positions"].items()):
+            lat = None if p.get("paper") else upnl.get(coin)
+            rows += (f"<tr><td>{coin}</td><td>{'LONG' if p['side'] == 'BUY' else 'SHORT'}</td><td>{p['qty']:g}</td>"
+                     f"<td>${p['entry']:.6g}</td><td>${p['sl']:.6g}</td>"
+                     + (f"<td style='color:{col(lat)}'>${lat:+.2f} ({pct(lat):+.2f} %)</td>" if lat is not None
+                        else "<td>—</td>")
+                     + f"<td>{datetime.fromtimestamp(p.get('opened_at') or 0, timezone.utc):%d/%m %H:%M}</td></tr>")
+        html = f"""<!doctype html>
+<html lang="fr"><head><meta charset="utf-8"><meta http-equiv="refresh" content="15"><title>BotShortTrade</title>
+<style>body{{background:#111827;color:#e5e7eb;font-family:system-ui,sans-serif;margin:24px}}
+td,th{{padding:6px 14px;border-bottom:1px solid #374151;text-align:left}}table{{border-collapse:collapse}}
+.k{{display:inline-block;margin:16px 40px 16px 0}}.k b{{display:block;font-size:26px}}small{{color:#9ca3af}}</style></head>
+<body><h1>BotShortTrade — tendance journalière</h1>
+<small>Mis à jour le {datetime.now(timezone.utc):%d/%m/%Y à %H:%M:%S} UTC · rafraîchi toutes les 15 s ·
+{'TESTNET' if HL_TESTNET else 'MAINNET (argent réel)'}{' · mode fantôme (aucun ordre réel)' if GHOST_ONLY else ''}</small><br>
+<div class="k">Équité<b>${balance:.2f}</b><small>{_since_start(balance, initial_balance)} (réf. ${initial_balance:.2f})</small></div>
+<div class="k">Positions fermées ({mode.lower()})<b style="color:{col(sum(done))}">${sum(done):+.2f}</b>
+<small>{len(done)} fermée(s) · {sum(1 for x in done if x > 0)} gagnante(s)</small></div>
+<table><tr><th>Coin</th><th>Sens</th><th>Qté</th><th>Entrée</th><th>SL</th><th>Latent</th><th>Ouverte (UTC)</th></tr>
+{rows or "<tr><td colspan='7'>aucune position</td></tr>"}</table>
+<p><small>Vote {'/'.join(map(str, TREND_LOOKBACKS))} j · SL {TREND_SL_ATR:g}×ATR D1 · exposition {TREND_EXPOSURE:.0%} de l'équité</small></p>
+</body></html>"""
+        with open("dashboard.html", "w", encoding="utf-8") as f:
+            f.write(html)
+    except Exception as e:
+        log_error(f"write_dashboard: {e}")
+
+# ── Boucle principale ─────────────────────────────────────────────────────────
 def run():
     print(f"\n{C.BCYN}{'═' * 60}{C.RST}")
     print(f"  {C.BOLD}BotShortTrade  –  Hyperliquid DEX{C.RST}")
@@ -2714,330 +1161,66 @@ def run():
     wb = init_excel()
     init_exchange_info()
 
-    # ── Calibrage du capital sur le solde réel ────────────────────────────────
-    global MAX_LIQUIDITY, CAPITAL_PER_TRADE
-    try:
-        balance = get_equity()
-        print(f"  Balance : {C.BOLD}${balance:.2f} USDC{C.RST}")
-    except Exception as e:
-        log_error(f"Balance: {e}")
-        balance = _MAX_LIQ_CFG if _MAX_LIQ_CFG > 0 else 100.0
-
-    if _MAX_LIQ_CFG > 0:
-        # Plafond manuel — utile pour limiter l'exposition si le portefeuille est grand
-        MAX_LIQUIDITY = min(_MAX_LIQ_CFG, balance)
-        print(f"  {C.BYLW}Capital plafonné à ${MAX_LIQUIDITY:.2f} (config) sur ${balance:.2f} disponibles{C.RST}")
-    else:
-        # Mode auto : gère tout le portefeuille
-        MAX_LIQUIDITY = balance
-        print(f"  {C.BGRN}Capital auto : ${MAX_LIQUIDITY:.2f} USDC (solde complet){C.RST}")
-
-    CAPITAL_PER_TRADE = MAX_LIQUIDITY * CAPITAL_PCT
-    print(f"  {C.DIM}Par trade : {CAPITAL_PCT*100:.0f}% × ${MAX_LIQUIDITY:.2f} = {C.RST}{C.BOLD}${CAPITAL_PER_TRADE:.2f}{C.RST}")
-
+    # Aucune décision sans l'équité réelle : Hyperliquid injoignable au démarrage → nouvel essai (avant :
+    # 100 $ supposés, et des positions taillées sur ce montant si la lecture suivante échouait aussi)
+    while True:
+        try:
+            balance = get_equity()
+            break
+        except Exception as e:
+            log_error(f"équité au démarrage (nouvel essai dans {STARTUP_RETRY_S} s) : {e}")
+            time.sleep(STARTUP_RETRY_S)
+    print(f"  Équité : {C.BOLD}${balance:.2f} USDC{C.RST}"
+          + (f" · tailles calculées sur au plus ${_MAX_LIQ_CFG:.2f} (MAX_LIQUIDITY)" if _MAX_LIQ_CFG > 0 else ""))
     initial_balance = load_initial_balance(balance)
     initial_balance += sum(f for _, f in sync_deposits())   # dépôts / retraits faits bot arrêté
     run._ledger_ts = time.time()
     print(f"  {C.DIM}Solde initial (référence % P&L) : ${initial_balance:.2f} USDC{C.RST}")
+    print(f"\n  {C.DIM}Démarrage — un cycle toutes les {LOOP_SECONDS}s{C.RST}\n")
 
-    open_positions, capital_in_use = recover_open_positions()
-    if open_positions:
-        reconcile_zombie_orders(wb, open_positions)
-        ensure_sl_orders(open_positions)
-        save_positions_state(open_positions)
-        print(f"  {C.BCYN}Positions reprises : {len(open_positions)}{C.RST}")
-    else:
-        print(f"  {C.DIM}Aucune position ouverte à la reprise{C.RST}")
-
-    LOOP_SECONDS = 60
-    print(f"\n  {C.DIM}Démarrage — scan toutes les {LOOP_SECONDS}s{C.RST}\n")
-
-    if STRATEGY == "trend":
-        _strat = (f"Stratégie : **tendance journalière** (vote {'/'.join(map(str, TREND_LOOKBACKS))} j, "
-                  f"SL {TREND_SL_ATR:g}×ATR D1) · "
-                  f"exposition {TREND_EXPOSURE:.0%} de l'équité · positions tendance : "
-                  f"{len(_load_trend()['positions'])}\n")
-    else:
-        _strat = (f"Stratégie : **scalping M1** · par trade ${CAPITAL_PER_TRADE:.2f} (levier ×{LEVERAGE})\n")
     send_discord_alert(
         "🚀 Bot démarré",
         f"Réseau : **{'TESTNET' if HL_TESTNET else 'MAINNET'}**"
         + (" · **mode fantôme seul (aucun ordre réel)**" if GHOST_ONLY else "")
         + (f" · capital fictif du test : **${PAPER_EQUITY:g}**" if GHOST_ONLY and PAPER_EQUITY > 0 else "") + "\n"
-        + _strat +
+        f"Stratégie : **tendance journalière** (vote {'/'.join(map(str, TREND_LOOKBACKS))} j, "
+        f"SL {TREND_SL_ATR:g}×ATR D1) · exposition {TREND_EXPOSURE:.0%} de l'équité · positions tendance : "
+        f"{len(_load_trend()['positions'])}\n"
         f"Équité : **${balance:.2f}** · {_since_start(balance, initial_balance)}\n"
-        + (f"Positions scalping reprises : {len(open_positions)}\n" if STRATEGY != "trend" or open_positions else "")
-        + f"Coins : {', '.join(TREND_COINS if STRATEGY == 'trend' else WATCHLIST)}",
+        f"Coins : {', '.join(TREND_COINS)}",
         color=0x3498db)
 
-    # Stats du heartbeat Discord — remises à zéro après chaque envoi
-    hb_last    = time.time()
-    hb_cycles  = 0   # cycles de boucle
-    hb_scans   = 0   # cycles où le marché a réellement été scanné
-    hb_raw     = 0   # signaux détectés (avant filtre régime/score)
-    hb_kept    = 0   # signaux retenus (après filtre)
-    hb_opened  = 0   # trades ouverts
-    hb_closed  = 0   # trades fermés
-    hb_best    = None  # meilleur signal brut vu sur la période
-    hb_blocked: dict[str, int] = {}   # raison → nb de cycles sans scan
-    hb_g_opened = 0                   # fantômes ouverts sur la période
-    hb_g_closed: list[dict] = []      # fantômes clos sur la période
-    hb_t_closed: list[dict] = []      # positions tendance fermées sur la période
-    cycle_errors: set[tuple] = set()  # (jour UTC, erreur) imprévues déjà signalées sur Discord
-
-    def _ghost_all(sigs: list[dict], reason_of) -> int:
-        """Ouvre un fantôme pour chaque signal (raison calculée par reason_of(sig))
-        + les candidats bloqués collectés par get_signal. Retourne le nb ouvert."""
-        n = 0
-        for sg in sigs:
-            n += ghost_open(wb, sg, reason_of(sg)) is not None
-        while _ghost_candidates:
-            c = _ghost_candidates.pop()
-            n += ghost_open(wb, c, c["ghost_reason"]) is not None
-        return n
+    hb_last, hb_cycles = time.time(), 0   # résumé Discord : remis à zéro après chaque envoi
+    hb_closed: list[dict] = []            # positions tendance fermées sur la période
+    cycle_errors: set[tuple] = set()      # (jour UTC, erreur) imprévues déjà signalées sur Discord
 
     while True:
         loop_start = time.time()
         try:
-            ts      = datetime.now(timezone.utc).strftime("%H:%M:%S")
-            now_min = datetime.now(timezone.utc).minute   # affichages console périodiques
+            ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
             print(f"\n{C.DIM}[{ts}] ──────────────────────────────────────────────────{C.RST}")
 
-            # ── Fetch unique par cycle : user_state sert pour check_position + equity + unrealized ──
-            # Avant : 3–4 appels info.user_state() par cycle (check × N + get_equity + get_unrealized)
-            # Maintenant : 1 seul appel, partagé par tous.
-            _user_state: dict | None = None
+            # Compte lu une fois par cycle : équité, positions (SL touchés, coins tenus par un autre bot)
+            user_state: dict | None = None
             try:
-                _user_state = info.user_state(WALLET_ADDRESS)
+                user_state = info.user_state(WALLET_ADDRESS)
             except Exception as e:
                 log_error(f"user_state: {e}")
-
-            # Suivi des positions ouvertes
-            closed_this_loop = []
-            _cycle_mids: dict | None = None
-            if open_positions and _user_state is not None:
-                try:
-                    _cycle_mids = info.all_mids()
-                except Exception:
-                    pass
-            for pos in list(open_positions):
-                result = check_position(wb, pos, _user_state, _cycle_mids)
-                if result is not None:
-                    closed_this_loop.append(pos)
-
-            for pos in closed_this_loop:
-                open_positions.remove(pos)
-                capital_in_use = max(0.0, capital_in_use - CAPITAL_PER_TRADE)
-
-            # Surveillance des SL toutes les 5 min (1 appel API) — position sans stop = risque max
-            if open_positions and time.time() - run.__dict__.get("_sl_check_ts", 0) >= SL_CHECK_S:
-                run._sl_check_ts = time.time()
-                if ensure_sl_orders(open_positions):
-                    save_positions_state(open_positions)
-
-            # Mode fantôme : résolution des signaux virtuels ouverts
             try:
-                hb_g_closed += ghost_update(wb)
-            except Exception as e:
-                log_error(f"ghost_update: {e}")
-
-            # Persister l'état après chaque cycle de vérification :
-            # - positions fermées : évident
-            # - positions ouvertes : sl, sl_oid et trailed peuvent avoir changé via trail_sl()
-            #   Si le bot crashe avant le prochain save, le nouvel sl_oid serait perdu sur disque
-            save_positions_state(open_positions)
-
-            # Balance : si des positions ont fermé ce cycle, user_state est stale → refetch
-            try:
-                balance = get_equity(None if closed_this_loop else _user_state)
+                balance = get_equity(user_state)
             except Exception as e:
                 log_error(f"équité (solde précédent conservé) : {e}")
+            print(f"  Équité : {C.BOLD}${balance:.2f}{C.RST} · {_since_start(balance, initial_balance)}")
 
-            # ── Auto-recalibrage du capital ───────────────────────────────────────────
-            # Recalibrer si le solde réel s'écarte significativement de MAX_LIQUIDITY
-            # (baisse > 20% OU hausse > 20%) ET aucune position ouverte.
-            # Hausse = dépôt ou profit accumulé. Baisse = perte ou retrait.
-            balance_drift = abs(balance - MAX_LIQUIDITY) / max(MAX_LIQUIDITY, 0.01)
-            if balance_drift > 0.20 and len(open_positions) == 0:
-                old_max = MAX_LIQUIDITY
-                MAX_LIQUIDITY      = max(balance, 0.01)
-                CAPITAL_PER_TRADE  = MAX_LIQUIDITY * CAPITAL_PCT
-                capital_in_use     = 0.0
-                direction = "↑" if balance > old_max else "↓"
-                print(f"  {C.BYLW}[RECALIBRAGE {direction}]{C.RST} Solde ${old_max:.2f} → ${MAX_LIQUIDITY:.2f} | "
-                      f"par trade ${CAPITAL_PER_TRADE:.2f}")
+            # Stratégie tendance : SL touchés, puis alignement de chaque coin sur le signal du jour
+            try:
+                hb_closed += trend_cycle(wb, user_state, _sizing_equity(balance))
+            except Exception as e:
+                log_error(f"tendance : {e}")
+                traceback.print_exc()
+            held = ", ".join(c + " " + p["side"] for c, p in sorted(_load_trend()["positions"].items()))
+            print(f"  Tendance{' (fantôme)' if GHOST_ONLY else ''} : {held or 'aucune position'}")
 
-            # Disponible = min(tracking interne, cash libre réel)
-            # Le solde Hyperliquid (balance) inclut la marge des positions ouvertes.
-            # Si balance < capital_in_use, le compte est en sous-marge → bloquer tout nouveau trade.
-            internal_avail = MAX_LIQUIDITY - capital_in_use
-            real_free      = max(0.0, balance - capital_in_use)
-            avail_capital  = min(internal_avail, real_free)
-
-            # Alerte divergence — seulement toutes les 5 min pour ne pas spammer
-            if (internal_avail > 0 and real_free < internal_avail * 0.8
-                    and now_min % 5 == 0):
-                print(f"  {C.BRED}[ALERTE]{C.RST} Dispo interne ${internal_avail:.2f} vs "
-                      f"cash libre ${real_free:.2f} — {len(open_positions)} position(s) en marge")
-
-            max_slots     = MAX_TRADES if MAX_TRADES > 0 else 999
-            slots_left    = max_slots - len(open_positions)
-
-            pnl_total, pnl_week = calc_portfolio_pnl(wb)
-            pnl_today  = calc_daily_pnl(wb)   # P&L du jour calculé ici → réutilisé pour le filtre
-            unrealized = get_unrealized_pnl(_user_state, {p["symbol"] for p in open_positions} | trend_coins())
-            net_pnl = pnl_total + unrealized
-            net_pct = (net_pnl / initial_balance * 100) if initial_balance > 0 else 0.0
-            _dispo_c = C.BRED if avail_capital <= 0 else (C.BYLW if avail_capital < CAPITAL_PER_TRADE * 2 else C.WHT)
-            print(f"  Positions: {C.BOLD}{len(open_positions)}{C.RST}  Dispo: {_dispo_c}${avail_capital:.2f}{C.RST}  Équité: {C.BOLD}${balance:.2f}{C.RST}")
-            print(f"  P&L réalisé: {_cp(pnl_total)}${pnl_total:+.2f}{C.RST}  |  Non réalisé: {_cp(unrealized)}${unrealized:+.2f}{C.RST}  |  Net: {_cp(net_pnl)}{C.BOLD}${net_pnl:+.2f} ({net_pct:+.1f}%){C.RST}")
-            print(f"  P&L 7j: {_cp(pnl_week)}${pnl_week:+.2f}{C.RST}  |  Aujourd'hui: {_cp(pnl_today)}${pnl_today:+.2f}{C.RST}")
-
-            # Filtre horaire (heures UTC)
-            hour_utc = datetime.now(timezone.utc).hour
-            in_session = SESSION_START_UTC <= hour_utc < SESSION_END_UTC
-
-            # Régime de marché — mis à jour toutes les 30 min (candles journalières, pas besoin de plus).
-            # Échec Bybit → on garde le régime précédent et on réessaie au cycle suivant
-            # (avant : RANGING forcé pendant 30 min ; et "minute % 30" ratait parfois sa minute).
-            if time.time() - run.__dict__.get("_regime_ts", 0) >= REGIME_REFRESH_S:
-                try:
-                    run._regime_cache = _compute_regime()
-                    run._regime_ts    = time.time()
-                except Exception as e:
-                    log_error(f"régime (précédent conservé) : {e}")
-            regime, bias, btc_chg, eth_chg = run.__dict__.get("_regime_cache", ("RANGING", "neutral", 0.0, 0.0))
-            global _current_regime
-            _current_regime = regime   # partagé avec get_signal() pour les leçons
-            _rc = (C.BGRN if regime == "BULL" else
-                   C.BRED if regime in ("BEAR", "DIVERGING") else C.BYLW)
-            print(f"  Régime: {_rc}{regime}{C.RST}  BTC={btc_chg:+.1f}%  ETH={eth_chg:+.1f}%")
-
-            # Limite de perte journalière (pnl_today déjà calculé plus haut)
-            daily_loss_limit = -MAX_LIQUIDITY * MAX_DAILY_LOSS_PCT / 100
-            daily_loss_hit = pnl_today <= daily_loss_limit
-            if daily_loss_hit:
-                print(f"  {C.BRED}[STOP]{C.RST} Perte du jour atteinte (${pnl_today:.2f} ≤ ${daily_loss_limit:.2f})")
-
-            # Bloquer les nouveaux trades en régime dangereux
-            regime_blocked = regime in ("BEAR", "DIVERGING")
-            if regime_blocked:
-                print(f"  {C.BRED}[RÉGIME]{C.RST} {regime} — aucun nouveau trade")
-
-            # Raison de non-scan (lisible)
-            if not in_session:
-                print(f"  {C.BYLW}[PAUSE]{C.RST} Hors session ({hour_utc}h UTC, actif {SESSION_START_UTC}h-{SESSION_END_UTC}h)")
-
-            # Avertissement solde insuffisant (< 2 trades possibles, aucune position ouverte)
-            if balance < CAPITAL_PER_TRADE * 2 and len(open_positions) == 0 and now_min % 5 == 0:
-                print(f"  {C.BRED}[SOLDE BAS]{C.RST} Équité ${balance:.2f} — "
-                      f"insuffisant pour trader (min recommandé ${CAPITAL_PER_TRADE * 3:.2f}). "
-                      f"Déposer des fonds pour reprendre.")
-
-            # Stratégie tendance : SL touchés + alignement sur le signal du jour (aucun scan scalping)
-            if STRATEGY == "trend":
-                try:
-                    hb_t_closed += trend_cycle(wb, _user_state, _sizing_equity(balance))
-                except Exception as e:
-                    log_error(f"tendance : {e}")
-                    traceback.print_exc()
-                _held = ", ".join(c + " " + p["side"] for c, p in sorted(_load_trend()["positions"].items()))
-                print(f"  Tendance{' (fantôme)' if GHOST_ONLY else ''} : {_held or 'aucune position'}")
-
-            # Scalping : chercher un nouveau signal
-            elif slots_left > 0 and avail_capital >= CAPITAL_PER_TRADE and in_session and not daily_loss_hit and not regime_blocked:
-                # + coins tenus par BotCopyTrade : 2 positions sur un coin fusionneraient
-                #   (user_state illisible → coins inconnus → aucun scan réel ce cycle)
-                open_coins = {p["symbol"] for p in open_positions} | (
-                    account_coins(_user_state) if _user_state is not None else set(WATCHLIST))
-                _ghost_candidates.clear()
-                signals    = scan_all(open_coins)
-                raw_signals = list(signals)   # pour le mode fantôme (signaux non tradés)
-                _print_scan_summary()
-                hb_scans += 1
-                hb_raw   += len(signals)
-                for s_ in signals:
-                    if hb_best is None or s_["score"] > hb_best["score"]:
-                        hb_best = s_
-
-                # Filtrage par régime :
-                # BULL     → BUY dans la tendance + SELL MR autorisé (suracheté, score ≥ 0.75)
-                #            SELL MOM bloqué (ne pas shorter un crash en plein BULL)
-                # RANGING  → exige score ≥ 0.75 (marché sans direction claire)
-                min_score = 0.75 if regime == "RANGING" else 0.45  # BULL : filtre les signaux trop faibles
-                bull_ok = signals
-                if regime == "BULL":
-                    signals = bull_ok = [s for s in signals if
-                               s["signal"] == "buy" or
-                               (s["signal"] == "sell" and
-                                s.get("conditions", {}).get("mode") == "MR" and
-                                s["score"] >= 0.75)]
-                signals = [s for s in signals if s["score"] >= min_score]
-                hb_kept += len(signals)
-                would_trade: list[dict] = []
-                if GHOST_ONLY:   # aucun ordre réel : les signaux retenus deviennent des fantômes
-                    would_trade, signals = signals, []
-
-                # Ouvrir jusqu'à slots_left positions si plusieurs bons signaux disponibles
-                opened_this_cycle = 0
-                traded: list[dict] = []
-                while signals and slots_left > 0 and avail_capital >= CAPITAL_PER_TRADE:
-                    sig = best_signal(signals)
-                    if not sig:
-                        break
-                    signals = [s for s in signals if s["symbol"] != sig["symbol"]]
-                    _ss = C.BGRN if sig["signal"] == "buy" else C.BRED
-                    print(f"\n  {_ss}[SIGNAL] {sig['symbol']} {sig['signal'].upper()}{C.RST}  score={sig['score']:.3f}  régime={regime}")
-                    try:
-                        pos = place_order(sig, wb)
-                        traded.append(sig)
-                        open_positions.append(pos)
-                        capital_in_use += CAPITAL_PER_TRADE
-                        avail_capital  -= CAPITAL_PER_TRADE
-                        slots_left     -= 1
-                        opened_this_cycle += 1
-                        save_positions_state(open_positions)
-                    except Exception as e:
-                        log_error(f"place_order: {e}")
-                        traceback.print_exc()
-                        break  # ne pas tenter un 2e ordre si le 1er échoue
-
-                hb_opened += opened_this_cycle
-                if opened_this_cycle == 0:
-                    print(f"  {C.DIM}Pas de signal retenu ce cycle{C.RST}")
-
-                # Fantômes : tous les signaux détectés mais non tradés
-                hb_g_opened += _ghost_all(
-                    [sg for sg in raw_signals if not any(sg is t for t in traded)],
-                    lambda sg: ("fantôme seul (aurait été tradé)" if any(sg is w for w in would_trade) else
-                                "filtre BULL" if not any(sg is b for b in bull_ok) else
-                                f"score<{min_score}" if sg["score"] < min_score else
-                                "non pris (slot/capital)"))
-            else:
-                if slots_left <= 0:
-                    print(f"  {C.DIM}Toutes les positions sont ouvertes — scan réel ignoré{C.RST}")
-                elif avail_capital < CAPITAL_PER_TRADE:
-                    print(f"  {C.DIM}Capital insuffisant (${avail_capital:.2f} < ${CAPITAL_PER_TRADE:.2f}) — scan réel ignoré{C.RST}")
-                _scan_log.clear()
-                # Scan fantôme : aucun trade possible (régime, slots, capital, perte du jour),
-                # mais on suit virtuellement les signaux pour apprendre (ex. SELL MOM en BEAR)
-                if in_session:
-                    _gwhy = ("positions max" if slots_left <= 0 else
-                             "capital insuffisant" if avail_capital < CAPITAL_PER_TRADE else
-                             "perte du jour" if daily_loss_hit else f"régime {regime}")
-                    _ghost_candidates.clear()
-                    try:
-                        gsigs = scan_all({p["symbol"] for p in open_positions})
-                        _scan_log.clear()
-                        hb_g_opened += _ghost_all(gsigs, lambda sg: _gwhy)
-                    except Exception as e:
-                        log_error(f"scan fantôme: {e}")
-
-            # Afficher le résumé des leçons du scalping toutes les 10 min (inutile en mode tendance)
-            if STRATEGY != "trend" and now_min % 10 == 0:
-                print_lessons_summary()
-
-            # ── Détection d'anomalies + alertes Discord ───────────────────────────────
             # Dépôts / retraits relevés toutes les 10 min, et tout de suite si l'équité bouge de plus de 5 % :
             # référence du « % depuis le départ » ajustée (avant : un dépôt comptait comme un gain)
             prev = run.__dict__.get("_prev_equity", 0.0)
@@ -3047,135 +1230,38 @@ def run():
                 run._ledger_ts = time.time()
                 moves = sync_deposits()
                 initial_balance += sum(f for _, f in moves)
-            # 1) Flash crash : équité chute > 5% en 1 cycle (60s), hors retrait fait pendant ce cycle
-            #    (avant : signalé comme un krach). Ignoré si des positions viennent de se fermer ce
-            #    cycle (faux positif courant : la marge libérée par un SL/TP n'est pas encore reflétée)
-            if prev > 0 and not closed_this_loop:
+            # Flash crash : équité en baisse de plus de 5 % en un cycle, hors retrait fait pendant ce cycle
+            # (avant : signalé comme un krach)
+            if prev > 0:
                 since_ms = (run.__dict__.get("_prev_ts", 0) - 60) * 1000
                 moved = sum(f for t, f in moves if t >= since_ms)
                 equity_drop_pct = (prev - (balance - moved)) / prev * 100
                 if equity_drop_pct > 5.0:
-                    msg = (f"Équité: **${prev:.2f}** → **${balance:.2f}** "
-                           f"(**-{equity_drop_pct:.1f}%** en 1 cycle)")
                     print(f"  {C.BRED}[🔴 FLASH CRASH]{C.RST} {equity_drop_pct:.1f}% en 1 cycle")
-                    send_discord_alert("⚡ Flash Crash Détecté", msg, color=0xe74c3c)
+                    send_discord_alert("⚡ Flash Crash Détecté",
+                                       f"Équité: **${prev:.2f}** → **${balance:.2f}** "
+                                       f"(**-{equity_drop_pct:.1f}%** en 1 cycle)", color=0xe74c3c)
             run._prev_equity, run._prev_ts = balance, time.time()
 
-            # 2) Drawdown non-réalisé > 4% de l'équité
-            if len(open_positions) > 0 and balance > 0:
-                dd_pct = abs(unrealized) / balance * 100
-                if unrealized < -balance * 0.04:
-                    if not getattr(run, '_drawdown_alerted', False):
-                        msg = (f"P&L non-réalisé: **${unrealized:.2f}** ({dd_pct:.1f}% de l'équité)\n"
-                               f"{len(open_positions)} position(s) ouverte(s)")
-                        print(f"  {C.BRED}[📉 DRAWDOWN]{C.RST} {dd_pct:.1f}% de l'équité non-réalisé")
-                        send_discord_alert("📉 Drawdown Élevé", msg, color=0xe67e22)
-                        run._drawdown_alerted = True
-                else:
-                    run._drawdown_alerted = False
-
-            # 3) Position zombie : ouverte depuis > 6h sans fermeture
-            #    • En drawdown → fermeture automatique (capital libéré pour de nouveaux trades)
-            #    • En profit   → alerte seulement (le trailing stop protège)
-            for pos in list(open_positions):
-                opened_at = pos.get('opened_at')
-                if opened_at:
-                    age_h = (time.time() - opened_at) / 3600
-                    alert_key = f"_zombie_{pos['symbol']}_{pos['id']}"
-                    if age_h > 6.0 and not getattr(run, alert_key, False):
-                        # P&L non-réalisé depuis le cache user_state du cycle
-                        _zpnl = 0.0
-                        if _user_state:
-                            for _ap in _user_state.get("assetPositions", []):
-                                if _ap["position"]["coin"] == pos["symbol"]:
-                                    _zpnl = float(_ap["position"].get("unrealizedPnl", 0))
-                                    break
-                        print(f"  {C.BRED}[🧟 ZOMBIE]{C.RST} {pos['symbol']} ouverte depuis "
-                              f"{age_h:.1f}h  P&L={_cp(_zpnl)}${_zpnl:.2f}{C.RST}")
-                        if _zpnl < 0:
-                            # Retirer et sauvegarder AVANT la fermeture sur l'exchange.
-                            # Si le bot s'arrête mid-close, au prochain redémarrage la position
-                            # n'a plus d'enrichissement → opened_at = time.time() → pas zombie.
-                            if pos in open_positions:
-                                open_positions.remove(pos)
-                                capital_in_use = max(0.0, capital_in_use - CAPITAL_PER_TRADE)
-                            save_positions_state(open_positions)
-                            if force_close_zombie(wb, pos) is None:
-                                # Échec : la position reste ouverte (SL intact) → on la remet en suivi
-                                # et on réessaiera au prochain cycle (alert_key non posé)
-                                open_positions.append(pos)
-                                capital_in_use += CAPITAL_PER_TRADE
-                                save_positions_state(open_positions)
-                                continue
-                        else:
-                            # En profit → alerter seulement, laisser le trailing gérer
-                            msg = (f"**{pos['symbol']}** ouverte depuis **{age_h:.1f}h** — en profit ${_zpnl:.2f}\n"
-                                   f"SL trailing actif : ${pos.get('sl', 0):.4f}")
-                            send_discord_alert("🧟 Position Zombie (profitable)", msg, color=0xf39c12)
-                        setattr(run, alert_key, True)
-
-            # ── Heartbeat Discord : preuve de vie + résumé de la période ──
+            # Résumé Discord périodique : positions tendance, fermetures de la période, équité
             hb_cycles += 1
-            hb_closed += len(closed_this_loop)
-            if STRATEGY == "scalp" and not (slots_left > 0 and avail_capital >= CAPITAL_PER_TRADE and in_session
-                                            and not daily_loss_hit and not regime_blocked):
-                _why = ("positions max" if slots_left <= 0 else
-                        "capital insuffisant" if avail_capital < CAPITAL_PER_TRADE else
-                        "hors session" if not in_session else
-                        "perte du jour" if daily_loss_hit else f"régime {regime}")
-                hb_blocked[_why] = hb_blocked.get(_why, 0) + 1
             if HEARTBEAT_HOURS > 0 and time.time() - hb_last >= HEARTBEAT_HOURS * 3600:
-                _best = (f"{hb_best['symbol']} {hb_best['signal'].upper()} "
-                         f"[{hb_best.get('conditions', {}).get('mode', '?')}] score {hb_best['score']:.3f}"
-                         if hb_best else "aucun")
-                _blk = (" · ".join(f"{k} ×{v}" for k, v in hb_blocked.items())) or "—"
-                _gw  = sum(1 for g in hb_g_closed if g["pnl_pct"] > 0)
-                _gavg = (sum(g["pnl_pct"] for g in hb_g_closed) / len(hb_g_closed)) if hb_g_closed else 0.0
-                _gtxt = (f"{len(_load_ghosts())} en cours · {hb_g_opened} ouverts · {len(hb_g_closed)} clos"
-                         + (f" (✓{_gw} ✗{len(hb_g_closed) - _gw}, moy {_gavg:+.2f}%)" if hb_g_closed else ""))
-                if hb_g_closed:
-                    _gtxt += "\nFantômes par type : " + _ghost_by_type(hb_g_closed)
-                _rej = (" · ".join(f"{k} ×{v}" for k, v in
-                                   sorted(_reject_stats.items(), key=lambda kv: -kv[1]))) or "—"
-                if STRATEGY == "trend":
-                    try:
-                        _hb_mids = info.all_mids()
-                    except Exception:
-                        _hb_mids = None
-                    _body = (trend_heartbeat(wb, _hb_mids, _sizing_equity(balance), hb_t_closed) + "\n"
-                             f"Régime : **{regime}** (BTC {btc_chg:+.1f}% · ETH {eth_chg:+.1f}% 7j)\n"
-                             f"Équité : **${balance:.2f}** · {_since_start(balance, initial_balance)}\n"
-                             f"Cycles : {hb_cycles}")
-                else:
-                    _body = (f"Régime : **{regime}** (BTC {btc_chg:+.1f}% · ETH {eth_chg:+.1f}% 7j)\n"
-                             f"Équité : **${balance:.2f}** · positions ouvertes : {len(open_positions)}\n"
-                             f"P&L aujourd'hui : ${pnl_today:+.2f}\n"
-                             f"Cycles : {hb_cycles} · scans : {hb_scans}\n"
-                             f"Signaux : {hb_raw} détectés → {hb_kept} retenus (min score {0.75 if regime == 'RANGING' else 0.45})\n"
-                             f"Trades : {hb_opened} ouverts · {hb_closed} fermés\n"
-                             f"Meilleur signal vu : {_best}\n"
-                             f"Scans bloqués : {_blk}\n"
-                             f"Rejets (1er filtre) : {_rej}\n"
-                             f"Fantômes : {_gtxt}")
+                try:
+                    mids = info.all_mids()
+                except Exception:
+                    mids = None
                 send_discord_alert(
                     f"💓 Bot actif — résumé {HEARTBEAT_HOURS:g}h",
                     ("Mode : **fantôme seul** (aucun ordre réel)"
                      + (f" · capital fictif **${PAPER_EQUITY:g}**" if PAPER_EQUITY > 0 else "") + "\n"
-                     if GHOST_ONLY else "") + _body,
-                    color=0x2ecc71 if hb_opened else 0x95a5a6)
-                hb_last = time.time()
-                hb_t_closed = []
-                hb_cycles = hb_scans = hb_raw = hb_kept = hb_opened = hb_closed = 0
-                hb_best = None
-                hb_blocked = {}
-                _reject_stats.clear()
-                hb_g_opened = 0
-                hb_g_closed = []
+                     if GHOST_ONLY else "")
+                    + trend_heartbeat(wb, mids, _sizing_equity(balance), hb_closed) + "\n"
+                    f"Équité : **${balance:.2f}** · {_since_start(balance, initial_balance)}\n"
+                    f"Cycles : {hb_cycles}",
+                    color=0x95a5a6)
+                hb_last, hb_cycles, hb_closed = time.time(), 0, []
 
-            # Régénérer le dashboard HTML à chaque cycle
-            write_dashboard(wb, open_positions + list(_load_trend()["positions"].values()), balance, initial_balance,
-                            pnl_total, pnl_week, unrealized, avail_capital,
-                            regime, btc_chg, eth_chg, pnl_today)
+            write_dashboard(wb, user_state, balance, initial_balance)
         except Exception as e:
             # Erreur imprévue : journalisée, signalée une fois par jour, nouvel essai au cycle suivant
             # (avant : bot arrêté, et systemd ne le relançait pas, la sortie semblant normale)
@@ -3188,8 +1274,7 @@ def run():
                                    f"`{err}`\nNouvel essai à chaque cycle ; les SL restent en place sur Hyperliquid.",
                                    color=0xf39c12)
 
-        elapsed = time.time() - loop_start
-        wait    = max(0.0, LOOP_SECONDS - elapsed)
+        wait = max(0.0, LOOP_SECONDS - (time.time() - loop_start))
         if wait > 0:
             time.sleep(wait)
 

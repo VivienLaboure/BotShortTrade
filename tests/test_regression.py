@@ -25,8 +25,7 @@ os.environ.update({
     "HL_PRIVATE_KEY": "0x" + "11" * 32,   # clé factice
     "HL_TESTNET": "1",
     "DISCORD_WEBHOOK_URL": "",
-    "LEVERAGE": "5", "CAPITAL_PCT": "0.15", "VOL_MULTIPLIER": "1.2",
-    "MIN_MOVE_PCT": "0.0002", "MAX_TRADES": "3", "HEARTBEAT_HOURS": "6",
+    "LEVERAGE": "5", "HEARTBEAT_HOURS": "6",
 })
 
 class _StubInfo:
@@ -102,13 +101,10 @@ class FakeInfo:
     def funding_history(self, coin, start): return [r for r in self.rates if r["time"] >= start]
     def user_non_funding_ledger_updates(self, addr, start): return [r for r in self.ledger if r["time"] >= start]
 
-SIG = {"symbol": "ETH", "signal": "buy", "score": 0.8, "atr_m5": 5.0, "price": 2000,
-       "conditions": {"mode": "MR", "regime": "RANGING", "rsi": 50, "bbp": 0.3, "vol_ratio": 1.5}}
-
 
 class BaseTest(unittest.TestCase):
     def setUp(self):
-        for f in (m.EXCEL_FILE, m.STATE_FILE, m.LESSONS_FILE, m.TREND_FILE):
+        for f in (m.EXCEL_FILE, m.STATE_FILE, m.TREND_FILE):
             if os.path.exists(f):
                 os.remove(f)
         m._trend = None; m._trend_sig.clear(); m._trend_alerted.clear(); m._trend_sl_ts = 0.0
@@ -135,93 +131,8 @@ def _hl_px_valide(px: float, sz_dec: int = 0) -> bool:
     return len(txt.replace(".", "").lstrip("0")) <= 5 and len(txt.split(".")[1]) <= 6 - sz_dec
 
 
-# ── place_order : SL/TP et sécurité stop-loss ────────────────────────────────
-class TestPlaceOrder(BaseTest):
-    def run_order(self, ex, sig=SIG):
-        with mock.patch.object(m, "exchange", ex), mock.patch.object(m, "info", FakeInfo()):
-            wb = m.init_excel()
-            return m.place_order(dict(sig), wb), wb
-
-    def test_sl_tp_calcules_sur_prix_execute(self):
-        pos, _ = self.run_order(FakeExchange(avg_px=2010.0))
-        self.assertEqual(pos["entry"], 2010.0)
-        self.assertAlmostEqual(pos["sl"], 2010.0 - m.ATR_SL_MULT * 5.0)
-        self.assertAlmostEqual(pos["tp"], 2010.0 + m.ATR_TP_MULT * 5.0)
-        self.assertEqual(pos["sl_oid"], 11)
-
-    def test_sl_tp_short(self):
-        sig = dict(SIG, signal="sell")
-        pos, _ = self.run_order(FakeExchange(avg_px=1990.0), sig)
-        self.assertAlmostEqual(pos["sl"], 1990.0 + m.ATR_SL_MULT * 5.0)
-        self.assertAlmostEqual(pos["tp"], 1990.0 - m.ATR_TP_MULT * 5.0)
-
-    def test_prix_sl_tp_valides_doge_au_dessus_de_10_cents(self):
-        """DOGE à 0.12345 : l'ancien arrondi (6 décimales) donnait 6 chiffres significatifs,
-        refusés par Hyperliquid → SL refusé → fermeture d'urgence de chaque trade."""
-        sig = dict(SIG, symbol="DOGE", atr_m5=0.000123, price=0.12345)
-        ex = FakeExchange(avg_px=0.12345)
-        with mock.patch.object(m, "exchange", ex), \
-             mock.patch.object(m, "info", FakeInfo(mids={"DOGE": "0.12345"})):
-            pos = m.place_order(sig, m.init_excel())
-        self.assertEqual(ex.closed, 0)
-        for o in ex.orders:
-            self.assertTrue(_hl_px_valide(o["triggerPx"]), o)
-        self.assertTrue(_hl_px_valide(pos["sl"]) and _hl_px_valide(pos["tp"]))
-
-    def test_sl_refuse_puis_accepte_au_retry(self):
-        ex = FakeExchange(sl=[_err(), _ok(33)])
-        pos, _ = self.run_order(ex)
-        self.assertEqual(pos["sl_oid"], 33)
-        self.assertEqual(ex.closed, 0)
-
-    def test_sl_refuse_deux_fois_ferme_la_position(self):
-        ex = FakeExchange(sl=[_err()])
-        with self.assertRaises(RuntimeError):
-            self.run_order(ex)
-        self.assertEqual(ex.closed, 1)
-        self.assertTrue(any("SL refusé" in t for t in self.titles()))
-        self.assertFalse(any(o["tpsl"] == "tp" for o in ex.orders))   # pas de TP posé
-
-    def test_sl_status_error_global(self):
-        ex = FakeExchange(sl=[{"status": "err", "response": "rate limited"}])
-        with self.assertRaises(RuntimeError):
-            self.run_order(ex)
-        self.assertEqual(ex.closed, 1)
-
-    def test_sl_refuse_et_fermeture_echoue_alerte_critique(self):
-        ex = FakeExchange(sl=[_err()], close_ok=False)
-        pos, _ = self.run_order(ex)          # position renvoyée pour rester suivie
-        self.assertIsNone(pos["sl_oid"])
-        self.assertTrue(any("SANS STOP-LOSS" in t for t in self.titles()))
-
-    def test_tp_refuse_alerte_mais_position_gardee(self):
-        ex = FakeExchange(tp=[_err()])
-        pos, _ = self.run_order(ex)
-        self.assertEqual(pos["sl_oid"], 11)
-        self.assertEqual(ex.closed, 0)
-        self.assertTrue(any("TP refusé" in t for t in self.titles()))
-
-    def test_ligne_excel_mode_regime_score(self):
-        _, wb = self.run_order(FakeExchange())
-        ws = wb["Trades"]
-        row = [c.value for c in ws[ws.max_row]]
-        hdr = [c.value for c in ws[1]]
-        self.assertEqual(row[hdr.index("Mode")], "MR")
-        self.assertEqual(row[hdr.index("Régime")], "RANGING")
-        self.assertEqual(row[hdr.index("Score")], 0.8)
-        self.assertEqual(hdr[14], "P&L final $")   # index utilisé par analyze_weekly.py
-
-
 # ── Excel ────────────────────────────────────────────────────────────────────
 class TestExcel(BaseTest):
-    def test_migration_ancien_fichier_15_colonnes(self):
-        wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Trades"
-        ws.append(m.COL_HEADERS[:15]); ws.append(["1", "2026-01-01 00:00"] + [0] * 13)
-        wb.save(m.EXCEL_FILE)
-        ws2 = m.init_excel()["Trades"]
-        self.assertEqual([c.value for c in ws2[1]], m.COL_HEADERS)
-        self.assertEqual(ws2.cell(2, 1).value, "1")   # données conservées
-
     def test_fichier_illisible_garde_sous_un_autre_nom(self):
         """trades.xlsx illisible (abîmé, réenregistré dans un autre format) : gardé sous un autre nom avec
         une alerte, puis nouveau fichier (avant : écrasé par un classeur vide, historique perdu)."""
@@ -239,6 +150,19 @@ class TestExcel(BaseTest):
                 os.remove(f)
         self.assertIn("Tendance", wb.sheetnames)
         self.assertIn("⚠️ trades.xlsx illisible", self.titles())
+
+    def test_ancien_fichier_garde_ses_onglets(self):
+        """Fichier existant avec les onglets de l'ancien scalping : historique gardé tel quel, onglet
+        Tendance ajouté une seule fois."""
+        wb = openpyxl.Workbook(); wb.active.title = "Trades"; wb.active.append(["ID", "x"])
+        wb.save(m.EXCEL_FILE)
+        self.assertEqual(m.init_excel().sheetnames, ["Trades", "Tendance"])
+        wb2 = m.init_excel()
+        self.assertEqual(wb2.sheetnames, ["Trades", "Tendance"])
+        self.assertEqual(wb2["Trades"].cell(1, 2).value, "x")
+
+    def test_nouveau_fichier_onglet_tendance_seul(self):
+        self.assertEqual(m.init_excel().sheetnames, ["Tendance"])
 
 
 # ── Équité ───────────────────────────────────────────────────────────────────
@@ -303,45 +227,8 @@ class TestEquity(BaseTest):
             m.get_equity({})
 
 
-# ── P&L : frais d'ouverture ──────────────────────────────────────────────────
-class TestSharedWallet(BaseTest):
-    POS = [{"position": {"coin": "ETH", "szi": "0.01", "entryPx": "2000", "unrealizedPnl": "1.5"}},
-           {"position": {"coin": "SOL", "szi": "-0.5", "entryPx": "100", "unrealizedPnl": "-3"}},
-           {"position": {"coin": "XRP", "szi": "0", "entryPx": "1", "unrealizedPnl": "0"}}]
-
-    def test_account_coins(self):
-        self.assertEqual(m.account_coins({"assetPositions": self.POS}), {"ETH", "SOL"})
-        self.assertEqual(m.account_coins(None), set())
-
-    def test_pnl_latent_limite_a_nos_positions(self):
-        st = {"assetPositions": self.POS}
-        self.assertAlmostEqual(m.get_unrealized_pnl(st, {"ETH"}), 1.5)
-        self.assertAlmostEqual(m.get_unrealized_pnl(st), -1.5)
-
-    def test_reprise_n_adopte_que_nos_positions(self):
-        m.save_positions_state([{"id": "o1", "symbol": "ETH", "side": "BUY", "entry": 2000,
-                                 "qty": 0.01, "sl": 1990, "tp": 2030, "sl_oid": 7, "atr": 5,
-                                 "open_fee": 0.01, "opened_at": 1.0, "conditions": {}}])
-        with mock.patch.object(m, "info", FakeInfo(perp={"assetPositions": self.POS})):
-            rec, _ = m.recover_open_positions()
-        self.assertEqual([p["symbol"] for p in rec], ["ETH"])
-        self.assertEqual(rec[0]["sl_oid"], 7)
-        self.assertEqual(self.titles(), ["⚠️ Position non reprise"])
-
-
+# ── Fills de fermeture : P&L réel d'une position ─────────────────────────────
 class TestFees(BaseTest):
-    def test_zombie_pnl_deduit_frais_ouverture_estimes(self):
-        fills = [{"coin": "ETH", "dir": "Close Long", "time": 1, "fee": "0.04", "closedPnl": "1.00"}]
-        pos = {"id": "1", "symbol": "ETH", "side": "BUY", "entry": 2000, "qty": 0.04,
-               "sl_oid": None, "open_fee": 0.0, "conditions": {}}
-        with mock.patch.object(m, "exchange", FakeExchange()), \
-             mock.patch.object(m, "info", FakeInfo(fills=fills)), \
-             mock.patch.object(m, "update_order_status", lambda *a, **k: None), \
-             mock.patch.object(m, "record_lesson", lambda *a, **k: None):
-            pnl = m.force_close_zombie(m.init_excel(), pos)
-        self.assertAlmostEqual(pnl, 1.00 - 0.04 - 0.04, places=2)
-
-
     # Fills réels du trade DOGE du 2026-10-16 : SL exécuté en 3 fills partiels.
     # Avant correctif : seul le dernier fill était compté → P&L −0.08 au lieu de −0.37.
     DOGE_FILLS = [
@@ -361,17 +248,6 @@ class TestFees(BaseTest):
                 "qty": 1016.0, "sl": 0.082014, "tp": 0.083016, "sl_oid": 576377359631,
                 "atr": 0.000182, "open_fee": 0.0, "conditions": {"mode": "MR"}}
 
-    def test_sl_en_fills_partiels_tous_additionnes(self):
-        rec = {}
-        with mock.patch.object(m, "info", FakeInfo(fills=self.DOGE_FILLS)), \
-             mock.patch.object(m, "update_order_status",
-                               lambda wb, oid, status, pnl=None: rec.update(status=status, pnl=pnl)), \
-             mock.patch.object(m, "record_lesson", lambda *a, **k: None):
-            result = m.check_position(None, dict(self.DOGE_POS), cached_state={"assetPositions": []})
-        self.assertEqual(result, "SL touché")
-        # gross −0.295832 − frais ouverture réels 0.036116 − frais sortie 0.035987
-        self.assertAlmostEqual(rec["pnl"], -0.37, places=2)
-
     def test_closing_pnl_frais_ouverture_reels(self):
         gross, open_fee, close_fee = m._closing_pnl(self.DOGE_POS, self.DOGE_FILLS)
         self.assertAlmostEqual(gross, -0.295832, places=6)
@@ -379,7 +255,15 @@ class TestFees(BaseTest):
         self.assertAlmostEqual(close_fee, 0.035987, places=6)
 
 
-# ── Revue 2026-10-16 : zombie, attribution des fermetures, surveillance SL ───
+class TestClosingAttribution(BaseTest):
+    def test_fermeture_anterieure_a_l_ouverture_ignoree(self):
+        fills = [{"coin": "DOGE", "dir": "Close Short", "time": 1_000_000, "oid": 9,
+                  "closedPnl": "5.0", "fee": "0.02"}]
+        pos = {"id": "1", "symbol": "DOGE", "opened_at": 2_000.0}   # ouvert après ce fill
+        self.assertIsNone(m._closing_pnl(pos, fills))
+
+
+# ── Surveillance des SL ──────────────────────────────────────────────────────
 class OrdersInfo(FakeInfo):
     def __init__(self, orders=None, **k):
         super().__init__(**k); self.orders = orders or []
@@ -394,57 +278,6 @@ class LogExchange(FakeExchange):
         self.log.append(("cancel", oid)); return {"status": "ok"}
     def order(self, *a, **k):
         self.log.append("order"); return super().order(*a, **k)
-
-class TestZombie(BaseTest):
-    POS = {"id": "1", "symbol": "ETH", "side": "BUY", "entry": 2000, "qty": 0.04,
-           "sl_oid": 11, "open_fee": 0.0, "conditions": {}}
-
-    def close(self, resp):
-        ex = LogExchange(close_resp=resp)
-        with mock.patch.object(m, "exchange", ex), mock.patch.object(m, "info", FakeInfo()), \
-             mock.patch.object(m, "update_order_status", lambda *a, **k: None), \
-             mock.patch.object(m, "record_lesson", lambda *a, **k: None):
-            return m.force_close_zombie(None, dict(self.POS)), ex
-
-    def test_fermeture_puis_annulation_sl(self):
-        pnl, ex = self.close({"status": "ok", "response": {"data": {"statuses": [{"filled": {}}]}}})
-        self.assertIsNotNone(pnl)
-        self.assertEqual(ex.log, ["close", ("cancel", 11)])
-
-    def test_fermeture_echouee_sl_conserve(self):
-        pnl, ex = self.close({"status": "err", "response": "insufficient liquidity"})
-        self.assertIsNone(pnl)
-        self.assertEqual(ex.log, ["close"])                  # SL jamais annulé
-        self.assertTrue(any("fermeture échouée" in t for t in self.titles()))
-
-    def test_fermeture_statut_erreur_sl_conserve(self):
-        pnl, ex = self.close({"status": "ok", "response": {"data": {"statuses": [{"error": "x"}]}}})
-        self.assertIsNone(pnl)
-        self.assertEqual(ex.log, ["close"])
-
-
-class TestClosingAttribution(BaseTest):
-    def test_fermeture_anterieure_a_l_ouverture_ignoree(self):
-        fills = [{"coin": "DOGE", "dir": "Close Short", "time": 1_000_000, "oid": 9,
-                  "closedPnl": "5.0", "fee": "0.02"}]
-        pos = {"id": "1", "symbol": "DOGE", "opened_at": 2_000.0}   # ouvert après ce fill
-        self.assertIsNone(m._closing_pnl(pos, fills))
-
-    def test_position_absente_sans_fill_attend_3_cycles(self):
-        pos = {"id": "1", "symbol": "DOGE", "side": "BUY", "entry": 0.08, "qty": 1000,
-               "opened_at": 2_000_000_000.0, "conditions": {}}
-        rec = {}
-        with mock.patch.object(m, "info", FakeInfo(fills=[])), \
-             mock.patch.object(m, "update_order_status",
-                               lambda wb, oid, status, pnl=None: rec.update(status=status)), \
-             mock.patch.object(m, "record_lesson", lambda *a, **k: None):
-            r1 = m.check_position(None, pos, cached_state={"assetPositions": []})
-            r2 = m.check_position(None, pos, cached_state={"assetPositions": []})
-            r3 = m.check_position(None, pos, cached_state={"assetPositions": []})
-        self.assertEqual((r1, r2), (None, None))
-        self.assertEqual(r3, "Fermé (inconnu)")
-        self.assertEqual(rec["status"], "Fermé (inconnu)")
-
 
 class TestSLWatchdog(BaseTest):
     POS = {"id": "1", "symbol": "ETH", "side": "BUY", "entry": 2000.0, "qty": 0.04,
@@ -487,315 +320,9 @@ class TestSLWatchdog(BaseTest):
         self.assertTrue(any("SANS STOP-LOSS" in t for t in self.titles()))
 
 
-class TestDailyPnl(BaseTest):
-    def test_pnl_du_jour_par_date_de_fermeture(self):
-        wb = m.init_excel(); ws = wb["Trades"]
-        today = m.datetime.now(m.timezone.utc).strftime("%Y-%m-%d")
-        base = ["x"] * 13
-        ws.append(["1", "2000-01-01 23:50"] + base[:11] + ["SL touché", -1.0, "MR", "RANGING", 0.8, f"{today} 00:10"])
-        ws.append(["2", f"{today} 08:00"] + base[:11] + ["TP touché", 0.5])          # ancienne ligne sans date
-        ws.append(["3", f"{today} 09:00"] + base[:11] + ["SL touché", -0.3, "MR", "RANGING", 0.8, "2000-01-02 00:00"])
-        self.assertAlmostEqual(m.calc_daily_pnl(wb), -0.5)
-
-    def test_date_fermeture_ecrite(self):
-        with mock.patch.object(m, "exchange", FakeExchange()), mock.patch.object(m, "info", FakeInfo()):
-            wb = m.init_excel(); m.place_order(dict(SIG), wb)
-        oid = wb["Trades"].cell(2, 1).value
-        m.update_order_status(wb, oid, "TP touché", 0.7)
-        self.assertTrue(str(wb["Trades"].cell(2, 19).value).startswith(
-            m.datetime.now(m.timezone.utc).strftime("%Y-%m-%d")))
-
-
-# ── Trailing stop ────────────────────────────────────────────────────────────
-class TrailExchange(FakeExchange):
-    def __init__(self, resp):
-        super().__init__(); self.resp, self.log = resp, []
-    def order(self, *a, **k):
-        self.log.append("order"); return self.resp
-    def cancel(self, coin, oid):
-        self.log.append(("cancel", oid)); return {"status": "ok"}
-
-class TestTrailing(BaseTest):
-    POS = {"symbol": "ETH", "side": "BUY", "entry": 2000.0, "qty": 0.04,
-           "sl": 1992.5, "sl_oid": 11, "atr": 5.0}
-
-    def trail(self, resp, price=2010.0):   # +2×ATR → phase trailing
-        pos, ex = dict(self.POS), TrailExchange(resp)
-        with mock.patch.object(m, "exchange", ex):
-            m.trail_sl(pos, price)
-        return pos, ex
-
-    def test_nouveau_sl_pose_avant_annulation_ancien(self):
-        pos, ex = self.trail(_ok(77))
-        self.assertEqual(ex.log, ["order", ("cancel", 11)])
-        self.assertEqual(pos["sl_oid"], 77)
-        self.assertAlmostEqual(pos["sl"], 2010.0 - m.TRAIL_DIST * 5.0)
-        self.assertTrue(pos["trailed"])
-
-    def test_nouveau_sl_refuse_ancien_conserve(self):
-        pos, ex = self.trail(_err())
-        self.assertEqual(ex.log, ["order"])            # ancien SL jamais annulé
-        self.assertEqual(pos["sl_oid"], 11)
-        self.assertEqual(pos["sl"], 1992.5)
-        self.assertNotIn("trailed", pos)
-
-    def test_nouveau_sl_status_erreur_ancien_conserve(self):
-        pos, ex = self.trail({"status": "err", "response": "rate limited"})
-        self.assertEqual(ex.log, ["order"])
-        self.assertEqual(pos["sl_oid"], 11)
-
-    def test_breakeven_couvre_les_frais(self):
-        pos, ex = self.trail(_ok(77), price=2006.0)   # +1.2×ATR → phase breakeven
-        self.assertAlmostEqual(pos["sl"], 2000.0 * (1 + m.BE_BUFFER_PCT / 100))
-
-    def test_breakeven_short(self):
-        pos = dict(self.POS, side="SELL", sl=2007.5)
-        with mock.patch.object(m, "exchange", TrailExchange(_ok(78))):
-            m.trail_sl(pos, 1994.0)
-        self.assertAlmostEqual(pos["sl"], 2000.0 * (1 - m.BE_BUFFER_PCT / 100))
-
-    def test_pas_de_trail_sous_1_atr(self):
-        pos, ex = self.trail(_ok(77), price=2003.0)
-        self.assertEqual(ex.log, [])
-
-
-# ── Apprentissage ────────────────────────────────────────────────────────────
-class TestLessons(BaseTest):
-    POS = {"symbol": "DOGE", "side": "BUY",
-           "conditions": {"rsi": 52.9, "bbp": 0.346, "regime": "RANGING", "mode": "MR"}}
-
-    def setUp(self):
-        super().setUp()
-        m._lessons_cache.clear(); m._lessons_cache_ts = 0.0
-
-    def test_trail_ferme_a_perte_compte_comme_perte(self):
-        m.record_lesson(self.POS, "TRAIL touché", -0.05)
-        b = m._load_lessons()["buckets"]["coin_DOGE|buy"]
-        self.assertEqual((b["w"], b["l"]), (0, 1))
-
-    def test_trail_ferme_en_gain_compte_comme_gain(self):
-        m.record_lesson(self.POS, "TRAIL touché", 0.40)
-        b = m._load_lessons()["buckets"]["coin_DOGE|buy"]
-        self.assertEqual((b["w"], b["l"]), (1, 0))
-
-    def pen(self):
-        return m.get_penalty("DOGE", "BUY", 52.9, 0.346, "RANGING", "MR")
-
-    def test_penalite_apres_6_pertes_avec_oubli(self):
-        for _ in range(5):
-            m.record_lesson(self.POS, "SL touché", -0.37)
-        self.assertEqual(self.pen(), 0.0)   # oubli : 5 pertes ≈ 4.71 effectives < 5
-        m.record_lesson(self.POS, "SL touché", -0.37)
-        self.assertAlmostEqual(self.pen(), 0.25)   # 4 buckets à 0 % WR → plafond
-
-    def test_bonus_si_historique_gagnant(self):
-        for _ in range(8):
-            m.record_lesson(self.POS, "TP touché", 0.70)
-        self.assertAlmostEqual(self.pen(), -0.15)  # bonus plafonné à 0.15
-
-    def test_oubli_progressif(self):
-        m.record_lesson(self.POS, "SL touché", -0.37)
-        m.record_lesson(self.POS, "TP touché", 0.70)
-        b = m._load_lessons()["buckets"]["coin_DOGE|buy"]
-        self.assertAlmostEqual(b["l"], 0.97)
-        self.assertAlmostEqual(b["w"], 1.0)
-
-    def test_fantomes_comptent_a_moitie(self):
-        for _ in range(10):
-            m.record_lesson(self.POS, "SL", -0.5, ghost=True)
-        self.assertEqual(self.pen(), 0.0)          # 10 fantômes ≈ 4.3 effectifs
-        for _ in range(2):
-            m.record_lesson(self.POS, "SL", -0.5, ghost=True)
-        self.assertGreater(self.pen(), 0.0)
-        b = m._load_lessons()["buckets"]["coin_DOGE|buy"]
-        self.assertEqual((b["w"], b["l"]), (0, 0))  # compteurs réels intacts
-        self.assertAlmostEqual(b["gpnl_pct"], -6.0)
-
-
-# ── Mode fantôme ─────────────────────────────────────────────────────────────
-def _m1(ts, o, h, l, c):
-    return {"ts": ts, "o": o, "h": h, "l": l, "c": c, "v": 1.0}
-
-class TestGhosts(BaseTest):
-    def setUp(self):
-        super().setUp()
-        if os.path.exists(m.GHOST_FILE):
-            os.remove(m.GHOST_FILE)
-        m._ghosts = None
-        m._lessons_cache.clear(); m._lessons_cache_ts = 0.0
-        self.wb = m.init_excel()
-
-    def g(self, side="buy"):
-        return {"side": side, "entry": 100.0, "sl": 99.0 if side == "buy" else 101.0,
-                "tp": 102.0 if side == "buy" else 98.0, "checked_ts": 0, "opened_at": 1000.0}
-
-    def test_tp_touche(self):
-        g = self.g()
-        self.assertEqual(m._ghost_resolve(g, [_m1(1, 100, 101, 99.5, 101), _m1(2, 101, 102.1, 100.5, 102)], 1100),
-                         ("TP", 102.0))
-        self.assertEqual(g["checked_ts"], 2)
-
-    def test_sl_et_tp_meme_bougie_compte_sl(self):
-        self.assertEqual(m._ghost_resolve(self.g(), [_m1(1, 100, 102.5, 98.5, 100)], 1100), ("SL", 99.0))
-
-    def test_short(self):
-        self.assertEqual(m._ghost_resolve(self.g("sell"), [_m1(1, 100, 100.2, 97.9, 98)], 1100), ("TP", 98.0))
-        self.assertEqual(m._ghost_resolve(self.g("sell"), [_m1(1, 100, 101.2, 99.9, 101)], 1100), ("SL", 101.0))
-
-    def test_bougies_deja_vues_ignorees(self):
-        g = dict(self.g(), checked_ts=5)
-        self.assertIsNone(m._ghost_resolve(g, [_m1(5, 100, 103, 98, 100)], 1100))
-
-    def test_delai_depasse(self):
-        g = self.g()
-        res = m._ghost_resolve(g, [_m1(1, 100, 100.5, 99.5, 100.4)], 1000 + m.GHOST_MAX_HOURS * 3600)
-        self.assertEqual(res, ("Délai", 100.4))
-
-    def test_pnl_pct_net_de_frais(self):
-        self.assertAlmostEqual(m._ghost_pnl_pct(self.g(), 102.0), 2.0 - m.GHOST_FEE_PCT)
-        self.assertAlmostEqual(m._ghost_pnl_pct(self.g("sell"), 101.0), -1.0 - m.GHOST_FEE_PCT)
-
-    def test_ouverture_dedoublonnee_et_excel(self):
-        sig = dict(SIG, price=100.0, atr_m5=1.0)
-        self.assertIsNotNone(m.ghost_open(self.wb, sig, "score<0.75"))
-        self.assertIsNone(m.ghost_open(self.wb, sig, "score<0.75"))   # même coin/côté/mode
-        ws = self.wb["Fantômes"]
-        self.assertEqual(ws.max_row, 2)
-        self.assertEqual(ws.cell(2, 8).value, "score<0.75")
-        self.assertTrue(os.path.exists(m.GHOST_FILE))
-
-    def test_cycle_complet_tp_alimente_apprentissage(self):
-        sig = dict(SIG, price=100.0, atr_m5=1.0)   # SL 98.5 / TP 104
-        g = m.ghost_open(self.wb, sig, "régime BEAR")
-        later = g["checked_ts"] + 60000
-        with mock.patch.object(m, "fetch_candles",
-                               lambda coin, iv, n, **k: [_m1(later, 100, 104.2, 99.8, 104)]):
-            closed = m.ghost_update(self.wb)
-        self.assertEqual(len(closed), 1)
-        self.assertEqual(m._load_ghosts(), [])
-        ws = self.wb["Fantômes"]
-        self.assertEqual(ws.cell(2, 12).value, "TP")
-        self.assertAlmostEqual(ws.cell(2, 14).value, 4.0 - m.GHOST_FEE_PCT)
-        b = m._load_lessons()["buckets"]["regime_RANGING|buy|MR"]
-        self.assertEqual(b["gw"], 1)
-        self.assertNotIn("gl", b)
-
-    def test_persistance_redemarrage(self):
-        m.ghost_open(self.wb, dict(SIG, price=100.0, atr_m5=1.0), "x")
-        m._ghosts = None   # simule un redémarrage
-        self.assertEqual(len(m._load_ghosts()), 1)
-
-
-def _declin(n, last_vol=300.0):
-    """Bougies en baisse régulière (chaque bougie rouge), volume fort sur la dernière."""
-    cs = []
-    for i in range(n):
-        px = 120.0 - 0.1 * i
-        cs.append({"ts": i, "o": px + 0.05, "h": px + 0.06, "l": px - 0.01, "c": px, "v": 100.0})
-    cs[-1]["v"] = last_vol
-    return cs
-
-class TestGhostCandidates(BaseTest):
-    def scan(self, regime):
-        m._ghost_candidates.clear(); m._reject_stats.clear()
-        m._lessons_cache.clear(); m._lessons_cache_ts = 0.0
-        with mock.patch.object(m, "fetch_candles", lambda coin, iv, n, **k: _declin(n)), \
-             mock.patch.object(m, "_current_regime", regime):
-            return m.get_signal("ETH")
-
-    def test_mom_bloque_en_ranging_devient_candidat_fantome(self):
-        self.assertIsNone(self.scan("RANGING"))
-        self.assertEqual(len(m._ghost_candidates), 1)
-        c = m._ghost_candidates[0]
-        self.assertEqual((c["signal"], c["conditions"]["mode"]), ("sell", "MOM"))
-        self.assertEqual(c["ghost_reason"], "MOM bloqué RANGING")
-        self.assertEqual(m._reject_stats.get("MOM bloqué RANGING"), 1)
-
-    def test_mom_en_bear_est_un_vrai_signal(self):
-        sig = self.scan("BEAR")
-        self.assertEqual((sig["signal"], sig["conditions"]["mode"]), ("sell", "MOM"))
-        self.assertEqual(m._ghost_candidates, [])
-
-
-def _mr_sell(iv, n, last_vol5):
-    """SELL MR : M15 baissier, M5 en haut de bande avec 2 bougies rouges, M1 neutre."""
-    cs = []
-    if iv == m.INTERVAL_M15:
-        for i in range(n):
-            px = 130.0 - 0.2 * i
-            cs.append({"ts": i, "o": px + 0.05, "h": px + 0.1, "l": px - 0.1, "c": px, "v": 100.0})
-    elif iv == m.INTERVAL_M5:
-        for i in range(n - 2):
-            px = 100.0 + 0.1 * i
-            cs.append({"ts": i, "o": px - 0.05, "h": px + 0.02, "l": px - 0.07, "c": px, "v": 100.0})
-        top = cs[-1]["c"]
-        cs.append({"ts": n - 2, "o": top + 0.02, "h": top + 0.03, "l": top - 0.03, "c": top - 0.02, "v": 100.0})
-        cs.append({"ts": n - 1, "o": top - 0.02, "h": top - 0.01, "l": top - 0.06, "c": top - 0.05,
-                   "v": last_vol5})
-    else:
-        for i in range(n):
-            px = 100.0 + (0.05 if i % 2 else -0.05)
-            cs.append({"ts": i, "o": 100.0, "h": px + 0.01, "l": px - 0.01, "c": px, "v": 100.0})
-    return cs
-
-class TestGhostVolume(BaseTest):
-    def scan(self, last_vol5):
-        m._ghost_candidates.clear(); m._reject_stats.clear()
-        m._lessons_cache.clear(); m._lessons_cache_ts = 0.0
-        with mock.patch.object(m, "fetch_candles", lambda coin, iv, n, **k: _mr_sell(iv, n, last_vol5)), \
-             mock.patch.object(m, "_current_regime", "RANGING"), \
-             mock.patch.object(m, "VOL_MULTIPLIER", 1.2):
-            return m.get_signal("ETH")
-
-    def test_mr_rejete_de_justesse_par_volume_devient_fantome_mrv(self):
-        self.assertIsNone(self.scan(100.0))   # ratio 1.0 < 1.2
-        self.assertEqual(len(m._ghost_candidates), 1)
-        c = m._ghost_candidates[0]
-        self.assertEqual((c["signal"], c["conditions"]["mode"]), ("sell", "MRv"))
-        self.assertEqual(c["ghost_reason"], "MR volume ×1.00<1.2")
-        self.assertEqual(m._reject_stats, {"volume M5": 1})
-
-    def test_volume_trop_faible_pas_de_fantome(self):
-        self.assertIsNone(self.scan(70.0))    # ratio < GHOST_VOL_MIN
-        self.assertEqual(m._ghost_candidates, [])
-
-    def test_volume_suffisant_vrai_signal_mr(self):
-        sig = self.scan(300.0)
-        self.assertEqual((sig["signal"], sig["conditions"]["mode"]), ("sell", "MR"))
-        self.assertEqual(m._ghost_candidates, [])
-
-    def test_fantome_mrv_clos_sans_toucher_apprentissage(self):
-        if os.path.exists(m.GHOST_FILE):
-            os.remove(m.GHOST_FILE)
-        m._ghosts = None
-        wb = m.init_excel()
-        self.scan(100.0)
-        g = m.ghost_open(wb, m._ghost_candidates[0], m._ghost_candidates[0]["ghost_reason"])
-        later = g["checked_ts"] + 60000
-        with mock.patch.object(m, "fetch_candles",
-                               lambda coin, iv, n, **k: [_m1(later, g["entry"], g["sl"] + 1, g["entry"] - 0.01, g["entry"])]):
-            closed = m.ghost_update(wb)
-        self.assertEqual([x["status"] for x in closed], ["SL"])
-        self.assertEqual(m._load_lessons().get("buckets", {}), {})
-        self.assertEqual(wb["Fantômes"].cell(2, 5).value, "MRv")
-
-    def test_heartbeat_par_type(self):
-        closed = [{"side": "sell", "mode": "MOM", "pnl_pct": 1.0},
-                  {"side": "sell", "mode": "MOM", "pnl_pct": -0.5},
-                  {"side": "buy", "mode": "MRv", "pnl_pct": -0.3}]
-        self.assertEqual(m._ghost_by_type(closed),
-                         "BUY MRv ✓0/1 moy -0.30% · SELL MOM ✓1/2 moy +0.25%")
-
-
-# ── Boucle principale (smoke test) ───────────────────────────────────────────
+# ── Boucle principale ────────────────────────────────────────────────────────
 class _StopLoop(Exception):
     pass
-
-class _Minute0(datetime):
-    """Horloge figée à hh:00 : le résumé des leçons (toutes les 10 min) tombe à chaque cycle."""
-    @classmethod
-    def now(cls, tz=None):
-        return datetime.now(tz).replace(minute=0)
 
 def _at_utc_hour(h: int):
     """datetime dont now() tombe à h heures (même jour)."""
@@ -809,158 +336,70 @@ class LoopInfo(FakeInfo):
     def meta(self): return {"universe": []}
 
 class TestRunLoop(BaseTest):
-    def run_loop(self, daily_chg, asset_positions=None, get_signal=None, d1_failures=0,
-                 keep_regime=False, strategy="scalp", trend_closes=None):
-        if os.path.exists(m.GHOST_FILE):
-            os.remove(m.GHOST_FILE)
-        m._ghosts = None
-        m._lessons_cache.clear(); m._lessons_cache_ts = 0.0
-        for attr in ("_sl_check_ts", "_prev_equity", "_prev_ts", "_ledger_ts") + \
-                    (() if keep_regime else ("_regime_cache", "_regime_ts")):
+    def run_loop(self, trend_closes=None, cycles=2):
+        """`cycles` cycles complets de run(), avec un résumé Discord à chaque cycle ; retourne l'Exchange simulé."""
+        for attr in ("_prev_equity", "_prev_ts", "_ledger_ts"):
             m.run.__dict__.pop(attr, None)
         info = LoopInfo(
-            mids={c: "100" for c in m.WATCHLIST + m.TREND_COINS},
-            perp={"assetPositions": asset_positions or [],
-                  "crossMarginSummary": {"accountValue": "0", "totalMarginUsed": "0"}},
+            mids={c: "100" for c in m.TREND_COINS},
+            perp={"assetPositions": [], "crossMarginSummary": {"accountValue": "0", "totalMarginUsed": "0"}},
             spot={"balances": [{"coin": "USDC", "total": "111.18", "hold": "0"}]})
-        ex = FakeExchange()
-        cycles = []
+        ex, ends = TrendExchange(), []
         def fake_sleep(sec):
-            if sec >= 5:                       # attente de fin de cycle
-                cycles.append(sec)
-                if len(cycles) >= 2:
+            if sec > m.STARTUP_RETRY_S:        # attente de fin de cycle (≈ 60 s)
+                ends.append(sec)
+                if len(ends) >= cycles:
                     raise _StopLoop()
-        d1_calls, self.m1_calls = [], []
-        def fc(coin, iv, n, **k):
-            if iv != m.INTERVAL_D1:
-                self.m1_calls.append(coin)
-                return _declin(n)
-            if n == max(m.TREND_LOOKBACKS) + 2:  # signal de la stratégie tendance
-                return _d1(trend_closes or [100.0] * 60)
-            d1_calls.append(coin)
-            if len(d1_calls) <= d1_failures:
-                raise RuntimeError("Bybit kline BTCUSDT: Too many visits")
-            return _daily(daily_chg)
         with mock.patch.object(m, "info", info), mock.patch.object(m, "exchange", ex), \
-             mock.patch.object(m, "fetch_candles", fc), \
+             mock.patch.object(m, "fetch_candles", lambda coin, iv, n, **k: _d1(trend_closes or [100.0] * 60)), \
              mock.patch.object(m.time, "sleep", fake_sleep), \
-             mock.patch.object(m, "HEARTBEAT_HOURS", 1e-9), \
-             mock.patch.object(m, "STRATEGY", strategy), \
-             mock.patch.object(m, "get_signal", get_signal or m.get_signal):
+             mock.patch.object(m, "HEARTBEAT_HOURS", 1e-9):
             with self.assertRaises(_StopLoop):
                 m.run()
-        return ex, m._load_ghosts()
+        return ex
 
-    def _signal_eth(self):
-        """get_signal factice : BUY MR score 0.9 sur ETH (passe tous les filtres en RANGING)."""
-        def gs(coin):
-            if coin != "ETH":
-                return None
-            return {"symbol": "ETH", "signal": "buy", "score": 0.9, "atr_m5": 5.0, "price": 100.0,
-                    "conditions": {"mode": "MR", "regime": "RANGING", "rsi": 50, "bbp": 0.3,
-                                   "vol_ratio": 1.5}}
-        return gs
-
-    def test_signal_retenu_ouvre_un_ordre_en_mode_normal(self):
-        """Témoin du test suivant : sans GHOST_ONLY le même signal passe un ordre (SL + TP)."""
-        with mock.patch.object(m, "GHOST_ONLY", False):
-            ex, _ = self.run_loop(-2, get_signal=self._signal_eth())
-        self.assertTrue(ex.orders)
-
-    def test_mode_fantome_seul_aucun_ordre(self):
+    def test_mode_fantome_une_position_par_coin_sans_ordre(self):
+        """Mode fantôme : une position fantôme par coin et aucun ordre ; message de démarrage et résumé Discord
+        de la stratégie tendance, sans la ligne « Régime » de l'ancien scalping."""
         with mock.patch.object(m, "GHOST_ONLY", True):
-            ex, ghosts = self.run_loop(-2, get_signal=self._signal_eth())
-        self.assertEqual(ex.orders, [])
-        self.assertEqual([(g["symbol"], g["reason"]) for g in ghosts],
-                         [("ETH", "fantôme seul (aurait été tradé)")])
-        self.assertIn("fantôme seul", dict(self.alerts)["🚀 Bot démarré"])
-        self.assertIn("Positions scalping reprises : 0", dict(self.alerts)["🚀 Bot démarré"])
+            ex = self.run_loop(trend_closes=TestTrend.UP)
+        self.assertEqual(ex.calls, [])
+        self.assertEqual(set(m._load_trend()["positions"]), set(m.TREND_COINS))
+        start = dict(self.alerts)["🚀 Bot démarré"]
+        self.assertIn("fantôme seul", start)
+        self.assertIn("tendance journalière", start)
+        self.assertIn("Coins : BTC, ETH, SOL, XRP, DOGE", start)
+        self.assertIn("Équité : **$111.18** · +0.0 % depuis le départ", start)
         hb = [d for t, d in self.alerts if "résumé" in t]
         self.assertTrue(hb and hb[0].startswith("Mode : **fantôme seul**"))
-
-    def test_wallet_partage_position_copytrade_ni_adoptee_ni_rescannee(self):
-        """SOL ouvert par BotCopyTrade (absent de bot_state.json) : pas repris au démarrage
-        (aucun SL posé, pas de fermeture zombie) et SOL exclu du scan réel."""
-        scanned = []
-        def gs(coin):
-            scanned.append(coin)
-            return None
-        sol = {"position": {"coin": "SOL", "szi": "-0.5", "entryPx": "100", "unrealizedPnl": "-3"}}
-        ex, _ = self.run_loop(-2, asset_positions=[sol], get_signal=gs)
-        self.assertEqual(ex.orders, [])
-        self.assertIn("⚠️ Position non reprise", self.titles())
-        self.assertTrue(scanned)
-        self.assertNotIn("SOL", scanned)
-        self.assertIn("ETH", scanned)
-
-    def test_bear_scan_fantome_et_heartbeat(self):
-        """2 cycles complets de run() en BEAR : aucun ordre réel, SELL MOM suivi en fantôme,
-        heartbeat Discord avec la ligne Fantômes."""
-        ex, ghosts = self.run_loop(-10)
-        self.assertEqual(ex.orders, [])                     # aucun ordre réel en BEAR
-        self.assertTrue(ghosts)
-        self.assertTrue(all(g["reason"] == "régime BEAR" for g in ghosts))
-        self.assertTrue(any(g["mode"] == "MOM" and g["side"] == "sell" for g in ghosts))
-        self.assertEqual(len(ghosts), len({(g["symbol"], g["side"], g["mode"]) for g in ghosts}))  # dédoublonné
-        hb = [d for t, d in self.alerts if "résumé" in t]
-        self.assertTrue(hb and "Fantômes :" in hb[0])
-
-    def test_regime_indisponible_reessaye_au_cycle_suivant(self):
-        """Bougies D1 en échec au 1er cycle : le régime est recalculé dès le cycle suivant
-        (avant : RANGING figé jusqu'à la prochaine demi-heure)."""
-        ex, _ = self.run_loop(-10, d1_failures=1)
-        self.assertEqual(ex.orders, [])
-        hb = [d for t, d in self.alerts if "résumé" in t]      # 1 heartbeat par cycle
-        self.assertIn("Régime : **RANGING**", hb[0])          # 1er cycle : défaut prudent
-        self.assertIn("Régime : **BEAR**", hb[-1])            # 2e cycle : recalculé
-
-    def test_regime_precedent_conserve_si_bybit_echoue(self):
-        m.run._regime_cache = ("BEAR", "down", -10.0, -10.0)
-        m.run._regime_ts = 0.0     # recalcul dû…
-        ex, ghosts = self.run_loop(-2, d1_failures=99, keep_regime=True)   # …mais Bybit échoue
-        self.assertTrue(ghosts and all(g["reason"] == "régime BEAR" for g in ghosts))
-
-    def test_strategie_tendance_fantome_sans_scalping(self):
-        """Mode tendance + GHOST_ONLY : une position fantôme par coin, aucun ordre, aucun scan
-        M1/M5 du scalping, et le heartbeat résume les positions tendance."""
-        with mock.patch.object(m, "GHOST_ONLY", True):
-            ex, ghosts = self.run_loop(-2, strategy="trend", trend_closes=TestTrend.UP)
-        self.assertEqual(ex.orders, [])
-        self.assertEqual(self.m1_calls, [])
-        self.assertEqual(ghosts, [])
-        self.assertEqual(set(m._load_trend()["positions"]), set(m.TREND_COINS))
-        self.assertIn("tendance journalière", dict(self.alerts)["🚀 Bot démarré"])
-        self.assertIn("Coins : BTC, ETH, SOL, XRP, DOGE", dict(self.alerts)["🚀 Bot démarré"])
-        self.assertNotIn("Positions scalping", dict(self.alerts)["🚀 Bot démarré"])
-        hb = [d for t, d in self.alerts if "résumé" in t]
-        self.assertTrue(hb and "Tendance : BTC LONG +0.0 %" in hb[0])
-        self.assertIn("Équité : **$111.18** · +0.0 % depuis le départ", dict(self.alerts)["🚀 Bot démarré"])
+        self.assertIn("Tendance : BTC LONG +0.0 %", hb[0])
         self.assertIn("Latent : **+0.00 %** du capital", hb[0])
         self.assertIn("Équité : **$111.18** · +0.0 % depuis le départ", hb[0])
+        self.assertNotIn("Régime", hb[0])
 
-    def test_resume_des_lecons_du_scalping_absent_en_mode_tendance(self):
-        """Le bloc « Leçons actives » (patterns du scalping, ~3 300 lignes de journal par jour) n'est
-        plus affiché en mode tendance ; le mode scalping le garde."""
-        shown = []
-        with mock.patch.object(m, "datetime", _Minute0), \
-             mock.patch.object(m, "print_lessons_summary", lambda: shown.append(m.STRATEGY)):
-            with mock.patch.object(m, "GHOST_ONLY", True):
-                self.run_loop(-2, strategy="trend", trend_closes=TestTrend.UP)
-            self.assertEqual(shown, [])
-            self.run_loop(-2)
-        self.assertTrue(shown)
-        self.assertEqual(set(shown), {"scalp"})
+    def test_mode_reel_chaque_coin_ouvert_avec_son_sl(self):
+        with mock.patch.object(m, "GHOST_ONLY", False):
+            ex = self.run_loop(trend_closes=TestTrend.UP, cycles=1)
+        self.assertEqual(sorted(c[1] for c in ex.calls if c[0] == "open"), sorted(m.TREND_COINS))
+        self.assertEqual(sorted(c[1] for c in ex.calls if c[0] == "sl"), sorted(m.TREND_COINS))
+        self.assertNotIn("fantôme", dict(self.alerts)["🚀 Bot démarré"])
 
     def run_with_equity(self, equities, ledger_delta=None):
-        """2 cycles en mode tendance fantôme ; get_equity renvoie `equities` (démarrage, cycle 1, cycle 2) et le
-        journal Hyperliquid la ligne `ledger_delta`, datée du relevé. Retourne l'équité passée à trend_cycle."""
+        """2 cycles en mode fantôme ; get_equity renvoie (ou lève) `equities` dans l'ordre, du démarrage aux
+        cycles, et le journal Hyperliquid la ligne `ledger_delta`, datée du relevé. Retourne l'équité passée
+        à trend_cycle."""
         eqs, seen = iter(equities), []
+        def get_equity(*a):
+            v = next(eqs)
+            if isinstance(v, Exception):
+                raise v
+            return v
         ledger = lambda self_, addr, start: [{"time": start, "delta": ledger_delta}] if ledger_delta else []
-        with mock.patch.object(m, "get_equity", lambda *a: next(eqs)), \
+        with mock.patch.object(m, "get_equity", get_equity), \
              mock.patch.object(m, "trend_cycle", lambda wb, us, eq: seen.append(eq) or []), \
              mock.patch.object(LoopInfo, "user_non_funding_ledger_updates", ledger), \
              mock.patch.object(m, "GHOST_ONLY", True):
-            self.run_loop(-2, strategy="trend")
+            self.run_loop()
         return seen
 
     def test_depot_utilise_des_le_cycle_suivant_et_pas_compte_comme_gain(self):
@@ -987,13 +426,20 @@ class TestRunLoop(BaseTest):
         self.run_with_equity([111.18, 111.18, 61.18])
         self.assertIn("⚡ Flash Crash Détecté", self.titles())
 
+    def test_equite_illisible_au_demarrage_aucune_taille_supposee(self):
+        """Hyperliquid injoignable au démarrage puis au 1er cycle : le bot attend l'équité réelle avant toute
+        décision (avant : 100 $ supposés, et les positions du 1er cycle taillées sur ce montant)."""
+        seen = self.run_with_equity([RuntimeError("502"), RuntimeError("502"), 111.18, 111.18, 111.18])
+        self.assertEqual(seen, [111.18, 111.18])
+        self.assertEqual(sys.stdout.getvalue().count("équité au démarrage"), 2)
+
     def test_capital_fictif_du_test_annonce_et_utilise(self):
         """Mode fantôme avec PAPER_EQUITY=200 : tailles calculées sur 200 $ et capital fictif annoncé au démarrage
         et dans chaque résumé."""
         seen = []
         with mock.patch.object(m, "PAPER_EQUITY", 200.0), mock.patch.object(m, "GHOST_ONLY", True), \
              mock.patch.object(m, "trend_cycle", lambda wb, us, eq: seen.append(eq) or []):
-            self.run_loop(-2, strategy="trend")
+            self.run_loop()
         self.assertEqual(seen, [200.0, 200.0])
         self.assertIn("capital fictif du test : **$200**", dict(self.alerts)["🚀 Bot démarré"])
         hb = [d for t, d in self.alerts if "résumé" in t]
@@ -1002,9 +448,9 @@ class TestRunLoop(BaseTest):
     def test_erreur_imprevue_le_bot_continue(self):
         """Erreur imprévue au milieu d'un cycle : journalisée, une seule alerte, et les cycles suivants ont
         lieu (avant : bot arrêté ; systemd ne le relançait pas, la sortie semblant normale)."""
-        with mock.patch.object(m, "calc_portfolio_pnl", mock.Mock(side_effect=KeyError("P&L"))), \
-             mock.patch("sys.stderr", new_callable=io.StringIO):
-            self.run_loop(-2)                                  # 2 cycles complets malgré l'erreur
+        with mock.patch.object(m, "trend_heartbeat", mock.Mock(side_effect=KeyError("P&L"))), \
+             mock.patch.object(m, "GHOST_ONLY", True), mock.patch("sys.stderr", new_callable=io.StringIO):
+            self.run_loop()                                  # 2 cycles complets malgré l'erreur
         self.assertEqual(self.titles().count("⚠️ Erreur inattendue (le bot continue)"), 1)
 
     def test_crash_fatal_code_d_erreur_pour_systemd(self):
@@ -1019,63 +465,25 @@ class TestRunLoop(BaseTest):
         with mock.patch.object(m, "run", mock.Mock(side_effect=KeyboardInterrupt)):
             m.main()
 
-    def test_ranging_mom_bloque_suivi_en_fantome(self):
-        ex, ghosts = self.run_loop(-2)
-        self.assertEqual(ex.orders, [])
-        self.assertTrue(ghosts)
-        self.assertTrue(all(g["reason"] == "MOM bloqué RANGING" for g in ghosts))
 
+# ── Tableau de bord ──────────────────────────────────────────────────────────
+class TestDashboard(BaseTest):
+    def test_positions_equite_et_latent(self):
+        m._load_trend()["positions"]["BTC"] = {"id": "1", "symbol": "BTC", "side": "SELL", "entry": 76111.0,
+                                               "qty": 0.00028, "sl": 82806.0, "opened_at": 1793904000.0,
+                                               "paper": False}
+        st = {"assetPositions": [{"position": {"coin": "BTC", "szi": "-0.00028", "unrealizedPnl": "0.8355"}}]}
+        m.write_dashboard(m.init_excel(), st, 220.56, 211.3483)
+        with open("dashboard.html", encoding="utf-8") as f:
+            html = f.read()
+        self.assertIn("<b>$220.56</b>", html)
+        self.assertIn("+4.4 % depuis le départ", html)
+        self.assertIn("<td>BTC</td><td>SHORT</td><td>0.00028</td><td>$76111</td><td>$82806</td>", html)
+        self.assertIn("$+0.84 (+0.38 %)", html)
 
-# ── Régime de marché ─────────────────────────────────────────────────────────
-def _daily(chg_pct, chg3_pct=None):
-    """8 bougies D1 : variation totale chg_pct, et variation 3j chg3_pct."""
-    start, end = 100.0, 100.0 * (1 + chg_pct / 100)
-    closes = [start + (end - start) * i / 7 for i in range(8)]
-    if chg3_pct is not None:
-        closes[4] = end / (1 + chg3_pct / 100)
-    return [{"c": c} for c in closes]
-
-class TestRegime(BaseTest):
-    def regime(self, btc, eth):
-        data = {"BTC": btc, "ETH": eth}
-        with mock.patch.object(m, "fetch_candles", lambda coin, iv, n, **k: data[coin]):
-            return m.get_market_regime()[0]
-
-    def test_bear_sur_la_moyenne(self):
-        # Cas réel du 2026-10-14 : BTC -2.8 %, ETH -7.4 % → moyenne -5.1 % → BEAR
-        self.assertEqual(self.regime(_daily(-2.8), _daily(-7.4)), "BEAR")
-
-    def test_ranging(self):
-        self.assertEqual(self.regime(_daily(-2.0), _daily(-5.9)), "RANGING")
-
-    def test_bull(self):
-        self.assertEqual(self.regime(_daily(6), _daily(7)), "BULL")
-
-    def test_bull_en_pullback_3j_devient_ranging(self):
-        self.assertEqual(self.regime(_daily(6, -3), _daily(7, -3)), "RANGING")
-
-    def test_diverging(self):
-        self.assertEqual(self.regime(_daily(4), _daily(-4)), "DIVERGING")
-
-    def test_erreur_api_ranging_par_defaut(self):
-        def boom(*a, **k): raise RuntimeError("api down")
-        with mock.patch.object(m, "fetch_candles", boom):
-            self.assertEqual(m.get_market_regime()[0], "RANGING")
-
-
-# ── Signaux : diagnostic des rejets ──────────────────────────────────────────
-def _candles(n, vol_last, vol=100.0, px=100.0):
-    cs = [{"ts": i, "o": px, "h": px * 1.001, "l": px * 0.999, "c": px, "v": vol} for i in range(n)]
-    cs[-1]["v"] = vol_last
-    return cs
-
-class TestSignalDiagnostic(BaseTest):
-    def test_volume_bas_compte_comme_rejet_volume_m5(self):
-        m._reject_stats.clear()
-        def fc(coin, iv, n, **k): return _candles(n, vol_last=10.0)
-        with mock.patch.object(m, "fetch_candles", fc):
-            self.assertIsNone(m.get_signal("ETH"))
-        self.assertEqual(m._reject_stats.get("volume M5"), 1)
+    def test_erreur_journalisee_sans_arreter_le_bot(self):
+        m.write_dashboard(None, None, 220.0, 211.0)          # classeur absent : erreur interne
+        self.assertIn("write_dashboard", sys.stdout.getvalue())
 
 
 # ── Dépôts et retraits (journal Hyperliquid) ────────────────────────────────
@@ -1176,8 +584,8 @@ class TestUtils(BaseTest):
         self.assertEqual(m.round_px(0.080481, "INCONNU"), 0.080481)   # filtres absents : pas de troncature
 
     def test_bybit_rate_limit_deux_echecs_puis_succes(self):
-        """Bybit répond « Too many visits » quand les 15 requêtes du scan partent ensemble :
-        2 nouvelles tentatives (avant : 1 seule → signal perdu pour le cycle)."""
+        """Bybit répond « Too many visits » (limite de débit) : 2 nouvelles tentatives (avant : 1 seule →
+        signal perdu pour le cycle)."""
         lim = {"retCode": 10006, "retMsg": "Too many visits. Exceeded the API Rate Limit."}
         ok  = {"retCode": 0, "result": {"list": [[str(i * 60_000), "1", "2", "0.5", "1.5", "10"]
                                                   for i in (3, 2, 1, 0)]}}
@@ -1187,39 +595,9 @@ class TestUtils(BaseTest):
             r = mock.Mock(); r.json.return_value = lim if len(calls) < 3 else ok
             return r
         with mock.patch.object(m.requests, "get", get):
-            cs = m.fetch_candles("ETH", m.INTERVAL_M1, 2)
+            cs = m.fetch_candles("ETH", m.INTERVAL_D1, 2)
         self.assertEqual(len(calls), 3)
         self.assertEqual([c["ts"] for c in cs], [60_000, 120_000])   # bougie en cours retirée
-
-    def test_dashboard_lecons_comptent_les_fantomes(self):
-        """Pattern appris uniquement en fantôme (1 gagné / 9 perdus → n=5, WR 10 %) : le bot
-        le pénalise de 0.15 ; le dashboard affichait « 0 (apprentissage…) »."""
-        m._lessons_cache = {"buckets": {"rsi70-75|buy|BBO": {"w": 0, "l": 0, "pnl": 0.0,
-                                                             "gw": 1.0, "gl": 9.0}}}
-        m._lessons_cache_ts = m.time.time()
-        try:
-            self.assertEqual(m.get_penalty("ETH", "buy", 72, 1.1, "RANGING", "BBO"), 0.15)
-            m.write_dashboard(m.init_excel(), [], 100.0, 100.0, 0.0, 0.0, 0.0, 100.0,
-                              "RANGING", 0.0, 0.0)
-            with open("dashboard.html", encoding="utf-8") as f:
-                html = f.read()
-        finally:
-            m._lessons_cache.clear(); m._lessons_cache_ts = 0.0
-        row = html[html.index(">rsi70-75|buy|BBO<"):].split("</tr>")[0]
-        self.assertIn("−0.15", row)
-        self.assertIn("10%", row)
-
-    def test_size_mult(self):
-        self.assertEqual(m._size_mult(1.6), 1.15)
-        self.assertEqual(m._size_mult(1.0), 1.0)
-        self.assertEqual(m._size_mult(0.5), 0.85)
-
-    def test_rsi_bornes(self):
-        self.assertEqual(m._rsi([float(i) for i in range(30)], 14), 100.0)
-        self.assertLess(m._rsi([float(30 - i) for i in range(30)], 14), 1.0)
-
-    def test_bb_plat(self):
-        self.assertEqual(m._bb([100.0] * 25)[3], 0.5)
 
 
 class TestDiscordJournal(unittest.TestCase):
@@ -1555,7 +933,7 @@ class TestTrend(BaseTest):
         ex, _ = self.cycle(ex=self.lost_open())
         (_, _, _, qty), = self.eth_calls(ex)                       # ordre parti, pas de SL
         self.assertNotIn("ETH", m._load_trend()["positions"])
-        self.assertIn("ETH", m.trend_coins())                       # ni adopté par le scalping
+        self.assertIn("ETH", m._load_trend()["opening"])            # noté : vérifié au cycle suivant
         self.assertIn("n'a pas répondu", dict(self.alerts)["⚠️ Tendance : ETH non ouvert"])
         self.assertNotIn("ETH", m._load_trend()["stopped"])
         m._trend = None                                             # redémarrage du bot
@@ -1866,14 +1244,15 @@ class TestTrend(BaseTest):
         self.assertEqual([p["status"] for p in closed], ["retiré de la stratégie"])
         self.assertNotIn("LTC", m._load_trend()["positions"])
 
-    def test_tailles_chargees_pour_les_coins_tendance_et_scalping(self):
+    def test_tailles_chargees_pour_tous_les_coins(self):
+        """Pas de taille de chaque coin de Hyperliquid : une position sur un coin retiré de TREND_COINS peut
+        encore être renforcée puis fermée au bon pas."""
         meta = {"universe": [{"name": c, "szDecimals": d} for c, d in (("BTC", 5), ("LTC", 2), ("AVAX", 2))]}
         with mock.patch.object(m, "info", mock.Mock(meta=lambda: meta)), \
              mock.patch.dict(m._sym_filters, {}, clear=True):
-            m.init_exchange_info()
+            self.assertTrue(m.init_exchange_info())
             self.assertEqual((m._flt("BTC")["sz_dec"], m._flt("BTC")["sz_step"]), (5, 1e-05))
-            self.assertIn("LTC", m._sym_filters)        # liste du scalping toujours servie
-            self.assertNotIn("AVAX", m._sym_filters)
+            self.assertEqual(set(m._sym_filters), {"BTC", "LTC", "AVAX"})
 
     def test_compte_illisible_aucune_ouverture_reelle(self):
         ex = TrendExchange()
@@ -1924,19 +1303,6 @@ class TestTrend(BaseTest):
         ex, _ = self.cycle(held=[_held("ETH", 0.12)], orders=[])
         self.assertIn(("sl", "ETH", False, 80.0), ex.calls)
         self.assertEqual(m._load_trend()["positions"]["ETH"]["sl_oid"], 21)
-
-    def test_reprise_scalping_ignore_les_positions_tendance(self):
-        """Une position tendance n'est ni adoptée par le scalping ni signalée « non reprise », même si
-        bot_state.json garde une ancienne position scalping du même sens sur ce coin (avant : adoptée)."""
-        self.real_eth()
-        m._save_trend()
-        m._trend = None
-        for saved in ([], [{"symbol": "ETH", "side": "BUY", "id": "old", "sl": 85.0, "tp": 99.0}]):
-            m.save_positions_state(saved)
-            with mock.patch.object(m, "info", FakeInfo(perp={"assetPositions": [_held("ETH", 0.12)]})):
-                rec, _ = m.recover_open_positions()
-            self.assertEqual(rec, [])
-        self.assertEqual(self.titles(), [])
 
 
 if __name__ == "__main__":

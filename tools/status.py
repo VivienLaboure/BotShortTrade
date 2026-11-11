@@ -1,18 +1,16 @@
 """
 État de BotShortTrade en une commande, sans copier-coller Discord :
-  python3 tools/status.py [--hours 24] [--scalp [--since "2026-10-27 17:09"]]
+  python3 tools/status.py [--hours 24]
 
 Lit uniquement des fichiers locaux et le journal systemd (aucun secret, aucun appel réseau) :
   service systemd, erreurs du journal, messages Discord (discord_events.jsonl),
-  stratégie tendance (trend_state.json + onglet Tendance de trades.xlsx),
-  et avec --scalp les fantômes du scalping clos dans trades.xlsx (onglet Fantômes)
+  stratégie tendance (trend_state.json + onglet Tendance de trades.xlsx)
 """
 from __future__ import annotations
 import argparse, json, os, re, subprocess
 from datetime import datetime, timedelta, timezone
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-GHOST_ONLY_SINCE = "2026-10-27 16:09"   # UTC — début du mode fantôme seul
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -57,14 +55,6 @@ def print_events(events: list[dict], full_prefix: str):
             print(f"    {k} : {v}")
 
 
-def stats(pnls: list[float]) -> str:
-    n = len(pnls)
-    mu = sum(pnls) / n
-    sd = (sum((p - mu) ** 2 for p in pnls) / (n - 1)) ** 0.5 if n > 1 else 0.0
-    t = mu / (sd / n ** 0.5) if sd > 0 else 0.0
-    return f"n={n:4d}  WR={100 * sum(p > 0 for p in pnls) / n:3.0f}%  moy={mu:+.3f}%  t={t:+.1f}"
-
-
 def trend_report():
     """Positions tendance en cours (trend_state.json) et bilan des positions fermées (onglet Tendance)."""
     try:
@@ -96,43 +86,9 @@ def trend_report():
                   f"P&L ${sum(pnl):+.2f} · moy {sum(r[h['P&L %']] for r in rs) / len(rs):+.2f} % du notionnel")
 
 
-def ghost_report(since: str):
-    path = os.path.join(ROOT, "trades.xlsx")
-    if not os.path.exists(path):
-        print("  trades.xlsx absent"); return
-    from openpyxl import load_workbook
-    wb = load_workbook(path, read_only=True)
-    if "Fantômes" not in wb.sheetnames:
-        print("  pas d'onglet Fantômes"); return
-    rows = list(wb["Fantômes"].iter_rows(values_only=True))
-    h = {name: i for i, name in enumerate(rows[0])}
-    closed, n_open = [], 0
-    for r in rows[1:]:
-        if r[h["Statut"]] == "Ouvert":
-            n_open += 1
-        elif r[h["P&L %"]] is not None and (r[h["Fermé (UTC)"]] or "") >= since:
-            closed.append(r)
-    print(f"  Fantômes clos depuis {since} UTC : {len(closed)} · encore ouverts : {n_open}")
-    if not closed:
-        return
-    groups = {"aurait été tradé (stratégie actuelle)": [r for r in closed if "aurait été tradé" in (r[h["Raison"]] or "")],
-              "filtrés / bloqués": [r for r in closed if "aurait été tradé" not in (r[h["Raison"]] or "")]}
-    for label, rs in groups.items():
-        if not rs:
-            continue
-        print(f"\n  {label} :  {stats([r[h['P&L %']] for r in rs])}")
-        by: dict[str, list[float]] = {}
-        for r in rs:
-            by.setdefault(f"{r[h['Côté']]} {r[h['Mode']]}", []).append(r[h["P&L %"]])
-        for k, v in sorted(by.items()):
-            print(f"    {k:10s} {stats(v)}")
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--hours", type=float, default=24, help="fenêtre du journal et des messages (h)")
-    ap.add_argument("--scalp", action="store_true", help="bilan des fantômes du scalping (désactivé depuis le 2026-11-02)")
-    ap.add_argument("--since", default=GHOST_ONLY_SINCE, help="date UTC de début du bilan des fantômes")
     a = ap.parse_args()
     since = datetime.now(timezone.utc) - timedelta(hours=a.hours)
 
@@ -153,9 +109,6 @@ def main():
     print_events(read_events(os.path.join(ROOT, "discord_events.jsonl"), since), "💓")
     print("\n  Stratégie tendance :")
     trend_report()
-    if a.scalp:
-        print("\n  Fantômes du scalping (désactivé depuis le 2026-11-02) :")
-        ghost_report(a.since)
 
 
 if __name__ == "__main__":
