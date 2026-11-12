@@ -132,6 +132,61 @@ def _hl_px_valide(px: float, sz_dec: int = 0) -> bool:
 
 
 # ── Excel ────────────────────────────────────────────────────────────────────
+class TestSecuriteEtJournal(BaseTest):
+    def _load_main(self, env):
+        """Second exemplaire de main.py, importé avec un autre environnement."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("main_bis", os.path.join(ROOT, "main.py"))
+        mod = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(os.environ, env):
+            spec.loader.exec_module(mod)
+        return mod
+
+    def test_cle_du_compte_par_defaut(self):
+        mod = self._load_main({"HL_ACCOUNT_ADDRESS": ""})
+        self.assertEqual(mod.WALLET_ADDRESS, mod._account.address)
+        self.assertEqual(mod.exchange.kwargs["account_address"], mod._account.address)
+
+    def test_cle_deleguee_le_compte_suivi_est_celui_de_l_adresse(self):
+        """Clé d'API wallet (trade sans pouvoir retirer) : positions, équité et ordres portent sur le compte
+        HL_ACCOUNT_ADDRESS, pas sur l'adresse de la clé (avant : seule la clé du compte était acceptée)."""
+        addr = "0x" + "ab" * 20
+        mod = self._load_main({"HL_ACCOUNT_ADDRESS": f" {addr} "})
+        self.assertEqual(mod.WALLET_ADDRESS, addr)
+        self.assertNotEqual(mod._account.address.lower(), addr)
+        self.assertEqual(mod.exchange.kwargs["account_address"], addr)
+
+    def test_env_lisible_par_son_proprietaire_seulement(self):
+        with open("env_test", "w") as f:
+            f.write("X=1\n")
+        os.chmod("env_test", 0o664)
+        try:
+            m._protect_env_file("env_test")
+            self.assertEqual(os.stat("env_test").st_mode & 0o777, 0o600)
+            m._protect_env_file("absent")                      # fichier absent : sans erreur
+        finally:
+            os.remove("env_test")
+
+    def test_erreurs_copiees_dans_un_fichier_date(self):
+        """Le journal systemd ne garde qu'environ 1,5 jour : chaque erreur est aussi écrite, datée, dans
+        bot_errors.log ; fichier trop gros → renommé en .1."""
+        for f in (m.ERROR_LOG, m.ERROR_LOG + ".1"):
+            if os.path.exists(f):
+                os.remove(f)
+        try:
+            m.log_error("user_state: 502")
+            line = open(m.ERROR_LOG, encoding="utf-8").read()
+            self.assertRegex(line, r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ user_state: 502\n$")
+            with mock.patch.object(m, "ERROR_LOG_BYTES", 10):
+                m.log_error("suivante")
+            self.assertEqual(open(m.ERROR_LOG + ".1", encoding="utf-8").read(), line)
+            self.assertIn("suivante", open(m.ERROR_LOG, encoding="utf-8").read())
+        finally:
+            for f in (m.ERROR_LOG, m.ERROR_LOG + ".1"):
+                if os.path.exists(f):
+                    os.remove(f)
+
+
 class TestExcel(BaseTest):
     def test_fichier_illisible_garde_sous_un_autre_nom(self):
         """trades.xlsx illisible (abîmé, réenregistré dans un autre format) : gardé sous un autre nom avec

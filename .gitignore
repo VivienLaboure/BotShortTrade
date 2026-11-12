@@ -29,8 +29,10 @@ env/
 # Backtest : bougies téléchargées et cache des scans
 backtest_data/
 
-# Journal local des messages Discord
+# Journal local des messages Discord et des erreurs
 *.jsonl
+*.log
+*.log.1
 
 # Dashboard régénéré chaque minute par le bot
 dashboard.html

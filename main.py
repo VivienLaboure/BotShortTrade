@@ -42,6 +42,16 @@ def _cp(val: float) -> str:
     return C.BGRN if val > 0 else (C.BRED if val < 0 else C.WHT)
 
 # ── Env ────────────────────────────────────────────────────────────────────────
+def _protect_env_file(path: str = ".env"):
+    """.env contient la clé privée : lisible par son propriétaire seulement (les autres comptes de la machine
+    pouvaient le lire)."""
+    try:
+        if os.stat(path).st_mode & 0o077:
+            os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+_protect_env_file()
 load_dotenv()
 
 HL_PRIVATE_KEY    = os.environ["HL_PRIVATE_KEY"]
@@ -77,13 +87,15 @@ TREND_COINS        = ["BTC", "ETH", "SOL", "XRP", "DOGE"]   # BTC a remplacé LT
 
 # ── Connexion Hyperliquid ──────────────────────────────────────────────────────
 _account       = Account.from_key(HL_PRIVATE_KEY)
-WALLET_ADDRESS = _account.address
+# HL_ACCOUNT_ADDRESS : adresse du compte quand HL_PRIVATE_KEY est la clé d'un « API wallet » (clé déléguée
+# créée sur app.hyperliquid.xyz/API : elle peut trader, pas retirer les fonds). Vide : la clé est celle du compte.
+WALLET_ADDRESS = os.getenv("HL_ACCOUNT_ADDRESS", "").strip() or _account.address
 API_URL        = constants.TESTNET_API_URL if HL_TESTNET else constants.MAINNET_API_URL
 # Délai max d'une requête Hyperliquid. Le SDK n'en met aucun : une connexion restée bloquée (coupure
 # Wi-Fi) figeait le bot sans erreur ni alerte. Ordre sans réponse : cf. « opening » (tendance).
 HL_TIMEOUT_S   = 20
 info           = Info(API_URL, skip_ws=True, timeout=HL_TIMEOUT_S)
-exchange       = Exchange(_account, API_URL, timeout=HL_TIMEOUT_S)
+exchange       = Exchange(_account, API_URL, account_address=WALLET_ADDRESS, timeout=HL_TIMEOUT_S)
 
 print(f"  {C.DIM}Wallet : {WALLET_ADDRESS}{C.RST}")
 _net_color = C.BYLW if HL_TESTNET else C.BRED
@@ -181,9 +193,19 @@ def init_excel() -> Workbook:
     _safe_save(wb)
     return wb
 
+ERROR_LOG       = "bot_errors.log"   # copie datée de chaque erreur : le journal systemd ne garde qu'environ 1,5 jour
+ERROR_LOG_BYTES = 1_000_000          # au-delà : renommé en .1 (un seul ancien fichier gardé)
+
 def log_error(msg: str):
-    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    print(f"  {C.BRED}[ERR {ts}]{C.RST} {msg}")
+    now = datetime.now(timezone.utc)
+    print(f"  {C.BRED}[ERR {now.strftime('%H:%M:%S')}]{C.RST} {msg}")
+    try:
+        if os.path.exists(ERROR_LOG) and os.path.getsize(ERROR_LOG) > ERROR_LOG_BYTES:
+            os.replace(ERROR_LOG, ERROR_LOG + ".1")
+        with open(ERROR_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{now.strftime('%Y-%m-%dT%H:%M:%SZ')} {str(msg)[:500]}\n")
+    except OSError:
+        pass
 
 # ── Bougies — données Bybit public (sans clé API) ────────────────────────────
 def fetch_candles(coin: str, interval: str, count: int, drop_incomplete: bool = True) -> list[dict]:

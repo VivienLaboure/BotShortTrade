@@ -25,6 +25,7 @@ l'historique git (étiquette `scalping-final`).
 | `bot_state.json` | référence du « % depuis le départ » et dernier relevé des dépôts |
 | `trades.xlsx` | une ligne par position (onglet Tendance) |
 | `discord_events.jsonl` | copie locale de chaque message Discord |
+| `bot_errors.log` | copie datée de chaque erreur (le journal systemd ne garde qu'environ 1,5 jour) |
 | `dashboard.html` | tableau de bord local, régénéré à chaque cycle |
 
 Les fichiers de données et `.env` sont exclus de git (`.gitignore`).
